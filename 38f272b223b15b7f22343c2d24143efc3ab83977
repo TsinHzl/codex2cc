@@ -1,0 +1,23 @@
+.github/workflows/docker-build.yaml
+  7932b62d110431aa 38-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "38f272b223b15b7f22343c2d24143efc3ab83977",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 0,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}
