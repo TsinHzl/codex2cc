@@ -1,0 +1,23 @@
+frontend/src/pages/Docs.tsx
+  7932b62d110431aa 411
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "7ad733ea8db13b458f6872edb072fb245b9c125d",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
