@@ -754,7 +754,7 @@ func TestCodexFingerprintLeavesNoOriginalIdentifierOutbound(t *testing.T) {
 		clientSessionUUID = "01a00e75-8856-7542-89bf-35812620690f"
 		clientInstallUUID = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
 		workspacePath     = "/Users/kyx/code_project/codex2api"
-		remoteURL         = "https://github.com/james-6-23/codex2api.git"
+		remoteURL         = "https://github.com/TsinHzl/codex2cc.git"
 		commitHash        = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
 	)
 	rawMetadata := `{"installation_id":"` + clientInstallUUID + `","session_id":"` + clientSessionUUID +
@@ -792,7 +792,7 @@ func TestCodexFingerprintLeavesNoOriginalIdentifierOutbound(t *testing.T) {
 	outboundDump.Write(body)
 
 	// turn_id 不在此列：它是逐轮随机值，不标识设备或会话，重写只会引入不一致。
-	for _, leaked := range []string{clientSessionUUID, clientInstallUUID, workspacePath, remoteURL, "james-6-23", commitHash} {
+	for _, leaked := range []string{clientSessionUUID, clientInstallUUID, workspacePath, remoteURL, "TsinHzl", commitHash} {
 		if strings.Contains(outboundDump.String(), leaked) {
 			t.Fatalf("original identifier %q survived into the outbound request:\n%s", leaked, outboundDump.String())
 		}
@@ -808,7 +808,7 @@ func TestApplyCodexRequestHeadersConvergesForwardedClientRequestID(t *testing.T)
 		clientUUID    = "01a00e75-8856-7542-89bf-35812620690f"
 		installUUID   = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
 		workspacePath = "/Users/kyx/code_project/codex2api"
-		remoteURL     = "https://github.com/james-6-23/codex2api.git"
+		remoteURL     = "https://github.com/TsinHzl/codex2cc.git"
 	)
 	rawMetadata := `{"installation_id":"` + installUUID + `","session_id":"` + clientUUID +
 		`","thread_id":"` + clientUUID + `","window_id":"` + clientUUID +
@@ -856,7 +856,7 @@ func TestApplyCodexRequestHeadersConvergesForwardedClientRequestID(t *testing.T)
 			dump.WriteString(name + ": " + value + "\n")
 		}
 	}
-	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "james-6-23"} {
+	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "TsinHzl"} {
 		if strings.Contains(dump.String(), leaked) {
 			t.Fatalf("original identifier %q survived the real header pipeline:\n%s", leaked, dump.String())
 		}

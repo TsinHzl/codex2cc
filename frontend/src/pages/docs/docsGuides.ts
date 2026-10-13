@@ -554,11 +554,11 @@ export function buildGuides(baseUrl: string, locale: DocsLocale): GuideSpec[] {
         { label: c("系统设置", "Settings"), href: "/admin/settings" },
         {
           label: c("完整 API 文档", "Full API reference"),
-          href: "https://github.com/james-6-23/codex2api/blob/main/docs/API.md",
+          href: "https://github.com/TsinHzl/codex2cc/blob/main/docs/API.md",
         },
         {
           label: c("部署与故障排查", "Deployment & troubleshooting"),
-          href: "https://github.com/james-6-23/codex2api/blob/main/docs/TROUBLESHOOTING.md",
+          href: "https://github.com/TsinHzl/codex2cc/blob/main/docs/TROUBLESHOOTING.md",
         },
       ],
     },

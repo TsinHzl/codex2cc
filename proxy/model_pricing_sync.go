@@ -16,7 +16,7 @@ import (
 // DefaultModelPricingSyncURL 是项目维护的定价 JSON（raw GitHub）。部署方可在设置页改成
 // 自己的镜像/私有列表。格式：{ "<model>": {input,cached_input,output,...}, ... }，
 // 见 database.ModelPricingOverride。
-const DefaultModelPricingSyncURL = "https://raw.githubusercontent.com/james-6-23/codex2api/main/pricing.json"
+const DefaultModelPricingSyncURL = "https://raw.githubusercontent.com/TsinHzl/codex2cc/main/pricing.json"
 
 // ModelsDevPricingSyncURL 是 models.dev 公开定价 API，格式为 provider→models→cost
 // （USD / 1M tokens，含 272K 长上下文分档），同步时自动识别并转换。
