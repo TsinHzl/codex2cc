@@ -1,0 +1,75 @@
+database/account_channel_test.go
+  7932b62d110431aa 36
+database/channel_test_settings.go
+  7932b62d110431aa 11,29
+admin/handler.go
+  7932b62d110431aa 1598,4145,11063
+database/sqlite_test.go
+  7932b62d110431aa 466-533
+frontend/src/api.ts
+  7932b62d110431aa 30,494,872,1126,1161
+frontend/src/components/ChannelScopeBadges.tsx
+  7932b62d110431aa 8,12
+frontend/src/index.css
+  7932b62d110431aa 6-8,10,12-13,15-17,19,21-22,24-30,32-34,40-43,49,52-60,62,64-66,68-75,78
+frontend/src/pages/Dashboard.tsx
+  7932b62d110431aa 5,279,282,387
+frontend/src/components/ChannelLogo.tsx
+  7932b62d110431aa 5,37-38
+database/visible_channels_settings_test.go
+  7932b62d110431aa 15,17-18
+database/account_cli_version.go
+  7932b62d110431aa 1-88
+frontend/src/pages/APIKeys.tsx
+  7932b62d110431aa 146,2575,2657-2659,2664,2996,3005,3009-3013,3016-3017,3651,3665-3666
+database/account_groups.go
+  7932b62d110431aa 24,32-33,37
+frontend/src/pages/Settings.tsx
+  7932b62d110431aa 10,174,177,182,1261,2766
+frontend/src/pages/Usage.tsx
+  7932b62d110431aa 1820-1821,1825,2494-2495,2718-2719
+database/visible_channels_settings.go
+  7932b62d110431aa 16-17
+frontend/src/hooks/useTheme.tsx
+  7932b62d110431aa 31-32,41-42,110
+frontend/src/types.ts
+  7932b62d110431aa 3,40,109,134,2491,2500,2710,3040-3140
+frontend/src/lib/codexConnectionTest.ts
+  7932b62d110431aa 1-2
+frontend/src/pages/SchedulerBoard.tsx
+  7932b62d110431aa 26,218-219
+frontend/src/components/ChannelFilter.tsx
+  7932b62d110431aa 8,10,18,52,93
+database/postgres.go
+  7932b62d110431aa 1774-1776,1798-1799
+frontend/src/lib/visibleChannels.ts
+  7932b62d110431aa 4
+database/data_migrations.go
+  7932b62d110431aa 25-27,55-58,71-75,77-89,91,93-94,97-98
+admin/model_refresh_all_test.go
+  7932b62d110431aa 26-27,29-30,36-37
+frontend/src/components/AccountDetailSheet.tsx
+  7932b62d110431aa 296,300,345
+frontend/src/lib/accountTimezoneOptions.ts
+  7932b62d110431aa 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "fdf32c1bd993c112f2ead5b8b746852d1db30c39",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 553,
+      "total_deletions": 798,
+      "accepted_lines": 508,
+      "overriden_lines": 0
+    }
+  }
+}
