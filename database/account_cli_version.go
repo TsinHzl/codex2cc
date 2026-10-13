@@ -9,8 +9,9 @@ import (
 	"strings"
 )
 
-// GetClaudeSyncedCLIVersion 读取后台同步到的 Claude Code CLI 版本（空=尚未同步）。
-func (db *DB) GetClaudeSyncedCLIVersion(ctx context.Context) (string, error) {
+// GetAccountSyncedCLIVersion 读取后台同步到的 Codex CLI 版本（空=尚未同步）。
+// 历史上该列服务于 Claude 渠道的 CLI 版本同步，渠道剔除后仅保留读写能力以兼容历史库。
+func (db *DB) GetAccountSyncedCLIVersion(ctx context.Context) (string, error) {
 	if db == nil || db.conn == nil {
 		return "", errors.New("database unavailable")
 	}
@@ -25,8 +26,8 @@ func (db *DB) GetClaudeSyncedCLIVersion(ctx context.Context) (string, error) {
 	return strings.TrimSpace(version), nil
 }
 
-// UpdateClaudeSyncedCLIVersion 只更新同步版本单列，不回写整行设置。
-func (db *DB) UpdateClaudeSyncedCLIVersion(ctx context.Context, version string) error {
+// UpdateAccountSyncedCLIVersion 只更新同步版本单列，不回写整行设置。
+func (db *DB) UpdateAccountSyncedCLIVersion(ctx context.Context, version string) error {
 	if db == nil || db.conn == nil {
 		return errors.New("database unavailable")
 	}

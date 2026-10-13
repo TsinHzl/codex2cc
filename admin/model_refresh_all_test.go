@@ -20,27 +20,21 @@ func TestRunRefreshAllModels_PartialFailureKeepsOtherChannels(t *testing.T) {
 		database.UpstreamChannelCodex: func(ctx context.Context, _ modelRefreshEmitter) channelModelRefreshResult {
 			return channelModelRefreshResult{Error: "官方模型页同步失败: boom", Failed: 1}
 		},
-		database.UpstreamChannelClaude: func(ctx context.Context, _ modelRefreshEmitter) channelModelRefreshResult {
-			panic("claude exploded")
-		},
 	}}
 	resp := h.runRefreshAllModels(context.Background(), nil)
 
-	if len(resp.Channels) != 3 {
-		t.Fatalf("channels = %d, want 3: %+v", len(resp.Channels), resp.Channels)
+	if len(resp.Channels) != 2 {
+		t.Fatalf("channels = %d, want 2: %+v", len(resp.Channels), resp.Channels)
 	}
-	// 固定顺序：codex → claude → relay
-	if resp.Channels[0].Channel != database.UpstreamChannelCodex || resp.Channels[1].Channel != database.UpstreamChannelClaude || resp.Channels[2].Channel != database.UpstreamChannelRelay {
+	// 固定顺序：codex → relay
+	if resp.Channels[0].Channel != database.UpstreamChannelCodex || resp.Channels[1].Channel != database.UpstreamChannelRelay {
 		t.Fatalf("unexpected channel order: %+v", resp.Channels)
 	}
 	if resp.Channels[0].Error == "" || resp.Channels[0].Failed != 1 {
 		t.Fatalf("codex failure should be reported: %+v", resp.Channels[0])
 	}
-	if resp.Channels[1].Error == "" || resp.Channels[1].Error[:5] != "panic" {
-		t.Fatalf("claude panic should be captured as error: %+v", resp.Channels[1])
-	}
-	if resp.Channels[2].Refreshed != 1 || len(resp.Channels[2].Added) != 1 {
-		t.Fatalf("relay result lost: %+v", resp.Channels[2])
+	if resp.Channels[1].Refreshed != 1 || len(resp.Channels[1].Added) != 1 {
+		t.Fatalf("relay result lost: %+v", resp.Channels[1])
 	}
 	if len(resp.Added) != 1 || resp.Added[0] != "relay-x" {
 		t.Fatalf("aggregated added = %v", resp.Added)

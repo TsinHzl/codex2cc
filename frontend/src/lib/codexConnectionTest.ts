@@ -1,5 +1,5 @@
-// Codex/Responses 测连诊断的类型与纯展示逻辑。与 Claude 的 claudeConnectionTest.ts
-// 平行但独立:字段语义按 Responses API 与 x-codex-* 用量头定义。
+// Codex/Responses 测连诊断的类型与纯展示逻辑:
+// 字段语义按 Responses API 与 x-codex-* 用量头定义。
 
 export interface CodexTestWindow {
   used_percent?: number;

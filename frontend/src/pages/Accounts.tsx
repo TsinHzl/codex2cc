@@ -200,11 +200,11 @@ import {
   ListChecks,
 } from "lucide-react";
 import {
-  CLAUDE_TIMEZONE_CUSTOM,
-  CLAUDE_TIMEZONE_OPTIONS,
-  claudeTimezoneLabel,
-  findClaudeTimezoneOption,
-} from "../lib/claudeAccountOptions";
+  ACCOUNT_TIMEZONE_CUSTOM,
+  ACCOUNT_TIMEZONE_OPTIONS,
+  accountTimezoneLabel,
+  findAccountTimezoneOption,
+} from "../lib/accountTimezoneOptions";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
@@ -624,18 +624,18 @@ function TimezoneSelect({
 }: TimezoneSelectProps) {
   const { t } = useTranslation();
   const choice = custom
-    ? CLAUDE_TIMEZONE_CUSTOM
-    : (findClaudeTimezoneOption(value)?.value ??
-      (value.trim() ? CLAUDE_TIMEZONE_CUSTOM : ""));
+    ? ACCOUNT_TIMEZONE_CUSTOM
+    : (findAccountTimezoneOption(value)?.value ??
+      (value.trim() ? ACCOUNT_TIMEZONE_CUSTOM : ""));
   return (
     <div className="mt-3 space-y-1.5">
       <Select
         value={choice}
         disabled={disabled}
         onValueChange={(next) => {
-          if (next === CLAUDE_TIMEZONE_CUSTOM) {
+          if (next === ACCOUNT_TIMEZONE_CUSTOM) {
             onCustomChange(true);
-            if (findClaudeTimezoneOption(value)) onChange("");
+            if (findAccountTimezoneOption(value)) onChange("");
             return;
           }
           onCustomChange(false);
@@ -643,13 +643,13 @@ function TimezoneSelect({
         }}
         options={[
           { value: "", label: t("accounts.codexTimezoneUnset") },
-          ...CLAUDE_TIMEZONE_OPTIONS,
-          { value: CLAUDE_TIMEZONE_CUSTOM, label: t("accounts.codexTimezoneCustom") },
+          ...ACCOUNT_TIMEZONE_OPTIONS,
+          { value: ACCOUNT_TIMEZONE_CUSTOM, label: t("accounts.codexTimezoneCustom") },
         ]}
       />
-      {findClaudeTimezoneOption(value) ? (
+      {findAccountTimezoneOption(value) ? (
         <p className="text-[10px] text-muted-foreground">
-          {claudeTimezoneLabel(value)}
+          {accountTimezoneLabel(value)}
         </p>
       ) : null}
       {custom ? (
@@ -5549,7 +5549,7 @@ export default function Accounts() {
     setEditCodexFingerprintMode(account.codex_fingerprint_mode ?? "off");
     setEditTimezone(account.timezone ?? "");
     setEditTimezoneCustom(
-      Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
+      Boolean(account.timezone && !findAccountTimezoneOption(account.timezone)),
     );
     setEditCodexTurnState(account.codex_turn_state ?? "");
     setEditCodexTurnStateModels(account.codex_turn_state_models ?? "");

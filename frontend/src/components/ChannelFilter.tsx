@@ -5,9 +5,9 @@ import type { UpstreamChannel } from "../types";
 import { cn } from "@/lib/utils";
 import { useVisibleChannels } from "../visibleChannels";
 
-// 仪表盘/用量页共用的上游渠道过滤（全部/Codex/Claude）。
+// 仪表盘/用量页共用的上游渠道过滤（全部/Codex/Relay）。
 // 选择持久化到 localStorage，两页共享同一份状态键。
-export type UsageChannel = "" | "codex" | "claude";
+export type UsageChannel = "" | UpstreamChannel;
 
 const USAGE_CHANNEL_KEY = "codex2api:usage:channel";
 
@@ -15,7 +15,7 @@ export function useUsageChannel(): [UsageChannel, (next: UsageChannel) => void] 
   const [channel, setChannel] = useState<UsageChannel>(() => {
     try {
       const raw = window.localStorage.getItem(USAGE_CHANNEL_KEY);
-      if (raw === "codex" || raw === "claude") return raw;
+      if (raw === "codex" || raw === "relay") return raw;
     } catch {
       // ignore
     }
@@ -49,7 +49,7 @@ export default function ChannelFilter({
   }> = [
     { key: "", label: t("usage.channelAll") },
     { key: "codex", label: "Codex", logo: "codex" },
-    { key: "claude", label: "Claude", logo: "claude" },
+    { key: "relay", label: "Relay", logo: "relay" },
   ];
   const options = allOptions.filter((o) => !o.logo || isChannelVisible(o.logo));
   const count = options.length;
@@ -90,7 +90,7 @@ export default function ChannelFilter({
               : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
           )}
         >
-          {key === "claude" ? <ChannelLogo channel="claude" size={16} /> : logo ? <ChannelLogo channel={logo} size={16} /> : null}
+          {logo ? <ChannelLogo channel={logo} size={16} /> : null}
           {label}
         </button>
       ))}

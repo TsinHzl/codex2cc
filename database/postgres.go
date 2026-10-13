@@ -1771,10 +1771,9 @@ const (
 
 // 上游渠道限定取值。
 const (
-	UpstreamChannelAuto   = ""
-	UpstreamChannelCodex  = "codex"
-	UpstreamChannelRelay  = "relay"
-	UpstreamChannelClaude = "claude"
+	UpstreamChannelAuto  = ""
+	UpstreamChannelCodex = "codex"
+	UpstreamChannelRelay = "relay"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1784,8 +1783,6 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelCodex
 	case UpstreamChannelRelay:
 		return UpstreamChannelRelay
-	case UpstreamChannelClaude:
-		return UpstreamChannelClaude
 	}
 	return UpstreamChannelAuto
 }
@@ -1796,10 +1793,10 @@ func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
 	switch strings.ToLower(strings.TrimSpace(channel)) {
 	case UpstreamChannelRelay:
 		return ` AND ` + upstreamTypeExpr + ` = 'relay'`
-	case UpstreamChannelClaude:
-		return ` AND ` + upstreamTypeExpr + ` = 'claude'`
 	case UpstreamChannelCodex:
 		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
+		// 'claude' 渠道已剔除（存量行由 data migration 软删除），此处保留排除条件
+		// 防御迁移未跑或备份恢复出的历史数据。
 		return ` AND ` + upstreamTypeExpr + ` NOT IN ('relay', 'claude')`
 	default:
 		return ""
@@ -2250,7 +2247,6 @@ type SystemSettings struct {
 	SiteName                           string
 	SiteLogo                           string
 	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
-	ClaudeConfig                       string // JSON: {"fingerprint_mode":"preserve","default_timezone":"","session_window_limit":0}
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
@@ -2605,7 +2601,6 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(session_slot_buffer_seconds, 10),
 		       COALESCE(models_list_read_max_bytes, 8388608),
 		       COALESCE(auto_activate_5h_window_enabled, false),
-		       COALESCE(claude_config, '{}'),
 		       COALESCE(codex_images_main_model, ''),
 		       COALESCE(codex_telemetry_enabled, false),
 		       COALESCE(codex_oauth_keepalive_enabled, false),
@@ -2686,7 +2681,6 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SessionSlotBufferSeconds,
 		&s.ModelsListReadMaxBytes,
 		&s.AutoActivate5hWindowEnabled,
-		&s.ClaudeConfig,
 		&s.CodexImagesMainModel,
 		&s.CodexTelemetryEnabled,
 		&s.CodexOAuthKeepaliveEnabled,
@@ -2935,13 +2929,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					scheduler_engine,
 					codex_request_compression,
 					auto_activate_5h_window_enabled,
-					claude_config,
 					codex_images_main_model,
 					codex_telemetry_enabled,
 					codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2981,10 +2974,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $123 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $122 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $124 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $123 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3110,7 +3103,6 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeSchedulerEngine(s.SchedulerEngine, s.FastSchedulerEnabled),
 		s.CodexRequestCompression,
 		s.AutoActivate5hWindowEnabled,
-		normalizeClaudeConfig(s.ClaudeConfig),
 		strings.TrimSpace(s.CodexImagesMainModel),
 		s.CodexTelemetryEnabled,
 		s.CodexOAuthKeepaliveEnabled,
@@ -3328,26 +3320,6 @@ func normalizeAffinityMode(mode string) string {
 	default:
 		return "bounded"
 	}
-}
-
-// normalizeClaudeConfig 校验 claude_config JSON,非法或空则回落到默认 {}。
-func normalizeClaudeConfig(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || !json.Valid([]byte(raw)) {
-		return "{}"
-	}
-	return raw
-}
-
-// UpdateClaudeConfig 定向更新 claude_config 单列(不回写整行设置,避免触碰大 UPSERT)。
-func (db *DB) UpdateClaudeConfig(ctx context.Context, raw string) error {
-	value := normalizeClaudeConfig(raw)
-	return db.withSQLiteWriteLock(ctx, func() error {
-		_, err := db.conn.ExecContext(ctx, `
-			INSERT INTO system_settings (id, claude_config) VALUES (1, $1)
-			ON CONFLICT (id) DO UPDATE SET claude_config = EXCLUDED.claude_config`, value)
-		return err
-	})
 }
 
 // DeleteAPIKey 删除 API 密钥

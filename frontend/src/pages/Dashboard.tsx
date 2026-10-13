@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
+import type { UpstreamChannel } from '../types'
 import { getTimeRangeISO, getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
@@ -275,10 +276,10 @@ export default function Dashboard() {
   const errorCount = effectiveCounts?.error ?? 0
   const todayRequests = effectiveCounts?.today_requests ?? 0
   const channelBreakdown = !channel && stats?.channels
-    ? (['codex', 'claude'] as const)
+    ? (['codex', 'relay'] as const)
         .filter((key) => isChannelVisible(key))
         .map((key) => ({ key, counts: stats.channels?.[key] }))
-        .filter((item): item is { key: 'codex' | 'claude'; counts: StatsChannelCounts } =>
+        .filter((item): item is { key: UpstreamChannel; counts: StatsChannelCounts } =>
           Boolean(item.counts && item.counts.total > 0))
     : []
 
@@ -383,7 +384,7 @@ export default function Dashboard() {
                     className="inline-flex items-center gap-1.5 rounded-full bg-muted/80 px-3 py-1 font-semibold text-foreground ring-1 ring-border/50"
                     title={t('dashboard.heroChannelTitle', {
                       // Preserve the provider identity in the tooltip for every channel.
-                      channel: key === 'claude' ? 'Claude' : 'Codex',
+                      channel: key === 'relay' ? 'Relay' : 'Codex',
                       available: counts.available,
                       total: counts.total,
                       requests: counts.today_requests,

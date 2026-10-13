@@ -463,6 +463,74 @@ func TestFindActiveAccountByOAuthIdentityIgnoresLegacyIDs(t *testing.T) {
 	}
 }
 
+// claude 渠道软删除迁移：存量 upstream_type='claude' 账号应被软删除，
+// codex / relay 账号与已删除行不受影响。
+func TestSQLiteDataMigrationSoftDeletesClaudeAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationClaudeAccountSoftDeleteV1); err != nil {
+		t.Fatalf("清理 data migration 标记返回错误: %v", err)
+	}
+
+	claudeID, err := db.InsertAccountWithCredentials(ctx, "claude-legacy", map[string]interface{}{
+		"access_token":  "at-claude-legacy",
+		"upstream_type": "claude",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert claude 返回错误: %v", err)
+	}
+	codexID, err := db.InsertAccountWithCredentials(ctx, "codex-keep", map[string]interface{}{
+		"access_token": "at-codex-keep",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert codex 返回错误: %v", err)
+	}
+	relayID, err := db.InsertAccountWithCredentials(ctx, "relay-keep", map[string]interface{}{
+		"api_key":       "sk-relay-keep",
+		"upstream_type": "relay",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert relay 返回错误: %v", err)
+	}
+
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("runDataMigrations 返回错误: %v", err)
+	}
+
+	alive := func(id int64) bool {
+		var n int
+		if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, id).Scan(&n); err != nil {
+			t.Fatalf("查询账号 %d 返回错误: %v", id, err)
+		}
+		return n == 1
+	}
+	if alive(claudeID) {
+		t.Fatal("claude 渠道账号应被迁移软删除")
+	}
+	if !alive(codexID) || !alive(relayID) {
+		t.Fatal("codex / relay 账号不应被迁移删除")
+	}
+
+	// 重跑迁移（幂等）：已删除的 claude 行不重复处理，标记只记一次。
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("重跑 runDataMigrations 返回错误: %v", err)
+	}
+	var applied int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version = $1`, dataMigrationClaudeAccountSoftDeleteV1).Scan(&applied); err != nil {
+		t.Fatalf("查询 data_migrations 返回错误: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("data_migrations 标记数 = %d, want 1", applied)
+	}
+}
+
 // v2 迁移：user_id 也是身份别名——个人账号（credentials 只有 user_id）和被旧版
 // wham 回填污染（user_id 写进了 account_id）的账号必须合并为一组。
 // 勾选"允许重复添加"强制导入的副本（allow_duplicate 标记）不参与合并。

@@ -1,4 +1,3 @@
-import { qualityTestFilterQuery, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
   AccountEventTrendPoint,
   AccountPortalAuthURLResponse,
@@ -28,8 +27,8 @@ import type {
   AccountPageStatsResponse,
   AccountLiveStateResponse,
   ChartAggregation,
+  HealthResponse,
   CreateAccountResponse,
-  CreateAPIKeyResponse,
   CreateAPIKeyRequest,
   CreatePromptFilterNewAPIBindingRequest,
   FetchOpenAIResponsesModelsRequest,
@@ -52,15 +51,6 @@ import type {
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
-  ClaudeAuthURLResponse,
-  ClaudeAuthKind,
-  ClaudeSessionKeyExchangeRequest,
-  ClaudeSetupTokenImportRequest,
-  ClaudeExchangeCodeRequest,
-  ClaudeImportTokenRequest,
-  ClaudeCredentialExportEntry,
-  ClaudeImportBundleResponse,
-  ClaudeAddAccountResponse,
   OpsErrorSummary,
   OpsOverviewResponse,
   PromptFilterLog,
@@ -109,10 +99,7 @@ import type {
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
   UpstreamChannel,
-  ClaudeGlobalConfig,
   VisibleChannelsSettings,
-  ChannelTestSettings,
-  ChannelTestSettingsResponse,
 } from './types'
 
 const BASE = '/api/admin'
@@ -504,7 +491,7 @@ export const api = {
     if (params.order) searchParams.set('order', params.order)
     return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
   },
-  getAccountAnalysis: (channel: 'codex' | 'claude' = 'codex', signal?: AbortSignal) =>
+  getAccountAnalysis: (channel: 'codex' | 'relay' = 'codex', signal?: AbortSignal) =>
     request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
   getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ ids: ids.join(',') })
@@ -533,65 +520,6 @@ export const api = {
       `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
       { signal, timeoutMs: 25_000 },
     ),
-  generateClaudeAuthURL: (mode: ClaudeAuthKind = 'oauth') =>
-    request<ClaudeAuthURLResponse>('/accounts/claude/oauth/auth-url', {
-      method: 'POST',
-      body: JSON.stringify({ mode }),
-      timeoutMs: 15_000,
-    }),
-  // claude.ai sessionKey(cookie)一键换号:服务端代跑 OAuth 三步。
-  exchangeClaudeSessionKey: (data: ClaudeSessionKeyExchangeRequest) =>
-    request<ClaudeAddAccountResponse>('/accounts/claude/oauth/exchange-session-key', {
-      method: 'POST',
-      body: JSON.stringify(data),
-      timeoutMs: 120_000,
-    }),
-  // 批量粘贴 sk-ant-oat01- Setup Token。
-  importClaudeSetupTokens: (data: ClaudeSetupTokenImportRequest) =>
-    request<ClaudeImportBundleResponse>('/accounts/claude/import-setup-tokens', {
-      method: 'POST',
-      body: JSON.stringify(data),
-      timeoutMs: 120_000,
-    }),
-  // 第二步：用 state+code 换取 token 并入库（可选从代理池分配代理）。
-  exchangeClaudeOAuthCode: (data: ClaudeExchangeCodeRequest) =>
-    request<ClaudeAddAccountResponse>('/accounts/claude/oauth/exchange-code', {
-      method: 'POST',
-      body: JSON.stringify(data),
-      timeoutMs: 90_000,
-    }),
-  // Claude 凭据导入：OAuth、Setup Token 或 Base URL + API Key。
-  importClaudeToken: (data: ClaudeImportTokenRequest) =>
-    request<ClaudeAddAccountResponse>('/accounts/claude/import', {
-      method: 'POST',
-      body: JSON.stringify(data),
-      timeoutMs: 60_000,
-    }),
-  /** Import a versioned Claude credential object or bundle. */
-  importClaudeCredentialBundle: (
-    data: ClaudeCredentialExportEntry | ClaudeCredentialExportEntry[] | { accounts: ClaudeCredentialExportEntry[] },
-  ) =>
-    request<ClaudeAddAccountResponse | ClaudeImportBundleResponse>('/accounts/claude/import', {
-      method: 'POST',
-      body: JSON.stringify(data),
-      timeoutMs: 120_000,
-    }),
-  /** Download one Claude JSON credential or a ZIP for multiple accounts. */
-  exportClaudeAccounts: (ids?: number[], filter: 'all' | 'healthy' = 'all', format: 'auto' | 'json' | 'zip' = 'auto') => {
-    const params = new URLSearchParams({ filter, format })
-    if (ids && ids.length > 0) params.set('ids', ids.join(','))
-    return requestNamedBlob(`/accounts/claude/export?${params.toString()}`)
-  },
-  refreshClaudeModels: (id: number) =>
-    request<{ message: string; models: string[]; count: number }>(`/accounts/${id}/claude/models`, {
-      method: 'POST',
-      timeoutMs: 30_000,
-    }),
-  refreshAllClaudeModels: () =>
-    request<{ message: string; refreshed: number; failed: number; model_count: number }>('/accounts/claude/models/refresh', {
-      method: 'POST',
-      timeoutMs: 60_000,
-    }),
   refreshAllModels: () =>
     request<RefreshAllModelsResponse>('/models/refresh-all', {
       method: 'POST',
@@ -627,10 +555,6 @@ export const api = {
       reset_5h_at?: string
       reset_7d_at?: string
       reset_spark_at?: string
-      claude_usage_probe_at?: string
-      claude_usage_probe_error?: string
-      claude_usage_windows?: import('./types').ClaudeUsageWindow[]
-      claude_usage_windows_probed?: boolean
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   // 订阅状态:GET 只读服务端已算好的状态对象;POST 立即向订阅提供方查一次(绕过后台节流,30s 内重复点会 429)。
   getAccountSubscription: (id: number, signal?: AbortSignal) =>
@@ -757,12 +681,6 @@ export const api = {
     request<VisibleChannelsSettings>('/settings/visible-channels', {
       method: 'PUT',
       body: JSON.stringify({ channels }),
-    }),
-  getChannelTestSettings: () => request<ChannelTestSettingsResponse>('/settings/channel-tests'),
-  updateChannelTestSettings: (patch: Partial<Record<'claude', Partial<ChannelTestSettings>>>) =>
-    request<ChannelTestSettingsResponse>('/settings/channel-tests', {
-      method: 'PUT',
-      body: JSON.stringify(patch),
     }),
   getInviteGuideSettings: () => request<{ enabled: boolean }>('/settings/invite-guide'),
   updateInviteGuideSettings: (enabled: boolean) =>
@@ -951,7 +869,7 @@ export const api = {
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
   createAPIKey: (data: CreateAPIKeyRequest) =>
-    request<CreateAPIKeyResponse>('/keys', {
+    request<APIKeysResponse['keys'][number] & { key: string }>('/keys', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -981,22 +899,6 @@ export const api = {
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
-  getClaudeConfig: () =>
-    request<ClaudeGlobalConfig>('/settings/claude-config'),
-  updateClaudeConfig: (data: ClaudeGlobalConfig) =>
-    request<{ message: string } & ClaudeGlobalConfig>('/settings/claude-config', {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    }),
-  syncClaudeCLIVersion: () =>
-    request<{
-      fetched_version: string
-      effective_version: string
-      builtin_version: string
-      updated: boolean
-      accounts_refreshed: number
-      warning?: string
-    }>('/settings/claude-config/cli-version/sync', { method: 'POST' }),
   getObservedInstructions: () =>
     request<ObservedInstructionsResponse>('/settings/observed-instructions'),
   getCodexUserAgentCatalog: () =>
@@ -1159,24 +1061,6 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
-  getQualityTestOptions: (id: number, signal?: AbortSignal) =>
-    request<{ models: string[]; reasoning_efforts: string[] }>(`/accounts/${id}/quality-test/options`, { signal }),
-  getQualityTestPrompts: (signal?: AbortSignal) =>
-    request<{ prompts: QualityTestPrompt[] }>('/quality-test-prompts', { signal }),
-  createQualityTestPrompt: (body: { name: string; prompt: string }) =>
-    request<{ prompt: QualityTestPrompt }>('/quality-test-prompts', { method: 'POST', body: JSON.stringify(body) }),
-  updateQualityTestPrompt: (id: number, body: { name?: string; prompt?: string }) =>
-    request<{ prompt: QualityTestPrompt }>(`/quality-test-prompts/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  deleteQualityTestPrompt: (id: number) =>
-    request<{ message: string }>(`/quality-test-prompts/${id}`, { method: 'DELETE' }),
-  createQualityTest: (accountId: number, body: { model: string; reasoning_effort: string; prompt: string; prompt_id?: number; preset_key?: string; preset_name?: string }) =>
-    request<{ job: QualityTestJob }>(`/accounts/${accountId}/quality-test`, { method: 'POST', body: JSON.stringify(body) }),
-  getQualityTests: (page = 1, filter: QualityTestJobsFilter = {}, signal?: AbortSignal) =>
-    request<QualityTestJobsResponse>(`/quality-tests?${qualityTestFilterQuery(page, filter)}`, { signal }),
-  getQualityTest: (id: number, signal?: AbortSignal) =>
-    request<{ job: QualityTestJob }>(`/quality-tests/${id}`, { signal }),
-  cancelQualityTest: (id: number) =>
-    request<{ job: QualityTestJob }>(`/quality-tests/${id}/cancel`, { method: 'POST' }),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
   syncCodexCLIVersion: () =>
     request<{
@@ -1239,7 +1123,7 @@ export const api = {
   exportAccounts: (params: {
     filter: 'healthy' | 'all'
     ids?: number[]
-    channel?: 'codex' | 'claude'
+    channel?: 'codex' | 'relay'
     includeProxy?: boolean
   }) => {
     const sp = new URLSearchParams({ filter: params.filter })
@@ -1274,7 +1158,7 @@ export const api = {
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   cleanErrorProxies: () =>
     request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
-  autoBalanceProxies: (data: { channel?: 'codex' | 'claude'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+  autoBalanceProxies: (data: { channel?: 'codex' | 'relay'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
     request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   listProxyRiskScoringProfiles: () =>
     request<{ profiles: ProxyRiskScoringProfile[] }>('/proxy-risk-scoring/profiles'),

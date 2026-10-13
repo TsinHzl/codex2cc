@@ -289,18 +289,15 @@ export default function AccountDetailSheet({
     account && displayName && displayName !== `#${account.id}`,
   );
   const rateWindow = account ? getRateLimitWindow(account) : null;
-  const isClaude = Boolean(account?.claude_api);
   // Codex AT-only / Responses 不走 AT 刷新。
   const refreshDisabled = Boolean(
     account && (refreshing || account.at_only || account.openai_responses_api),
   );
-  // 凭据导出由各 provider 自己决定格式；Claude 使用专用安全导出端点。
-  // 旧的 Codex auth.json 行为保持不变。
+  // 凭据导出由各 provider 自己决定格式；Codex 使用 auth.json。
   const showAuthJson = Boolean(account);
-  const showResetCredits = Boolean(account && !isClaude);
+  const showResetCredits = Boolean(account);
   const authJsonDisabled = Boolean(
-    account &&
-      (authJsonExporting || (!isClaude && (account.at_only || account.openai_responses_api))),
+    account && (authJsonExporting || account.at_only || account.openai_responses_api),
   );
   const resetCredits = account?.rate_limit_reset_credits ?? 0;
   const healthLabel = (() => {
@@ -345,9 +342,7 @@ export default function AccountDetailSheet({
             <div className="flex items-start justify-between gap-3 pr-2">
               <div className="flex min-w-0 flex-1 items-start gap-3">
                 <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
-                  {account.claude_api ? (
-                    <ChannelLogo channel="claude" size={22} />
-                  ) : account.openai_responses_api ? (
+                  {account.openai_responses_api ? (
                     <ModelLogo model="openai" variant="plain" size={22} />
                   ) : (
                     <ChannelLogo channel="codex" size={40} className="rounded-xl" />
@@ -762,7 +757,6 @@ export default function AccountDetailSheet({
             {(account.proxy_url ||
               account.at_only ||
               account.openai_responses_api ||
-              account.claude_api ||
               account.base_url ||
               (!account.openai_responses_api &&
                 (account.models?.length ?? 0) > 0)) && (
@@ -786,14 +780,6 @@ export default function AccountDetailSheet({
                       <span className="font-medium text-foreground">
                         {t("accounts.detailApiResponses")}
                       </span>
-                    </div>
-                  )}
-                  {isClaude && (
-                    <div className="flex justify-between gap-3">
-                      <span className="text-muted-foreground">
-                        {t("accounts.detailAuthType")}
-                      </span>
-                      <span className="font-medium text-foreground">{t("claude.authOAuth")}</span>
                     </div>
                   )}
                   {account.base_url && (
@@ -879,9 +865,7 @@ export default function AccountDetailSheet({
                 <RefreshCw
                   className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
                 />
-                {isClaude
-                  ? t("claude.actionRefresh")
-                  : t("accounts.actionRefreshAT")}
+                {t("accounts.actionRefreshAT")}
               </Button>
               {showAuthJson && (
                 <Button
@@ -892,7 +876,7 @@ export default function AccountDetailSheet({
                   onClick={onGenerateAuthJson}
                 >
                   <FileJson className="size-3.5" />
-                  {isClaude ? t("claude.exportCredential") : t("accounts.actionAuthJson")}
+                  {t("accounts.actionAuthJson")}
                 </Button>
               )}
               <Button

@@ -12,10 +12,10 @@ func TestNormalizeVisibleChannels(t *testing.T) {
 		in   []string
 		want []string
 	}{
-		{"nil means everything visible", nil, []string{"codex", "relay", "claude"}},
+		{"nil means everything visible", nil, []string{"codex", "relay"}},
 		{"empty list keeps the fallback", []string{}, []string{"codex"}},
-		{"fallback is added when missing", []string{"claude"}, []string{"codex", "claude"}},
-		{"unknown, blank and duplicate entries are dropped and order is canonical", []string{" Claude ", "", "codex", "openai"}, []string{"codex", "claude"}},
+		{"stale claude entries are dropped, fallback is added", []string{"claude"}, []string{"codex"}},
+		{"unknown, blank and duplicate entries are dropped and order is canonical", []string{" Claude ", "", "codex", "openai"}, []string{"codex"}},
 		{"relay is a valid channel", []string{"relay", "codex"}, []string{"codex", "relay"}},
 	}
 	for _, tc := range cases {

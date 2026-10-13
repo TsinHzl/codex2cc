@@ -1817,16 +1817,12 @@ export default function Usage() {
     seenModelsRef.current[channel] = merged
     return merged
   }, [modelStats, channel])
-  // 下拉选项跟随渠道过滤：codex 列 Codex manifest 目录，claude 列 Claude 模型，
-  // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
+  // 下拉选项跟随渠道过滤：codex/relay 列 Codex manifest 目录，
+  // 当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
   const modelFilterOptions = useMemo(() => {
     const seen = new Set<string>()
     const merged: string[] = []
-    const catalog = channel === 'codex'
-      ? modelOptions
-      : channel === 'claude'
-        ? claudeModelOptions
-        : [...modelOptions, ...claudeModelOptions]
+    const catalog = channel === '' ? [...modelOptions, ...claudeModelOptions] : modelOptions
     for (const m of catalog) {
       const key = m.trim()
       if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
@@ -2495,13 +2491,8 @@ export default function Usage() {
                               onClick={() => toggleModelFilter(log.model)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleModelFilter(log.model) } }}
                             >
-                              {(log.channel === 'codex' || log.channel === 'claude') && (
-                                <ChannelLogo
-                                  channel={log.channel}
-                                  size={13}
-                                  className="mr-1"
-                                  title={log.channel === 'claude' ? 'Claude' : 'Codex'}
-                                />
+                              {(log.channel === 'codex' || log.channel === 'relay') && (
+                                <ChannelLogo channel={log.channel} size={13} className="mr-1" title={log.channel === 'relay' ? 'Relay' : 'Codex'} />
                               )}
                               {log.model || '-'}
                             </Badge>
@@ -2724,13 +2715,8 @@ export default function Usage() {
                               onClick={() => toggleModelFilter(log.model)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleModelFilter(log.model) } }}
                             >
-                              {(log.channel === 'codex' || log.channel === 'claude') && (
-                                <ChannelLogo
-                                  channel={log.channel}
-                                  size={13}
-                                  className="mr-1"
-                                  title={log.channel === 'claude' ? 'Claude' : 'Codex'}
-                                />
+                              {(log.channel === 'codex' || log.channel === 'relay') && (
+                                <ChannelLogo channel={log.channel} size={13} className="mr-1" title={log.channel === 'relay' ? 'Relay' : 'Codex'} />
                               )}
                               {log.model || '-'}
                             </Badge>

@@ -23,7 +23,7 @@ const PAGE_SIZE_OPTIONS = [12, 20, 50, 100]
 export default function SchedulerBoard() {
   const { t } = useTranslation()
   const [tierFilter, setTierFilter] = useState('all')
-  const [channel, setChannel] = useState<'codex' | 'claude'>('codex')
+  const [channel, setChannel] = useState<'codex' | 'relay'>('codex')
   const [sortBy, setSortBy] = useState('risk')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
@@ -215,8 +215,8 @@ export default function SchedulerBoard() {
                   <div className="w-full sm:w-[180px]">
                     <Select
                       value={channel}
-                      onValueChange={(value) => setChannel(value as 'codex' | 'claude')}
-                      options={[{ label: 'Codex', value: 'codex' }, { label: 'Claude', value: 'claude' }]}
+                      onValueChange={(value) => setChannel(value as 'codex' | 'relay')}
+                      options={[{ label: 'Codex', value: 'codex' }, { label: 'Relay', value: 'relay' }]}
                     />
                   </div>
                   <span className="text-[12px] font-semibold text-muted-foreground">{t('scheduler.filter')}</span>

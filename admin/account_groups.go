@@ -510,8 +510,6 @@ func (h *Handler) validateGroupChannelForRows(ctx context.Context, rows []*datab
 
 func groupChannelDisplayName(channel string) string {
 	switch channel {
-	case database.AccountGroupChannelClaude:
-		return "Claude"
 	default:
 		return "Codex"
 	}

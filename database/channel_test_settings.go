@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Claude 渠道的连通性测试配置（测试模型、测活内容），存放在
+// 渠道连通性测试配置（测试模型、测活内容），存放在
 // system_settings.channel_test_config。全局 test_model / test_content 是 Codex 语义
 // 的默认值，其它渠道的模型目录完全不同，需要各自的默认探测模型与提示词。
 // 和 visible_channels_config 一样刻意用独立的小 UPDATE 读写，不进 SaveSettings 的
@@ -26,7 +26,7 @@ type ChannelTestSettings struct {
 // MaxChannelTestConcurrency 与全局测试并发的上限保持一致。
 const MaxChannelTestConcurrency = 200
 
-// ChannelTestConfig 汇总有独立测试配置的渠道。
+// ChannelTestConfig 汇总有独立测试配置的渠道。Claude 渠道已剔除，字段保留以兼容历史库数据。
 type ChannelTestConfig struct {
 	Claude ChannelTestSettings `json:"claude"`
 }

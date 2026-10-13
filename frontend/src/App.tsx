@@ -19,7 +19,6 @@ const Settings = lazy(() => import('./pages/Settings'))
 const Docs = lazy(() => import('./pages/Docs'))
 const APIKeys = lazy(() => import('./pages/APIKeys'))
 const Usage = lazy(() => import('./pages/Usage'))
-const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
 
 export default function App() {
   return (
@@ -54,7 +53,6 @@ function AdminApp() {
           <Route path="/ops/errors" element={<OperationsErrors />} />
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
-          <Route path="/theme" element={<ThemeSettings />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Docs />} />
           <Route path="/guide" element={<Navigate to="/docs" replace />} />

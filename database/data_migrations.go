@@ -22,10 +22,9 @@ const (
 	// usage_logs.channel 回填：账号已删的历史行默认 codex。
 	dataMigrationUsageLogChannelV1   = "20260721_usage_log_channel_backfill_v1"
 	dataMigrationWorkspaceIdentityV3 = "20260722_workspace_identity_v3"
-	// Claude 原生渠道上线后的存量回填：只修复能从当前账号、端点或模型可靠
-	// 识别的记录；不把混合分组或历史不明请求强行改写成 Claude。
-	dataMigrationClaudeProviderV1 = "20260829_claude_provider_backfill_v1"
-	dataMigrationTimeout          = 5 * time.Minute
+	// claude 渠道已剔除：软删除存量 upstream_type='claude' 账号，保留 usage 归因。
+	dataMigrationClaudeAccountSoftDeleteV1 = "20261014_claude_account_soft_delete_v1"
+	dataMigrationTimeout                   = 5 * time.Minute
 )
 
 type oauthIdentityDedupeAccount struct {
@@ -53,7 +52,10 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.runDataMigrationOnce(ctx, dataMigrationWorkspaceIdentityV3, db.migrateWorkspaceIdentityV3); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationClaudeProviderV1, db.backfillClaudeProviderData)
+	if err := db.runDataMigrationOnce(ctx, dataMigrationClaudeAccountSoftDeleteV1, db.softDeleteClaudeAccounts); err != nil {
+		return err
+	}
+	return nil
 }
 
 // backfillUsageLogChannel 给存量 usage_logs 回填 channel：空值统一置 codex。
@@ -66,127 +68,34 @@ func (db *DB) backfillUsageLogChannel(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// backfillClaudeProviderData repairs two conservative pieces of provider
-// metadata for databases that predate the native Claude channel. Usage rows are
-// updated only when their endpoint/model clearly identifies Anthropic Messages
-// traffic and the credential generation still matches the account (or is a
-// legacy zero). Pure/mixed groups are left untouched; only groups whose active
-// members are all Claude accounts are promoted from the legacy Codex channel.
-func (db *DB) backfillClaudeProviderData(ctx context.Context, tx *sql.Tx) error {
-	upstreamTypeExpr := `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
+// softDeleteClaudeAccounts 软删除存量 upstream_type='claude' 账号。claude 渠道
+// 已从产品中剔除，这些行在所有渠道视图中均不可见；软删除保留行用于历史 usage
+// 归因，与渠道过滤（accountChannelFilterSQL 排除 'claude'）语义一致。
+func (db *DB) softDeleteClaudeAccounts(ctx context.Context, tx *sql.Tx) error {
+	upstreamTypeExpr := `LOWER(COALESCE(credentials->>'upstream_type', ''))`
 	if db.isSQLite() {
-		upstreamTypeExpr = `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
+		upstreamTypeExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 	}
-	// Do not update usage_logs with a correlated account subquery. On a large
-	// history that shape forces a full usage_logs scan (and a repeated accounts
-	// scan) while the migration holds the startup write transaction. Resolve the
-	// small set of Claude account generations once, then update by the existing
-	// account_id/credential_generation indexes in bounded batches.
-	accountRows, err := tx.QueryContext(ctx, `
-		SELECT id, COALESCE(credential_generation, 0)
-		FROM accounts a
-		WHERE `+upstreamTypeExpr+` = 'claude'
-		ORDER BY id`)
+	query := `
+		UPDATE accounts
+		SET status = 'deleted',
+			error_message = '',
+			cooldown_reason = '',
+			cooldown_until = NULL,
+			deleted_at = CURRENT_TIMESTAMP,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
+			AND ` + upstreamTypeExpr + ` = 'claude'`
+	res, err := tx.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("读取 Claude 账号代际: %w", err)
+		return fmt.Errorf("软删除 claude 渠道账号失败: %w", err)
 	}
-	const batchSize = 500
-	zeroGenerationIDs := make([]int64, 0)
-	idsByGeneration := make(map[int64][]int64)
-	for accountRows.Next() {
-		var id, generation int64
-		if err := accountRows.Scan(&id, &generation); err != nil {
-			accountRows.Close()
-			return fmt.Errorf("读取 Claude 账号代际: %w", err)
-		}
-		if generation <= 0 {
-			zeroGenerationIDs = append(zeroGenerationIDs, id)
-			continue
-		}
-		idsByGeneration[generation] = append(idsByGeneration[generation], id)
-	}
-	if err := accountRows.Err(); err != nil {
-		accountRows.Close()
-		return fmt.Errorf("读取 Claude 账号代际: %w", err)
-	}
-	if err := accountRows.Close(); err != nil {
-		return fmt.Errorf("关闭 Claude 账号代际游标: %w", err)
-	}
-
-	updateUsageBatch := func(ids []int64, generation *int64) (int64, error) {
-		var affectedTotal int64
-		for start := 0; start < len(ids); start += batchSize {
-			end := start + batchSize
-			if end > len(ids) {
-				end = len(ids)
-			}
-			batch := ids[start:end]
-			placeholders := dbPlaceholders(db.isSQLite(), 1, len(batch))
-			args := argsFromInt64s(batch)
-			generationPredicate := "COALESCE(credential_generation, 0) = 0"
-			if generation != nil {
-				args = append(args, *generation)
-				generationPlaceholder := "?"
-				if !db.isSQLite() {
-					generationPlaceholder = fmt.Sprintf("$%d", len(args))
-				}
-				generationPredicate = "credential_generation = " + generationPlaceholder
-			}
-			usageQuery := fmt.Sprintf(`
-				UPDATE usage_logs
-				SET channel = 'claude'
-				WHERE COALESCE(channel, '') IN ('', 'codex')
-				  AND account_id IN (%s)
-				  AND (LOWER(COALESCE(endpoint, '')) LIKE '/v1/messages%%'
-				       OR LOWER(COALESCE(model, '')) LIKE 'claude-%%')
-				  AND %s`, strings.Join(placeholders, ","), generationPredicate)
-			res, err := tx.ExecContext(ctx, usageQuery, args...)
-			if err != nil {
-				return affectedTotal, fmt.Errorf("回填 Claude usage_logs 渠道: %w", err)
-			}
-			if affected, err := res.RowsAffected(); err == nil {
-				affectedTotal += affected
-			}
-		}
-		return affectedTotal, nil
-	}
-
-	var usageAffected int64
-	if affected, err := updateUsageBatch(zeroGenerationIDs, nil); err != nil {
+	affected, err := res.RowsAffected()
+	if err != nil {
 		return err
-	} else {
-		usageAffected += affected
 	}
-	generations := make([]int64, 0, len(idsByGeneration))
-	for generation := range idsByGeneration {
-		generations = append(generations, generation)
-	}
-	sort.Slice(generations, func(i, j int) bool { return generations[i] < generations[j] })
-	for _, generation := range generations {
-		if affected, err := updateUsageBatch(idsByGeneration[generation], &generation); err != nil {
-			return err
-		} else {
-			usageAffected += affected
-		}
-	}
-	if usageAffected > 0 {
-		log.Printf("[data_migration] %s: %d 条 usage_logs 回填为 Claude", dataMigrationClaudeProviderV1, usageAffected)
-	}
-
-	groupQuery := `
-		UPDATE account_groups SET channel = 'claude'
-		WHERE COALESCE(channel, 'codex') = 'codex' AND id IN (
-			SELECT m.group_id
-			FROM account_group_members m
-			JOIN accounts a ON a.id = m.account_id
-			WHERE a.status <> 'deleted' AND COALESCE(a.error_message, '') <> 'deleted'
-			GROUP BY m.group_id
-			HAVING COUNT(*) > 0 AND COUNT(*) = SUM(CASE WHEN ` + upstreamTypeExpr + ` = 'claude' THEN 1 ELSE 0 END)
-		)`
-	if res, err := tx.ExecContext(ctx, groupQuery); err != nil {
-		return fmt.Errorf("归类 Claude 分组: %w", err)
-	} else if affected, err := res.RowsAffected(); err == nil && affected > 0 {
-		log.Printf("[data_migration] %s: %d 个存量分组归类为 Claude 渠道", dataMigrationClaudeProviderV1, affected)
+	if affected > 0 {
+		log.Printf("[data_migration] %s: 已软删除 %d 个 claude 渠道账号", dataMigrationClaudeAccountSoftDeleteV1, affected)
 	}
 	return nil
 }

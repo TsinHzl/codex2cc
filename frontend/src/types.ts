@@ -1,127 +1,11 @@
 export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
-export type UpstreamChannel = 'codex' | 'relay' | 'claude'
-
-// 管理台可见渠道设置（GET/PUT /settings/visible-channels）
-export interface ChannelTestSettings {
-  test_model: string
-  test_content: string
-  // 0 = 沿用全局 test_concurrency
-  test_concurrency: number
-}
-
-export interface ChannelTestSettingsResponse {
-  claude: ChannelTestSettings
-  default_test_content: string
-  default_test_concurrency: number
-  model_choices?: Partial<Record<'claude', string[]>>
-}
+export type UpstreamChannel = 'codex' | 'relay'
 
 export interface VisibleChannelsSettings {
   channels: UpstreamChannel[]
   all: UpstreamChannel[]
   fallback: UpstreamChannel
-}
-
-/** Claude 凭据形态:oauth=可刷新 OAuth;setup_token=长效 Setup Token(仅推理,1 年,无 RT)。 */
-export type ClaudeAuthKind = 'oauth' | 'setup_token' | 'api_key'
-
-/** Claude Code OAuth：第一步返回授权 URL 与 state。 */
-export interface ClaudeAuthURLResponse {
-  auth_url: string
-  state: string
-  mode?: ClaudeAuthKind
-  redirect_uri?: string
-}
-
-/** Claude sessionKey(cookie)一键换号请求。 */
-export interface ClaudeSessionKeyExchangeRequest {
-  session_key: string
-  mode?: ClaudeAuthKind
-  name?: string
-  proxy_url?: string
-  use_proxy_pool?: boolean
-  timezone?: string
-}
-
-/** Claude Setup Token 批量粘贴导入请求。 */
-export interface ClaudeSetupTokenImportRequest {
-  text?: string
-  tokens?: string[]
-  name?: string
-  proxy_url?: string
-  use_proxy_pool?: boolean
-  timezone?: string
-  group_refs?: Array<{ name: string; channel: 'claude' }>
-}
-
-/** Claude Code OAuth：第二步用 state+code 换取 token 并入库。 */
-export interface ClaudeExchangeCodeRequest {
-  state: string
-  code: string
-  name?: string
-  proxy_url?: string
-  use_proxy_pool?: boolean
-  timezone?: string
-}
-
-/** Claude Code：直接导入 cmd/claude_login 产出的 token JSON。 */
-export interface ClaudeImportTokenRequest {
-  access_token?: string
-  api_key?: string
-  auth_kind?: ClaudeAuthKind
-  base_url?: string
-  /** OAuth 凭据必填;Setup Token(auth_kind=setup_token)没有 RT。 */
-  refresh_token?: string
-  email?: string
-  account_id?: string
-  expires_at?: string
-  name?: string
-  proxy_url?: string
-  use_proxy_pool?: boolean
-  timezone?: string
-  /** API Key 账号:账号级自定义出站请求头,最后套用;网关保留头(鉴权/Content-Type/Accept 等)会被拒绝。 */
-  custom_headers?: Record<string, string> | null
-  /** API Key 账号:可选的 Claude Code 客户端身份仿真;空=透传(默认)。OAuth 账号沿用指纹替换语义。 */
-  claude_fingerprint_mode?: 'preserve' | 'force' | ''
-}
-
-/** Versioned, provider-scoped Claude OAuth export. Secret-bearing fields are
- * only returned by the administrator-only Claude export endpoint. */
-export interface ClaudeCredentialExportEntry extends ClaudeImportTokenRequest {
-  access_token: string
-  type: 'claude'
-  version: number
-  auth_kind: ClaudeAuthKind
-  plan_type?: string
-  models?: string[]
-  claude_fingerprint_mode?: 'preserve' | 'force' | ''
-  claude_user_agent?: string
-  fingerprint_headers?: Record<string, string>
-  tags?: string[]
-  group_refs?: Array<{ name: string; channel: 'claude' }>
-  enabled?: boolean
-}
-
-export interface ClaudeImportBundleItem {
-  id?: number
-  email?: string
-  ok: boolean
-  error?: string
-  warnings?: string[]
-}
-
-export interface ClaudeImportBundleResponse {
-  total: number
-  imported: number
-  failed: number
-  items: ClaudeImportBundleItem[]
-}
-
-export interface ClaudeAddAccountResponse {
-  message: string
-  id: number
-  email?: string
 }
 
 export interface ToastState {
@@ -153,7 +37,7 @@ export interface StatsResponse {
   rate_limited: number
   error: number
   today_requests: number
-  // 按上游渠道(codex/claude)拆分的账号与今日请求计数
+  // 按上游渠道(codex/relay)拆分的账号与今日请求计数
   channels?: Record<string, StatsChannelCounts>
 }
 
@@ -166,17 +50,6 @@ export interface AccountUsageWindow {
   model_success_counts?: Record<string, number>
   model_avg_first_token_ms?: Record<string, number>
 }
-
-/** Claude OAuth zero-spend quota bucket; model-scoped buckets include Fable. */
-export interface ClaudeUsageWindow {
-  name: string
-  label?: string
-  utilization: number
-  reset_at?: ISODateString
-  model_scoped?: boolean
-  model_family?: string
-}
-
 
 export type SubscriptionBusinessStatus = 'active' | 'expiring_today' | 'expired' | 'grace_period' | 'unknown'
 export type SubscriptionSyncState = 'confirmed' | 'pending' | 'failed' | 'unknown' | 'unsupported'
@@ -233,8 +106,7 @@ export interface AccountRow {
   account_type?: string
   openai_responses_api?: boolean
   claude_api?: boolean
-  /** Claude 凭据形态(仅 Claude 账号有值)。 */
-  claude_auth_kind?: ClaudeAuthKind | string
+  claude_auth_kind?: string
   claude_base_url?: string
   agent_identity?: boolean
   /** Safe, allowlisted User-Agent observed/generated for Claude upstream calls. */
@@ -259,7 +131,7 @@ export interface AccountRow {
   claude_client_version_override?: string
   claude_usage_probe_at?: ISODateString
   claude_usage_probe_error?: string
-  claude_usage_windows?: ClaudeUsageWindow[]
+  claude_usage_windows?: Array<{ name: string; label?: string; utilization: number; reset_at?: ISODateString; model_scoped?: boolean; model_family?: string }>
   /** True once the OAuth usage probe has run for this row (even with no windows). */
   claude_usage_windows_probed?: boolean
   timezone?: string
@@ -932,10 +804,6 @@ export interface UpdateAccountSchedulerRequest {
   scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
   codex_fingerprint_mode?: CodexFingerprintMode | null
-  claude_fingerprint_mode?: 'preserve' | 'force' | '' | null
-  claude_client_platform?: 'any' | 'claude_code_cli_only' | null
-  claude_version_policy?: 'passthrough' | 'fixed' | 'minimum' | null
-  claude_client_version?: string | null
   timezone?: string | null
   codex_turn_state?: string | null
   codex_turn_state_models?: string | null
@@ -2620,7 +2488,7 @@ export interface ModelInfo {
 
 export interface ModelsResponse {
   models: string[]
-  // Claude 渠道账号声明模型的并集;渠道选 claude 时模型下拉用这份
+  // Claude 渠道账号声明模型的并集;模型映射下拉展示用
   claude_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
@@ -2629,7 +2497,7 @@ export interface ModelsResponse {
 }
 
 export interface ChannelModelRefreshResult {
-  channel: 'codex' | 'claude' | string
+  channel: 'codex' | 'relay' | string
   groups?: number
   refreshed: number
   failed: number
@@ -2839,7 +2707,7 @@ export interface UsageLog {
   upstream_turn_state?: string
   id: number
   account_id: number
-  // 上游渠道(codex/claude),写入时固化;历史行回填,可能为空
+  // 上游渠道(codex/relay),写入时固化;历史行回填,可能为空
   channel?: string
   client_ip: string
   client_user_agent: string
@@ -3169,6 +3037,107 @@ export interface APIKeyRow {
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
 
+export interface APIKeySelfUsageBreakdown {
+  name: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface APIKeySelfUsageWindow extends APIKeyWindowUsage {
+  window_kind: 'fixed' | 'sliding'
+  reset_at?: string | null
+  decay_at?: string | null
+}
+
+export interface APIKeySelfUsageLog {
+  id: number
+  endpoint: string
+  model: string
+  effective_model: string
+  status_code: number
+  duration_ms: number
+  first_token_ms: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  image_input_tokens: number
+  image_output_tokens: number
+  cached_image_input_tokens: number
+  total_tokens: number
+  user_billed: number
+  user_billing_mode: string
+  image_unit_price: number
+  billed_image_count: number
+  input_cost: number
+  output_cost: number
+  cache_read_cost: number
+  total_cost: number
+  input_price_per_mtoken: number
+  output_price_per_mtoken: number
+  cache_read_price_per_mtoken: number
+  rate_multiplier: number
+  long_context: boolean
+  service_tier: string
+  stream: boolean
+  compact: boolean
+  has_compaction_history: boolean
+  via_websocket: boolean
+  upstream_error_kind: string
+  created_at: string
+}
+
+export interface APIKeySelfUsageReport {
+  summary: {
+    requests: number
+    tokens: number
+    input_tokens: number
+    output_tokens: number
+    cached_tokens: number
+    error_count: number
+    user_billed: number
+    avg_duration_ms: number
+    avg_first_token_ms: number
+    rpm: number
+    tpm: number
+  }
+  windows: {
+    today: APIKeySelfUsageWindow
+    last_5h: APIKeySelfUsageWindow
+    last_7d: APIKeySelfUsageWindow
+    last_30d: APIKeySelfUsageWindow
+  }
+  models: APIKeySelfUsageBreakdown[]
+  endpoints: APIKeySelfUsageBreakdown[]
+  recent_logs: APIKeySelfUsageLog[]
+  recent_logs_total: number
+  recent_logs_page: number
+  recent_logs_page_size: number
+}
+
+export interface PublicAPIKeyUsageResponse {
+  key: {
+    name: string
+    key: string
+    quota_limit: number
+    quota_used: number
+    total_used: number
+    reset_count: number
+    last_reset_at?: string | null
+    expires_at?: string | null
+    limits: APIKeyLimits
+    status: string
+    created_at: string
+  }
+  range: { name: string; start?: string | null; end: string }
+  usage: APIKeySelfUsageReport | null
+  model_request_usage: APIKeyModelRequestUsage[]
+}
+
 export type PromptFilterScope = 'inherit' | 'local_only' | 'off'
 
 export interface PromptFilterNewAPIBinding {
@@ -3327,29 +3296,4 @@ export interface CodexUserAgentPreview {
 
 export interface ObservedInstructionsResponse {
   samples: ObservedInstructionsSample[]
-}
-
-// ClaudeGlobalConfig 是系统设置里的 ClaudeCode 全局配置(全体 Claude 账号默认遵守)。
-export interface ClaudeGlobalConfig {
-  fingerprint_mode: 'preserve' | 'force' | ''
-  client_platform: 'any' | 'claude_code_cli_only'
-  version_policy: 'passthrough' | 'fixed' | 'minimum'
-  client_version: string
-  default_timezone: string
-  session_window_limit: number
-  cli_version_sync_enabled: boolean
-  cli_version_sync_interval_hours: number
-  first_token_timeout_seconds: number
-  stream_keepalive_enabled: boolean
-  synced_cli_version?: string
-  builtin_cli_version?: string
-  effective_cli_version?: string
-  allow_service_tier: boolean
-  allow_inference_geo: boolean
-  allow_speed: boolean
-  allow_safety_identifier: boolean
-  allowed_beta_headers: string[]
-  max_output_tokens: number
-  max_tool_count: number
-  max_tool_schema_bytes: number
 }

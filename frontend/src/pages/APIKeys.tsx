@@ -143,7 +143,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "claude";
+type UpstreamChannel = "auto" | "codex" | "relay";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -2572,7 +2572,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     allowLive: Boolean(limits.allow_live),
     upstreamChannel:
       limits.upstream_channel === "codex" ||
-      limits.upstream_channel === "claude"
+      limits.upstream_channel === "relay"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2654,14 +2654,14 @@ function UpstreamChannelPicker({
       icon: <ChannelLogo channel="codex" size={18} />,
     },
     {
-      key: "claude",
-      label: t("apiKeys.limits.upstreamChannelClaude"),
-      icon: <ChannelLogo channel="claude" size={18} />,
+      key: "relay",
+      label: t("apiKeys.limits.upstreamChannelRelay"),
+      icon: <ChannelLogo channel="relay" size={18} />,
     },
   ];
   return (
     <div>
-      <div className="grid grid-cols-5 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -2993,7 +2993,7 @@ function KeyScopeBudgetBadge({
   );
 }
 
-// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/claude），一眼区分 Key 用途。
+// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/relay），一眼区分 Key 用途。
 function KeyChannelBadge({
   keyRow,
   t,
@@ -3002,27 +3002,19 @@ function KeyChannelBadge({
   t: Translator;
 }) {
   const channel = keyRow.limits?.upstream_channel;
-  if (channel === "codex") {
+  if (channel === "codex" || channel === "relay") {
     return (
       <Badge
         variant="outline"
-        title={t("apiKeys.limits.upstreamChannelCodex")}
+        title={
+          channel === "relay"
+            ? t("apiKeys.limits.upstreamChannelRelay")
+            : t("apiKeys.limits.upstreamChannelCodex")
+        }
         className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
       >
-        <ChannelLogo channel="codex" size={12} />
-        Codex
-      </Badge>
-    );
-  }
-  if (channel === "claude") {
-    return (
-      <Badge
-        variant="outline"
-        title={t("apiKeys.limits.upstreamChannelClaude")}
-        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
-      >
-        <ChannelLogo channel="claude" size={12} />
-        Claude
+        <ChannelLogo channel={channel} size={12} />
+        {channel === "relay" ? "Relay" : "Codex"}
       </Badge>
     );
   }
@@ -3656,7 +3648,7 @@ function APIKeysSkeleton() {
 }
 
 // 套餐选项与后端 cleanPlanAllow 白名单保持一致(pro 与 prolite 相互独立)。
-// Codex / Claude 分列，自动渠道再合并；切渠道时只保留当前渠道能调度的套餐。
+// Codex / Relay 分列，自动渠道再合并；切渠道时只保留当前渠道能调度的套餐。
 const CODEX_PLAN_FILTER_OPTIONS = [
   "free",
   "plus",
@@ -3667,32 +3659,11 @@ const CODEX_PLAN_FILTER_OPTIONS = [
   "go",
 ] as const;
 
-// Claude OAuth profiles expose these normalized plan keys. Keep them
-// separate from the Codex plan allowlist so a Claude-bound API key
-// cannot accidentally be configured with an unrelated plan.
-const CLAUDE_PLAN_FILTER_OPTIONS = [
-  "claude",
-  "free",
-  "pro",
-  "max",
-  "max-5x",
-  "max-20x",
-  "team",
-  "enterprise",
-  "business",
-] as const;
-
-const PLAN_FILTER_OPTIONS = [
-  ...CODEX_PLAN_FILTER_OPTIONS,
-  ...CLAUDE_PLAN_FILTER_OPTIONS.filter(
-    (plan) =>
-      !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
-  ),
-];
+const PLAN_FILTER_OPTIONS = [...CODEX_PLAN_FILTER_OPTIONS];
 
 function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
-  if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
-  if (channel === "claude") return CLAUDE_PLAN_FILTER_OPTIONS;
+  if (channel === "codex" || channel === "relay")
+    return CODEX_PLAN_FILTER_OPTIONS;
   return PLAN_FILTER_OPTIONS;
 }
 

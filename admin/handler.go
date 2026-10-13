@@ -129,9 +129,6 @@ type Handler struct {
 	// accountCachesGen 在账号变更时递增;重建协程安装快照前校验代数,
 	// 防止变更前就开始读库的在途重建把旧数据写回缓存。
 	accountCachesGen atomic.Uint64
-	// Claude 用量采样只改变 Claude 列表投影；独立代数避免频繁采样让
-	// Codex 的大池快照无谓失效。
-	claudeAccountCachesGen atomic.Uint64
 
 	// 分析图表使用固定大小的聚合结果，避免把完整号池传给浏览器。与账号
 	// 快照分开缓存，只有展开分析区或 Dashboard runway 时才会构建。
@@ -973,8 +970,6 @@ func parseUsageChannel(c *gin.Context) string {
 	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
 	case database.UpstreamChannelCodex:
 		return database.UpstreamChannelCodex
-	case database.UpstreamChannelClaude:
-		return database.UpstreamChannelClaude
 	case database.UpstreamChannelRelay:
 		return database.UpstreamChannelRelay
 	}
@@ -1600,7 +1595,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		h.store.TriggerRecoveryProbeAsync()
 	}
 
-	// Optional ?channel=codex|claude — server-side filter so each channel's
+	// Optional ?channel=codex|relay — server-side filter so each channel's
 	// admin page only transfers and enriches its own account set.
 	channel := parseUsageChannel(c)
 	var pageSelection *accountPageSelection
@@ -4147,7 +4142,7 @@ type updateAccountModelsRequest struct {
 }
 
 // UpdateAccountModels 设置 OAuth 账号的支持模型白名单。
-// Claude 账号仅接受 claude-* 原生模型；空数组 = 清空白名单，放行全部模型；
+// 空数组 = 清空白名单，放行全部模型；
 // 非空时调度器只会把白名单内模型的请求派给该账号。
 func (h *Handler) UpdateAccountModels(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -5786,7 +5781,7 @@ type batchUpdateAccountsReq struct {
 
 func (h *Handler) accountOperationIdentity(id int64) (string, string) {
 	h.accountListCacheMu.RLock()
-	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelClaude, database.UpstreamChannelRelay} {
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelRelay} {
 		snapshot := h.accountListCache[channel]
 		if snapshot == nil {
 			continue
@@ -8440,9 +8435,6 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
 	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
-	// Claude OAuth profile tiers. Keep these independent from Codex
-	// labels so a Claude-bound key's plan gate survives normalization.
-	"claude": {}, "max": {}, "max-5x": {}, "max-20x": {},
 	"enterprise": {}, "business": {},
 }
 
@@ -11068,7 +11060,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 	filter := c.DefaultQuery("filter", "healthy")
 	idsParam := c.Query("ids")
 	remote := c.Query("remote")
-	// channel=codex/claude 限定导出渠道:各渠道账号页导出传自己的渠道,避免把
+	// channel=codex/relay 限定导出渠道:各渠道账号页导出传自己的渠道,避免把
 	// 其他渠道账号混进以渠道命名的导出文件。缺省仍导出全部,
 	// 远程迁移(remote=true)依赖全量语义。
 	channel := strings.ToLower(strings.TrimSpace(c.Query("channel")))
