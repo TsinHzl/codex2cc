@@ -32,10 +32,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ env.IMAGE_OWNER }}/codex2cc
+          # 注释不得写入 tags 块内：metadata-action 会把注释行当规则解析
           tags: |
-            # latest 仅在默认分支（master）构建时发布，tag 触发不覆盖
             type=raw,value=latest,enable={{is_default_branch}}
-            # v* tag 触发时产出语义版本 tag（0.1.0 / 0.1）
             type=sem,pattern={{version}}
             type=sem,pattern={{major}}.{{minor}}
             type=sha
