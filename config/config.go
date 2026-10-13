@@ -133,7 +133,7 @@ func Load(envPath string) (*Config, error) {
 	applyTimezone()
 
 	cfg := &Config{
-		Port:               8080,
+		Port:               8989,
 		MaxRequestBodySize: 48 * 1024 * 1024,
 	}
 
