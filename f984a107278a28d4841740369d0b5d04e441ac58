@@ -1,0 +1,225 @@
+openspec/config.yaml
+  7932b62d110431aa 1-18
+proxy/apikey_limits.go
+  7932b62d110431aa 348,356
+proxy/prompt_policy_stub.go
+  7932b62d110431aa 1-173
+frontend/src/lib/docsContent.test.mjs
+  7932b62d110431aa 33,58,60
+database/official_pricing_sync.go
+  7932b62d110431aa 66,79,97,101-102
+database/helpers_prompt_policy_test.go
+  7932b62d110431aa 1-18
+proxy/anthropic_test.go
+  7932b62d110431aa 1097-1104
+database/account_channel_test.go
+  7932b62d110431aa 17,36-37,60-62,65,83,103,110-111,137,144-145
+proxy/apikey_model_requests_test.go
+  7932b62d110431aa 79-84,127-128
+database/official_pricing_sync_test.go
+  7932b62d110431aa 22,34,39,46
+frontend/src/locales/zh.json
+  7932b62d110431aa 4117,4120
+proxy/handler_core.go
+  7932b62d110431aa 190-193,196,198-210,293,434,733-757,1261,1713-1714,1882,1964-1965
+proxy/model_capabilities.go
+  7932b62d110431aa 361-363,368-369
+database/shared_helpers.go
+  7932b62d110431aa 4,6,12,14-24,79,84,95,97-98,100
+proxy/stubs_channel.go
+  7932b62d110431aa 1-11,13-189,191-233
+database/model_pricing_override.go
+  7932b62d110431aa 54
+admin/handler.go
+  7932b62d110431aa 80-81,133,346,978-979,990-1002,1603-1604,4180-4181,4284-4293,5789,8443,11071-11072,11325
+frontend/src/components/ChannelScopeBadges.tsx
+  7932b62d110431aa 7
+proxy/count_tokens_test.go
+  7932b62d110431aa 1-62
+README.md
+  7932b62d110431aa 1-93
+proxy/codex_models_manifest_test.go
+  7932b62d110431aa 49-51
+admin/subscription_status.go
+  7932b62d110431aa 81-82
+database/sqlite_test.go
+  7932b62d110431aa 921-923,926,933-934,937,939,941-942,2711,3491,3493,3583,3587,3594,3601,3622-3623,3699,3718-3719
+frontend/src/lib/usageTokenDisplay.test.mjs
+  7932b62d110431aa 71
+openspec/project.md
+  7932b62d110431aa 1-48
+proxy/image_log_stub.go
+  7932b62d110431aa 6,22-24,37-46,151-153,362,383-385,400-403,624-628,630,633
+frontend/src/lib/visibleChannels.test.mjs
+  7932b62d110431aa 7-8,10-12,16-17
+database/scheduler_outbox.go
+  7932b62d110431aa 328
+database/data_migrations.go
+  7932b62d110431aa 22,59,398
+auth/store.go
+  7932b62d110431aa 489-495,4609
+proxy/stubs_core.go
+  7932b62d110431aa 19-24
+proxy/anthropic.go
+  7932b62d110431aa 349,377,391,393,457-463
+docs/部署指南_服务端.md
+  7932b62d110431aa 1-114
+database/account_groups.go
+  7932b62d110431aa 24,32-34,40-41
+proxy/model_pricing_sync.go
+  7932b62d110431aa 162,164
+frontend/package.json
+  7932b62d110431aa 2
+database/invite_guide_settings.go
+  7932b62d110431aa 12
+database/quality_test_prompt_schema.go
+  7932b62d110431aa 1-29
+database/sqlite.go
+  7932b62d110431aa 524,582
+proxy/upstream_drain.go
+  7932b62d110431aa 38
+admin/visible_channels.go
+  7932b62d110431aa 49
+.github/workflows/docker-build.yaml
+  7932b62d110431aa 1-48
+frontend/src/locales/en.json
+  7932b62d110431aa 4118,4121
+proxy/codex_fingerprint_test.go
+  7932b62d110431aa 553-554
+admin/handler_test.go
+  7932b62d110431aa 183,3012,3029,3031,3033-3037,3039,3064-3066
+Dockerfile
+  7932b62d110431aa 1-31
+admin/review_regression_test.go
+  7932b62d110431aa 4
+database/image_user_billing.go
+  7932b62d110431aa 18
+admin/wham_daily_probe.go
+  7932b62d110431aa 261-262,375
+security/promptfilter/envelope_test.go
+  7932b62d110431aa 278,280
+database/billing_test.go
+  7932b62d110431aa 437,457-459
+proxy/downstream_keepalive_regression_test.go
+  7932b62d110431aa 181-183
+frontend/src/types.ts
+  7932b62d110431aa 3
+.dockerignore
+  7932b62d110431aa 1-14
+admin/account_page_stats_test.go
+  7932b62d110431aa 81-84,87
+proxy/stream_flush_writer.go
+  7932b62d110431aa 116-117,316
+proxy/handler_anthropic.go
+  7932b62d110431aa 27-28,206,211,215,224,226,380-384,387,390-391,393-395,401,526-528,531
+proxy/handler_anthropic_stream_failure_test.go
+  7932b62d110431aa 68-71,131-133,246-262
+admin/accounts_paged_test.go
+  7932b62d110431aa 35-37,39-43,46,48,60,108,110,118,172-174,198,581,584-585,587-589,623-626
+database/credential_cas.go
+  7932b62d110431aa 1-130
+admin/responses.go
+  7932b62d110431aa 28
+proxy/codex_models_manifest.go
+  7932b62d110431aa 27,107,155,283-286,289-290,292-293,295
+admin/accounts_paged.go
+  7932b62d110431aa 347,795-796,1048-1055,1149
+database/visible_channels_settings_test.go
+  7932b62d110431aa 15,17-19
+proxy/model_mapping_test.go
+  7932b62d110431aa 508-511
+admin/model_refresh_all.go
+  7932b62d110431aa 20-21,369,374
+admin/test_connection_usage.go
+  7932b62d110431aa 98
+database/channel_test_settings.go
+  7932b62d110431aa 11,31,37
+docker-compose.yml
+  7932b62d110431aa 1-20
+database/image_billing.go
+  7932b62d110431aa 44-46
+database/postgres.go
+  7932b62d110431aa 1078,1202,1207,1756,1776,1785-1786,1797-1798,1803,2934,2938,3109,3113,3117,4315,4928,5910,8186,8193
+proxy/model_mapping.go
+  7932b62d110431aa 211-212,217
+database/visible_channels_settings.go
+  7932b62d110431aa 16
+security/promptfilter/advanced_guard_test.go
+  7932b62d110431aa 154,161-162
+proxy/handler_core_retry.go
+  7932b62d110431aa 5,47-55,62,64-68,79-81,94,96-98,105-107,376-377,398-400,428-430,471,547,551-557,561,563-565,621-624,653,1018-1020
+frontend/src/components/OperationResultsModal.tsx
+  7932b62d110431aa 3
+frontend/src/lib/qualityTest.ts
+  7932b62d110431aa 125-128
+proxy/official_model_pricing.go
+  7932b62d110431aa 48,89-90,152
+proxy/executor.go
+  7932b62d110431aa 521,688-689
+frontend/src/lib/visibleChannels.ts
+  7932b62d110431aa 4,6
+proxy/endpoint_keepalive.go
+  7932b62d110431aa 37,40-42,48-49
+.gitignore
+  7932b62d110431aa 1-24
+proxy/codex_tool_names.go
+  7932b62d110431aa 17
+proxy/handler.go
+  7932b62d110431aa 1-514
+frontend/src/components/Layout.tsx
+  7932b62d110431aa 4
+database/parse_time_value.go
+  7932b62d110431aa 3-6
+proxy/scoped_models_test.go
+  7932b62d110431aa 6
+proxy/claude_first_token_timeout.go
+  7932b62d110431aa 9-12
+proxy/scoped_models.go
+  7932b62d110431aa 73-74,167-171,173-180
+main.go
+  7932b62d110431aa 1-614
+proxy/continuous_retry_deadline.go
+  7932b62d110431aa 274-277
+admin/model_refresh_all_test.go
+  7932b62d110431aa 17-18,32-33,43,45,57,72-73
+proxy/codex_cli_version_sync.go
+  7932b62d110431aa 8,187,189
+admin/export_proxy_test.go
+  7932b62d110431aa 22-23
+proxy/handler_core_filter_test.go
+  7932b62d110431aa 1-82
+database/account_health_test.go
+  7932b62d110431aa 22-23
+database/billing.go
+  7932b62d110431aa 32
+database/api_key_limits_codec.go
+  7932b62d110431aa 3-7
+proxy/egress.go
+  7932b62d110431aa 23,82
+proxy/routing_hint.go
+  7932b62d110431aa 53
+admin/account_groups.go
+  7932b62d110431aa 477
+proxy/translator.go
+  7932b62d110431aa 1554
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "f984a107278a28d4841740369d0b5d04e441ac58",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 4060,
+      "total_deletions": 3887,
+      "accepted_lines": 3314,
+      "overriden_lines": 6
+    }
+  }
+}
