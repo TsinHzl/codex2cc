@@ -22,11 +22,11 @@ RUN apk add --no-cache ca-certificates tzdata sqlite-libs
 WORKDIR /app
 COPY --from=go-builder /codex2cc /app/codex2cc
 ENV CODEX_BIND=0.0.0.0 \
-    CODEX_PORT=8080 \
+    CODEX_PORT=8989 \
     DATABASE_DRIVER=sqlite \
     DATABASE_PATH=/app/data/codex2cc.db \
     CACHE_DRIVER=memory \
     TZ=Asia/Shanghai
 VOLUME ["/app/data"]
-EXPOSE 8080
+EXPOSE 8989
 ENTRYPOINT ["/app/codex2cc"]

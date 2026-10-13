@@ -31,7 +31,7 @@ cp .env.example .env
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `CODEX_PORT` | 监听端口 | `8080` |
+| `CODEX_PORT` | 监听端口 | `8989` |
 | `CODEX_BIND` | 监听地址 | `0.0.0.0` |
 | `ADMIN_SECRET` | 管理后台密钥（留空则首启引导初始化） | 空 |
 | `DATABASE_DRIVER` | `postgres` / `sqlite` | `postgres` |
@@ -64,14 +64,14 @@ docker compose up -d
 
 ### 4. 管理后台
 
-首次访问 `http://<host>:8080/admin/`，按引导设置管理员密钥并添加上游账号。
+首次访问 `http://<host>:8989/admin/`，按引导设置管理员密钥并添加上游账号。
 
 ## [CC] CLI 接入示例
 
 Claude Code 通过环境变量指向本网关：
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8989
 export ANTHROPIC_AUTH_TOKEN=<管理后台生成的 API Key>
 claude
 ```

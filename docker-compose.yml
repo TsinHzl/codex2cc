@@ -4,7 +4,7 @@ services:
     container_name: codex2cc
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8989:8989"
     env_file:
       - .env
     environment:
