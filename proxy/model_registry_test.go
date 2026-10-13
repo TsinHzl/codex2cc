@@ -121,7 +121,7 @@ func TestReasoningEffortModelsAreIncludedInCatalog(t *testing.T) {
 	}
 	if settings == nil {
 		settings = &database.SystemSettings{
-			SiteName:                         "CodexProxy",
+			SiteName:                         "codex2cc",
 			MaxConcurrency:                   2,
 			TestModel:                        "gpt-5.4",
 			TestConcurrency:                  50,

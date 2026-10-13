@@ -1454,7 +1454,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                          "CodexProxy",
+		SiteName:                          "codex2cc",
 		MaxConcurrency:                    2,
 		GlobalRPM:                         0,
 		TestModel:                         "gpt-5.4",

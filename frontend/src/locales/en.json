@@ -5021,11 +5021,11 @@
   },
   "guide": {
     "title": "Usage Guide",
-    "description": "Learn how to configure and call CodexProxy API endpoints",
+    "description": "Learn how to configure and call codex2cc API endpoints",
     "copy": "Copy",
     "copied": "Copied",
     "endpoints": "API Endpoints",
-    "endpointsDesc": "CodexProxy provides three API endpoints compatible with different client formats.",
+    "endpointsDesc": "codex2cc provides three API endpoints compatible with different client formats.",
     "responsesTitle": "POST /v1/responses",
     "responsesDesc": "Native Codex Responses API endpoint. Directly proxies requests to upstream. For Codex CLI, OpenAI SDK and other native clients.",
     "chatTitle": "POST /v1/chat/completions",
@@ -5377,7 +5377,7 @@
   },
   "apiRef": {
     "title": "API Reference",
-    "description": "CodexProxy API endpoint reference documentation with request formats and response examples",
+    "description": "codex2cc API endpoint reference documentation with request formats and response examples",
     "authSection": "Authentication",
     "authDesc": "All API requests require a key passed via one of the following methods:",
     "responses": {

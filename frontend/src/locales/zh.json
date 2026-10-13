@@ -5020,11 +5020,11 @@
   },
   "guide": {
     "title": "使用教程",
-    "description": "了解如何配置和调用 CodexProxy API 端点",
+    "description": "了解如何配置和调用 codex2cc API 端点",
     "copy": "复制",
     "copied": "已复制",
     "endpoints": "API 端点",
-    "endpointsDesc": "CodexProxy 提供三个 API 端点，兼容不同的客户端格式。",
+    "endpointsDesc": "codex2cc 提供三个 API 端点，兼容不同的客户端格式。",
     "responsesTitle": "POST /v1/responses",
     "responsesDesc": "Codex Responses API 原生端点，直接透传请求到上游。适用于 Codex CLI、OpenAI SDK 等原生客户端。",
     "chatTitle": "POST /v1/chat/completions",
@@ -5376,7 +5376,7 @@
   },
   "apiRef": {
     "title": "API 文档",
-    "description": "CodexProxy API 端点参考文档，包含请求格式和响应示例",
+    "description": "codex2cc API 端点参考文档，包含请求格式和响应示例",
     "authSection": "认证",
     "authDesc": "所有 API 请求需要通过以下方式之一传递密钥：",
     "responses": {

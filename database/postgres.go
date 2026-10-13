@@ -1240,7 +1240,7 @@ func (db *DB) migrate(ctx context.Context) error {
 
 			CREATE TABLE IF NOT EXISTS system_settings (
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-				site_name          TEXT DEFAULT 'CodexProxy',
+				site_name          TEXT DEFAULT 'codex2cc',
 				site_logo          TEXT DEFAULT '',
 				background_config  TEXT DEFAULT '{}',
 				claude_config      TEXT DEFAULT '{}',
@@ -1307,7 +1307,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		PRIMARY KEY (account_id, model)
 	);
 	CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'codex2cc';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS claude_config TEXT DEFAULT '{}';
@@ -2203,7 +2203,7 @@ func (db *DB) ResetAllAPIKeyQuotas(ctx context.Context) ([]APIKeyQuotaResetTarge
 
 // ==================== System Settings ====================
 
-const DefaultSiteName = "CodexProxy"
+const DefaultSiteName = "codex2cc"
 
 func NormalizeSiteName(value string) string {
 	value = strings.TrimSpace(value)
@@ -2499,7 +2499,7 @@ func NormalizeSchedulerEngine(value string, legacyFastEnabled bool) string {
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
-		SELECT COALESCE(site_name, 'CodexProxy'), COALESCE(site_logo, ''),
+		SELECT COALESCE(site_name, 'codex2cc'), COALESCE(site_logo, ''),
 		       max_concurrency, global_rpm, test_model, COALESCE(test_content, 'hi'), test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),

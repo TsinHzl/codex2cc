@@ -259,7 +259,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-					site_name TEXT DEFAULT 'CodexProxy',
+					site_name TEXT DEFAULT 'codex2cc',
 					site_logo TEXT DEFAULT '',
 					background_config TEXT DEFAULT '{}',
 					claude_config TEXT DEFAULT '{}',
@@ -598,7 +598,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"account_groups", "channel", "TEXT DEFAULT 'codex'"},
 		{"account_groups", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"account_groups", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
-		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
+		{"system_settings", "site_name", "TEXT DEFAULT 'codex2cc'"},
 		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
 		{"system_settings", "background_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "claude_config", "TEXT DEFAULT '{}'"},

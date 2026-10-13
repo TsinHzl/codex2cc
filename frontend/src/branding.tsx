@@ -3,7 +3,7 @@ import { api } from './api'
 import type { SiteBranding } from './types'
 import defaultLogo from './assets/logo.png'
 
-export const DEFAULT_SITE_NAME = 'CodexProxy'
+export const DEFAULT_SITE_NAME = 'codex2cc'
 export const DEFAULT_SITE_LOGO = defaultLogo
 const DEFAULT_FAVICON = `${import.meta.env.BASE_URL}favicon.png`
 const DEFAULT_BACKGROUND_GLASS_OPACITY = 58

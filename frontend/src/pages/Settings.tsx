@@ -2052,7 +2052,7 @@ export default function Settings() {
     }
   }, [])
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
-    site_name: 'CodexProxy',
+    site_name: 'codex2cc',
     site_logo: '',
     background_image: '',
     background_opacity: 18,
@@ -4263,7 +4263,7 @@ export default function Settings() {
                         <Input
                           value={settingsForm.site_name}
                           maxLength={80}
-                          placeholder="CodexProxy"
+                          placeholder="codex2cc"
                           onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, site_name: e.target.value }))}
                         />
                       </SettingField>
@@ -4305,7 +4305,7 @@ export default function Settings() {
                     <SettingField label={t('settings.siteLogo')} description={t('settings.siteLogoDesc')}>
                       <div className="flex items-center gap-3">
                         <div className="flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-background shadow-sm">
-                          <img src={siteLogoPreview} alt={settingsForm.site_name || 'CodexProxy'} className="size-full object-cover" />
+                          <img src={siteLogoPreview} alt={settingsForm.site_name || 'codex2cc'} className="size-full object-cover" />
                         </div>
                         <div className="min-w-0 flex-1 space-y-2">
                           <Input
@@ -4395,7 +4395,7 @@ export default function Settings() {
                           </div>
                         )}
                         <div className="space-y-0.5">
-                          <div className="text-xs font-bold leading-none text-foreground">{settingsForm.site_name || 'CodexProxy'}</div>
+                          <div className="text-xs font-bold leading-none text-foreground">{settingsForm.site_name || 'codex2cc'}</div>
                           <div className="text-[10px] text-muted-foreground">毛玻璃预览 Glass Effect</div>
                         </div>
                       </div>

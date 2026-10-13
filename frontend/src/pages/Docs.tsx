@@ -408,7 +408,7 @@ function slugProviderId(name: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return slug || "codexproxy";
+  return slug || "codex2cc";
 }
 
 function modelIncludes(models: string[], model?: string) {
@@ -578,7 +578,7 @@ export default function Docs() {
     ccSwitchApp === "claude" ? claudeModelOptions : modelOptions;
   const quickTools = useMemo(() => buildQuickTools(docsLocale), [docsLocale]);
   const ccSwitchConfig = CC_SWITCH_APPS[ccSwitchApp];
-  const siteName = settings?.site_name?.trim() || "CodexProxy";
+  const siteName = settings?.site_name?.trim() || "codex2cc";
   const defaultCcSwitchName = `${siteName} ${ccSwitchConfig.suffix}`;
   const defaultCherryProviderId = slugProviderId(siteName);
   const showQuickCodexOptions =
