@@ -35,6 +35,9 @@ jobs:
           tags: |
             # latest 仅在默认分支（master）构建时发布，tag 触发不覆盖
             type=raw,value=latest,enable={{is_default_branch}}
+            # v* tag 触发时产出语义版本 tag（0.1.0 / 0.1 / 0）
+            type=sem,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sem,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
 
       - uses: docker/build-push-action@v6
