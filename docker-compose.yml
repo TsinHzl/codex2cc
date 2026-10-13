@@ -1,0 +1,20 @@
+services:
+  codex2cc:
+    image: ghcr.io/${IMAGE_OWNER:-tsinhzl}/codex2cc:${IMAGE_TAG:-latest}
+    container_name: codex2cc
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      # 容器内默认 SQLite + 内存缓存，如需 PostgreSQL/Redis 在 .env 覆盖
+      DATABASE_DRIVER: sqlite
+      DATABASE_PATH: /app/data/codex2cc.db
+      CACHE_DRIVER: memory
+    volumes:
+      - codex2cc-data:/app/data
+      - ./logs:/app/logs
+
+volumes:
+  codex2cc-data:

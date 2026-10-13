@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodexProxy 管理后台</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/favicon.png" />
+    <script>
+      ;(function () {
+        const root = document.documentElement
+        function readPreference(key) {
+          try {
+            return localStorage.getItem(key)
+          } catch {
+            return null
+          }
+        }
+
+        // Match ThemeProvider before React loads, including its system fallback.
+        const mode = readPreference('theme')
+        if (mode === 'dark' || (mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)) {
+          root.classList.add('dark')
+        }
+
+        const colorThemes = [
+          'default', 'claude', 'chatgpt', 'deepseek', 'graphite', 'aurora', 'rose', 'mono',
+          'one-dark-pro', 'github-dimmed', 'tokyo-night', 'dracula', 'monokai-pro',
+          'nord', 'catppuccin', 'gruvbox', 'solarized-light', 'quiet-light', 'ayu-light', 'noctis-lux',
+          'ocean', 'forest', 'lavender', 'amber', 'espresso', 'sakura', 'mint', 'midnight',
+          'glass', 'github', 'vercel', 'google', 'apple', 'notion', 'stripe', 'spotify', 'slack',
+        ]
+        const colorTheme = readPreference('color-theme')
+        root.classList.add('theme-' + (colorThemes.includes(colorTheme) ? colorTheme : 'default'))
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

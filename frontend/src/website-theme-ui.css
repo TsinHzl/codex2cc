@@ -1,0 +1,232 @@
+/* Website-inspired geometry for the shared UI and its previews.
+ * References: primer.style/product, vercel.com/geist, material-web.dev,
+ * developer.apple.com/design, notion.com/help, docs.stripe.com/stripe-apps/style,
+ * developer.spotify.com/documentation/design, slack.com/help/articles/205166337.
+ * These are adaptations for this console, not copies of vendor components.
+ */
+
+/* A thumbnail owns its geometry so selecting a website style cannot reshape
+ * unrelated theme thumbnails. Its palette is provided by inline swatch tokens. */
+.appearance-thumbnail {
+  --website-card-radius: 12px;
+  --website-button-radius: 4px;
+  --website-nav-radius: 4px;
+  --website-card-shadow: 0 4px 16px #00000010;
+  --website-shadow-color: #00000012;
+}
+
+:root.theme-github, .appearance-thumbnail[data-ui='github'] {
+  --website-card-radius: 8px;
+  --website-button-radius: 6px;
+  --website-field-radius: 6px;
+  --website-nav-radius: 6px;
+  --website-card-shadow: 0 1px 0 var(--website-shadow-color, #1f23280a);
+  --website-button-weight: 600;
+  --website-nav-weight: 500;
+  --website-nav-size: 13px;
+}
+
+:root.theme-vercel, .appearance-thumbnail[data-ui='vercel'] {
+  --website-card-radius: 8px;
+  --website-button-radius: 6px;
+  --website-field-radius: 6px;
+  --website-nav-radius: 6px;
+  --website-card-shadow: 0 0 0 0 #0000;
+  --website-button-weight: 500;
+  --website-nav-weight: 500;
+  --website-nav-size: 13px;
+}
+
+:root.theme-google, .appearance-thumbnail[data-ui='google'] {
+  --website-card-radius: 24px;
+  --website-button-radius: 999px;
+  --website-field-radius: 12px;
+  --website-nav-radius: 999px;
+  --website-card-shadow: 0 2px 6px var(--website-shadow-color, #304b7010);
+  --website-button-weight: 600;
+  --website-nav-weight: 500;
+  --website-nav-size: 14px;
+}
+
+:root.theme-apple, .appearance-thumbnail[data-ui='apple'] {
+  --website-card-radius: 20px;
+  --website-button-radius: 999px;
+  --website-field-radius: 10px;
+  --website-nav-radius: 10px;
+  --website-card-shadow: 0 8px 28px var(--website-shadow-color, #1d1d1f0b);
+  --website-button-weight: 500;
+  --website-nav-weight: 500;
+  --website-nav-size: 14px;
+}
+
+:root.theme-notion, .appearance-thumbnail[data-ui='notion'] {
+  --website-card-radius: 6px;
+  --website-button-radius: 4px;
+  --website-field-radius: 4px;
+  --website-nav-radius: 4px;
+  --website-card-shadow: 0 0 0 0 #0000;
+  --website-button-weight: 500;
+  --website-nav-weight: 500;
+  --website-nav-size: 13px;
+}
+
+:root.theme-stripe, .appearance-thumbnail[data-ui='stripe'] {
+  --website-card-radius: 12px;
+  --website-button-radius: 8px;
+  --website-field-radius: 8px;
+  --website-nav-radius: 8px;
+  --website-card-shadow: 0 6px 20px var(--website-shadow-color, #203c611a);
+  --website-button-weight: 600;
+  --website-nav-weight: 500;
+  --website-nav-size: 13px;
+}
+
+:root.theme-spotify, .appearance-thumbnail[data-ui='spotify'] {
+  --website-card-radius: 12px;
+  --website-button-radius: 999px;
+  --website-field-radius: 8px;
+  --website-nav-radius: 8px;
+  --website-card-shadow: 0 0 0 0 #0000;
+  --website-button-weight: 700;
+  --website-nav-weight: 650;
+  --website-nav-size: 14px;
+}
+
+:root.theme-slack, .appearance-thumbnail[data-ui='slack'] {
+  --website-card-radius: 10px;
+  --website-button-radius: 6px;
+  --website-field-radius: 6px;
+  --website-nav-radius: 6px;
+  --website-card-shadow: 0 1px 3px var(--website-shadow-color, #3511390d);
+  --website-button-weight: 600;
+  --website-nav-weight: 500;
+  --website-nav-size: 14px;
+}
+
+/* Only website presets opt into geometry changes. ThemeProvider removes the
+ * preset's class when switching away, restoring all existing component styles. */
+:root:is(.theme-github, .theme-vercel, .theme-google, .theme-apple, .theme-notion, .theme-stripe, .theme-spotify, .theme-slack) {
+  &.dark { --website-shadow-color: #00000038; }
+
+  [data-slot='card'] {
+    border-radius: var(--website-card-radius);
+    /* Keep Tailwind's ring layers intact on interactive cards. */
+    --tw-shadow: var(--website-card-shadow);
+  }
+
+  :is([data-slot='dialog-content'], .data-table-shell, .appearance-workspace, .appearance-preview-window) {
+    border-radius: var(--website-card-radius);
+  }
+
+  :is(.appearance-workspace, .appearance-preview-window) {
+    box-shadow: var(--website-card-shadow);
+  }
+
+  [data-slot='button']:not([data-variant='link']) {
+    border-radius: var(--website-button-radius);
+    font-weight: var(--website-button-weight);
+  }
+
+  [data-slot='button'][data-variant='link'] { color: var(--website-link); }
+
+  :is([data-slot='input'], [data-slot='select-trigger'], .appearance-search) {
+    border-radius: var(--website-field-radius);
+  }
+
+  [data-slot='admin-sidebar'] nav a {
+    border-radius: var(--website-nav-radius);
+    font-size: var(--website-nav-size);
+    font-weight: var(--website-nav-weight);
+  }
+
+  [data-slot='admin-sidebar'] nav a[aria-current='page'] {
+    background: var(--website-nav-background);
+    border-color: transparent;
+    color: var(--website-nav-foreground);
+  }
+
+  [data-slot='admin-sidebar'] nav a[aria-current='page'] > span[aria-hidden='true'] {
+    background: var(--website-nav-foreground);
+  }
+
+  .appearance-demo-nav { border-radius: min(var(--website-nav-radius), 16px); }
+  .appearance-demo-nav.is-active {
+    color: var(--website-nav-foreground);
+    background: var(--website-nav-background);
+  }
+
+  .appearance-theme-card { border-radius: var(--website-card-radius); }
+  .appearance-theme-card:not([aria-pressed='true']) { box-shadow: var(--website-card-shadow); }
+  .appearance-theme-art { border-radius: max(3px, calc(var(--website-card-radius) - 7px)); }
+
+  :is(.appearance-demo-metrics > div, .appearance-demo-chart, .appearance-demo-request, .appearance-demo-notice) {
+    border-radius: calc(var(--website-card-radius) / 2);
+  }
+
+  :is(.appearance-demo-action, .appearance-demo-outline) {
+    border-radius: min(var(--website-button-radius), 30px);
+    font-weight: var(--website-button-weight);
+  }
+
+  .theme-settings-page .appearance-demo-action {
+    background: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+
+  .appearance-demo-input { border-radius: calc(var(--website-field-radius) / 1.5); }
+}
+
+/* Flat surfaces are part of the monochrome presets, including the page canvas. */
+:root:is(.theme-vercel, .theme-notion, .theme-spotify) body { background: var(--color-background); }
+
+:root.theme-google [data-slot='admin-sidebar'] nav a[aria-current='page'] > span[aria-hidden='true'],
+:root.theme-spotify [data-slot='admin-sidebar'] nav a[aria-current='page'] > span[aria-hidden='true'] { display: none; }
+
+:root.theme-google .appearance-window-chrome {
+  background-image: linear-gradient(90deg, #4285f4 25%, #ea4335 25% 50%, #fbbc04 50% 75%, #34a853 75%);
+  background-repeat: no-repeat;
+  background-position: bottom;
+  background-size: 100% 2px;
+}
+
+:root.theme-stripe .appearance-preview-stage {
+  background-image: radial-gradient(ellipse at top left, color-mix(in srgb, var(--color-primary) 15%, transparent), transparent 65%);
+}
+
+/* Slack's dark sidebar needs its own foreground and popup surfaces even when
+ * the content pane is light. Keep these tokens local to that chrome. */
+:root.theme-slack :is([data-slot='admin-sidebar'], [data-slot='admin-mobile-topbar'], .appearance-demo-sidebar) {
+  color: var(--color-foreground);
+  --color-foreground: #f8eff9;
+  --color-muted-foreground: #dfc9e2;
+  --color-primary: #f0e3f3;
+  --color-primary-foreground: #301431;
+  --color-card: hsl(var(--sidebar-background));
+  --color-card-foreground: #f8eff9;
+  --color-popover: hsl(var(--sidebar-background));
+  --color-popover-foreground: #f8eff9;
+  --color-border: #754676;
+  --color-muted: #69316b;
+  --color-accent: #69316b;
+  --color-accent-foreground: #f8eff9;
+  --success: 153 55% 70%;
+  --success-bg: 153 55% 70% / 0.12;
+  --appearance-muted-ink: #dfc9e2;
+  --appearance-line: #754676;
+}
+
+.appearance-thumbnail[data-ui='google'] .appearance-thumb-window {
+  border-top: 2px solid var(--thumb-primary);
+}
+.appearance-thumbnail[data-ui='spotify'] .appearance-thumb-sidebar > i:first-of-type {
+  background: color-mix(in srgb, var(--thumb-primary) 20%, var(--thumb-sidebar));
+}
+.appearance-thumbnail[data-ui='slack'] .appearance-thumb-sidebar {
+  color: #f8eff9;
+  border-color: #754676;
+}
+.appearance-thumbnail[data-ui='slack'] :is(.appearance-thumb-logo, .appearance-thumb-sidebar > i, .appearance-thumb-avatar) {
+  color: #f8eff9;
+  --thumb-muted: #916894;
+}
+.appearance-thumbnail[data-ui='slack'] .appearance-thumb-sidebar > i:first-of-type { background: #f0e3f3; }

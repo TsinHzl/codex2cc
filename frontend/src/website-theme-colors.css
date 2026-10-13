@@ -1,0 +1,387 @@
+/* Website-inspired palettes. UI geometry is defined in website-theme-ui.css. */
+@layer base {
+  /* GitHub Developer */
+  :root.theme-github {
+    --color-background: #f6f8fa;
+    --color-foreground: #1f2328;
+    --color-card: #ffffff;
+    --color-card-foreground: #1f2328;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #1f2328;
+    --color-primary: #1f883d;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #eaeef2;
+    --color-secondary-foreground: #1f2328;
+    --color-muted: #eaeef2;
+    --color-muted-foreground: #59636e;
+    --color-accent: #ddf4ff;
+    --color-accent-foreground: #1f2328;
+    --color-border: #d0d7de;
+    --color-input: #d0d7de;
+    --color-ring: #1f883d;
+    --sidebar-background: 210.00000 28.57143% 97.25490%;
+    --website-nav-foreground: #0969da;
+    --website-nav-background: #ddf4ff;
+    --website-link: #0969da;
+  }
+  :root.dark.theme-github {
+    --color-background: #0d1117;
+    --color-foreground: #e6edf3;
+    --color-card: #161b22;
+    --color-card-foreground: #e6edf3;
+    --color-popover: #161b22;
+    --color-popover-foreground: #e6edf3;
+    --color-primary: #3fb950;
+    --color-primary-foreground: #0d1117;
+    --color-secondary: #21262d;
+    --color-secondary-foreground: #e6edf3;
+    --color-muted: #21262d;
+    --color-muted-foreground: #9da7b3;
+    --color-accent: #183149;
+    --color-accent-foreground: #e6edf3;
+    --color-border: #30363d;
+    --color-input: #30363d;
+    --color-ring: #3fb950;
+    --sidebar-background: 216.00000 27.77778% 7.05882%;
+    --website-nav-foreground: #58a6ff;
+    --website-nav-background: #183149;
+    --website-link: #58a6ff;
+  }
+
+  /* Vercel Minimal */
+  :root.theme-vercel {
+    --color-background: #fafafa;
+    --color-foreground: #171717;
+    --color-card: #ffffff;
+    --color-card-foreground: #171717;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #171717;
+    --color-primary: #171717;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #ededed;
+    --color-secondary-foreground: #171717;
+    --color-muted: #ededed;
+    --color-muted-foreground: #626262;
+    --color-accent: #eeeeee;
+    --color-accent-foreground: #171717;
+    --color-border: #dedede;
+    --color-input: #dedede;
+    --color-ring: #171717;
+    --sidebar-background: 0.00000 0.00000% 100.00000%;
+    --website-nav-foreground: #171717;
+    --website-nav-background: #eeeeee;
+    --website-link: #171717;
+  }
+  :root.dark.theme-vercel {
+    --color-background: #000000;
+    --color-foreground: #ededed;
+    --color-card: #0a0a0a;
+    --color-card-foreground: #ededed;
+    --color-popover: #0a0a0a;
+    --color-popover-foreground: #ededed;
+    --color-primary: #ededed;
+    --color-primary-foreground: #0a0a0a;
+    --color-secondary: #1a1a1a;
+    --color-secondary-foreground: #ededed;
+    --color-muted: #1a1a1a;
+    --color-muted-foreground: #a8a8a8;
+    --color-accent: #222222;
+    --color-accent-foreground: #ededed;
+    --color-border: #303030;
+    --color-input: #303030;
+    --color-ring: #ededed;
+    --sidebar-background: 0.00000 0.00000% 0.00000%;
+    --website-nav-foreground: #ededed;
+    --website-nav-background: #222222;
+    --website-link: #ededed;
+  }
+
+  /* Google Material */
+  :root.theme-google {
+    --color-background: #f8fafd;
+    --color-foreground: #1f1f1f;
+    --color-card: #ffffff;
+    --color-card-foreground: #1f1f1f;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #1f1f1f;
+    --color-primary: #0b57d0;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #e9eef6;
+    --color-secondary-foreground: #1f1f1f;
+    --color-muted: #e9eef6;
+    --color-muted-foreground: #505867;
+    --color-accent: #d3e3fd;
+    --color-accent-foreground: #1f1f1f;
+    --color-border: #d7dee8;
+    --color-input: #d7dee8;
+    --color-ring: #0b57d0;
+    --sidebar-background: 216.92308 56.52174% 95.49020%;
+    --website-nav-foreground: #0842a0;
+    --website-nav-background: #d3e3fd;
+    --website-link: #0842a0;
+  }
+  :root.dark.theme-google {
+    --color-background: #131314;
+    --color-foreground: #e3e3e3;
+    --color-card: #1e1f20;
+    --color-card-foreground: #e3e3e3;
+    --color-popover: #1e1f20;
+    --color-popover-foreground: #e3e3e3;
+    --color-primary: #a8c7fa;
+    --color-primary-foreground: #062e6f;
+    --color-secondary: #282a2c;
+    --color-secondary-foreground: #e3e3e3;
+    --color-muted: #282a2c;
+    --color-muted-foreground: #b4b9c0;
+    --color-accent: #263d5a;
+    --color-accent-foreground: #e3e3e3;
+    --color-border: #45474a;
+    --color-input: #45474a;
+    --color-ring: #a8c7fa;
+    --sidebar-background: 225.00000 7.14286% 10.98039%;
+    --website-nav-foreground: #d3e3fd;
+    --website-nav-background: #263d5a;
+    --website-link: #d3e3fd;
+  }
+
+  /* Apple Silver */
+  :root.theme-apple {
+    --color-background: #f5f5f7;
+    --color-foreground: #1d1d1f;
+    --color-card: #ffffff;
+    --color-card-foreground: #1d1d1f;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #1d1d1f;
+    --color-primary: #0071e3;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #eaeaec;
+    --color-secondary-foreground: #1d1d1f;
+    --color-muted: #eaeaec;
+    --color-muted-foreground: #606065;
+    --color-accent: #e5f1ff;
+    --color-accent-foreground: #1d1d1f;
+    --color-border: #d8d8dd;
+    --color-input: #d8d8dd;
+    --color-ring: #0071e3;
+    --sidebar-background: 240.00000 11.11111% 96.47059%;
+    --website-nav-foreground: #0067ce;
+    --website-nav-background: #e5f1ff;
+    --website-link: #0067ce;
+  }
+  :root.dark.theme-apple {
+    --color-background: #000000;
+    --color-foreground: #f5f5f7;
+    --color-card: #1d1d1f;
+    --color-card-foreground: #f5f5f7;
+    --color-popover: #1d1d1f;
+    --color-popover-foreground: #f5f5f7;
+    --color-primary: #2997ff;
+    --color-primary-foreground: #04192d;
+    --color-secondary: #2b2b2d;
+    --color-secondary-foreground: #f5f5f7;
+    --color-muted: #2b2b2d;
+    --color-muted-foreground: #b0b0b5;
+    --color-accent: #102d4d;
+    --color-accent-foreground: #f5f5f7;
+    --color-border: #3a3a3c;
+    --color-input: #3a3a3c;
+    --color-ring: #2997ff;
+    --sidebar-background: 240.00000 5.55556% 7.05882%;
+    --website-nav-foreground: #69b4ff;
+    --website-nav-background: #102d4d;
+    --website-link: #69b4ff;
+  }
+
+  /* Notion Paper */
+  :root.theme-notion {
+    --color-background: #ffffff;
+    --color-foreground: #37352f;
+    --color-card: #ffffff;
+    --color-card-foreground: #37352f;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #37352f;
+    --color-primary: #37352f;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #f1f1ef;
+    --color-secondary-foreground: #37352f;
+    --color-muted: #f1f1ef;
+    --color-muted-foreground: #66645f;
+    --color-accent: #eeede9;
+    --color-accent-foreground: #37352f;
+    --color-border: #e3e2de;
+    --color-input: #e3e2de;
+    --color-ring: #37352f;
+    --sidebar-background: 60.00000 11.11111% 96.47059%;
+    --website-nav-foreground: #37352f;
+    --website-nav-background: #eeede9;
+    --website-link: #37352f;
+  }
+  :root.dark.theme-notion {
+    --color-background: #191919;
+    --color-foreground: #e3e2de;
+    --color-card: #202020;
+    --color-card-foreground: #e3e2de;
+    --color-popover: #202020;
+    --color-popover-foreground: #e3e2de;
+    --color-primary: #e3e2de;
+    --color-primary-foreground: #191919;
+    --color-secondary: #2c2c2c;
+    --color-secondary-foreground: #e3e2de;
+    --color-muted: #2c2c2c;
+    --color-muted-foreground: #adada9;
+    --color-accent: #343434;
+    --color-accent-foreground: #e3e2de;
+    --color-border: #3d3d3d;
+    --color-input: #3d3d3d;
+    --color-ring: #e3e2de;
+    --sidebar-background: 0.00000 0.00000% 12.54902%;
+    --website-nav-foreground: #e3e2de;
+    --website-nav-background: #343434;
+    --website-link: #e3e2de;
+  }
+
+  /* Stripe Indigo */
+  :root.theme-stripe {
+    --color-background: #f6f9fc;
+    --color-foreground: #0a2540;
+    --color-card: #ffffff;
+    --color-card-foreground: #0a2540;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #0a2540;
+    --color-primary: #635bff;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #e9eef5;
+    --color-secondary-foreground: #0a2540;
+    --color-muted: #e9eef5;
+    --color-muted-foreground: #52657c;
+    --color-accent: #eae8ff;
+    --color-accent-foreground: #0a2540;
+    --color-border: #d7e0eb;
+    --color-input: #d7e0eb;
+    --color-ring: #635bff;
+    --sidebar-background: 217.50000 50.00000% 96.86275%;
+    --website-nav-foreground: #554bd8;
+    --website-nav-background: #eae8ff;
+    --website-link: #554bd8;
+  }
+  :root.dark.theme-stripe {
+    --color-background: #0a1020;
+    --color-foreground: #e4eafa;
+    --color-card: #141e32;
+    --color-card-foreground: #e4eafa;
+    --color-popover: #141e32;
+    --color-popover-foreground: #e4eafa;
+    --color-primary: #a59bff;
+    --color-primary-foreground: #13132b;
+    --color-secondary: #202c43;
+    --color-secondary-foreground: #e4eafa;
+    --color-muted: #202c43;
+    --color-muted-foreground: #a6b5cf;
+    --color-accent: #2c2854;
+    --color-accent-foreground: #e4eafa;
+    --color-border: #36445e;
+    --color-input: #36445e;
+    --color-ring: #a59bff;
+    --sidebar-background: 223.84615 44.82759% 11.37255%;
+    --website-nav-foreground: #c0b9ff;
+    --website-nav-background: #2c2854;
+    --website-link: #c0b9ff;
+  }
+
+  /* Spotify Green */
+  :root.theme-spotify {
+    --color-background: #f6f8f6;
+    --color-foreground: #17221b;
+    --color-card: #ffffff;
+    --color-card-foreground: #17221b;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #17221b;
+    --color-primary: #087a35;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #e6eee8;
+    --color-secondary-foreground: #17221b;
+    --color-muted: #e6eee8;
+    --color-muted-foreground: #526159;
+    --color-accent: #dcebe0;
+    --color-accent-foreground: #17221b;
+    --color-border: #d2ddd5;
+    --color-input: #d2ddd5;
+    --color-ring: #087a35;
+    --sidebar-background: 140.00000 20.00000% 94.11765%;
+    --website-nav-foreground: #155d32;
+    --website-nav-background: #dcebe0;
+    --website-link: #155d32;
+  }
+  :root.dark.theme-spotify {
+    --color-background: #121212;
+    --color-foreground: #ffffff;
+    --color-card: #181818;
+    --color-card-foreground: #ffffff;
+    --color-popover: #181818;
+    --color-popover-foreground: #ffffff;
+    --color-primary: #1ed760;
+    --color-primary-foreground: #071b0e;
+    --color-secondary: #282828;
+    --color-secondary-foreground: #ffffff;
+    --color-muted: #282828;
+    --color-muted-foreground: #b3b3b3;
+    --color-accent: #303030;
+    --color-accent-foreground: #ffffff;
+    --color-border: #353535;
+    --color-input: #353535;
+    --color-ring: #1ed760;
+    --sidebar-background: 0.00000 0.00000% 0.00000%;
+    --website-nav-foreground: #ffffff;
+    --website-nav-background: #282828;
+    --website-link: #ffffff;
+  }
+
+  /* Slack Aubergine */
+  :root.theme-slack {
+    --color-background: #f8f7fa;
+    --color-foreground: #1d1c1d;
+    --color-card: #ffffff;
+    --color-card-foreground: #1d1c1d;
+    --color-popover: #ffffff;
+    --color-popover-foreground: #1d1c1d;
+    --color-primary: #4a154b;
+    --color-primary-foreground: #ffffff;
+    --color-secondary: #eeedf1;
+    --color-secondary-foreground: #1d1c1d;
+    --color-muted: #eeedf1;
+    --color-muted-foreground: #615d68;
+    --color-accent: #f0e3f3;
+    --color-accent-foreground: #1d1c1d;
+    --color-border: #dbd8e0;
+    --color-input: #dbd8e0;
+    --color-ring: #4a154b;
+    --sidebar-background: 298.88889 56.25000% 18.82353%;
+    --website-nav-foreground: #301431;
+    --website-nav-background: #f0e3f3;
+    --website-link: #301431;
+  }
+  :root.dark.theme-slack {
+    --color-background: #1a1d21;
+    --color-foreground: #e8e8e8;
+    --color-card: #222529;
+    --color-card-foreground: #e8e8e8;
+    --color-popover: #222529;
+    --color-popover-foreground: #e8e8e8;
+    --color-primary: #d6a5e2;
+    --color-primary-foreground: #2a1231;
+    --color-secondary: #2d3035;
+    --color-secondary-foreground: #e8e8e8;
+    --color-muted: #2d3035;
+    --color-muted-foreground: #afb4bb;
+    --color-accent: #48304f;
+    --color-accent-foreground: #e8e8e8;
+    --color-border: #42474e;
+    --color-input: #42474e;
+    --color-ring: #d6a5e2;
+    --sidebar-background: 298.53659 61.19403% 13.13725%;
+    --website-nav-foreground: #301431;
+    --website-nav-background: #f0e3f3;
+    --website-link: #301431;
+  }
+
+}

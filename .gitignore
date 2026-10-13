@@ -1,0 +1,24 @@
+# Logs
+*.log
+logs/
+.dac/
+
+# Go
+*.exe
+*.test
+*.out
+dist/
+codex2cc
+main
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Frontend
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep

@@ -1,0 +1,12345 @@
+package admin
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"mime"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"github.com/codex2cc/auth"
+	"github.com/codex2cc/cache"
+	"github.com/codex2cc/database"
+	"github.com/codex2cc/internal/openaiidentity"
+	"github.com/codex2cc/proxy"
+	"github.com/codex2cc/security"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+)
+
+// Handler 管理后台 API 处理器
+type Handler struct {
+	store             *auth.Store
+	modelRefreshFuncs map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	cache             cache.TokenCache
+	authCacheProxy    *proxy.Handler
+	db                *database.DB
+	cacheCfgStore     responseCacheSettingsStore
+	rateLimiter       *proxy.RateLimiter
+	systemUpdate      *systemUpdater
+	systemUpdateOnce  sync.Once
+	refreshAccount    func(context.Context, int64) error
+	probeUsage        func(context.Context, *auth.Account) error
+
+	codexUsageRefreshRunning atomic.Bool
+
+	activate5hWindow             func(context.Context, *auth.Account) error
+	executeUsageProbe            usageProbeRequestFunc
+	syncAccountPlanOnReset       func(context.Context, *auth.Account) error
+	queryResetCredits            func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit           func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	queryWhamDailyUsage          func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
+	queryWhamDailyTokenBreakdown func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error)
+	// 列表 page-stats 发现当前页缺少官方结算快照时，按账号做即时回补；
+	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
+	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
+	// （官方统计有滞后），让 page-stats 下发显式空态而不是无限触发回补。
+	whamDailyBackfillMu       sync.Mutex
+	whamDailyBackfillLast     map[int64]time.Time
+	whamDailyBackfillInFlight map[int64]struct{}
+	whamDailyBackfillFailedAt map[int64]time.Time
+	// patWhoAmIFailedAt 记录 PAT 账号 whoami 工作区补全最近一次失败时间（退避用）。
+	patWhoAmIFailedAt   map[int64]time.Time
+	whamDailySyncedOnce map[int64]struct{}
+	whamDailyDeepSynced map[int64]whamDailyDeepState
+	recordAccountEvent  func(int64, string, string)
+	memReader           memStatsReader
+	cpuSampler          *cpuSampler
+	startedAt           time.Time
+	pgMaxConns          int
+	redisPoolSize       int
+	databaseDriver      string
+	databaseLabel       string
+	cacheDriver         string
+	cacheLabel          string
+	adminSecretEnv      string
+
+	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
+	// 在大文件导入时堆出成千上万个阻塞协程。
+	importProbeQueueMu sync.Mutex
+	importProbeQueue   []func(context.Context)
+	importProbeWorkers int
+	importProbeActive  atomic.Int32
+	importLoadMu       sync.Mutex
+	importLoadTier     importLoadTier
+	importLoadReady    bool
+	importLoadDBWait   int64
+	importLoadChanged  time.Time
+	importLoadBusyTill time.Time
+	importLoadNow      func() time.Time
+	importLoadSnapshot func() importRuntimeLoadSnapshot
+
+	// 图表聚合内存缓存（10秒 TTL）
+	chartCacheMu   sync.RWMutex
+	chartCacheData map[string]*chartCacheEntry
+	// 余额查询短缓存避免账号列表重新渲染或多管理员同时打开页面时重复探测上游。
+	openAIResponsesBalanceMu    sync.RWMutex
+	openAIResponsesBalanceCache map[int64]openAIResponsesBalanceCacheEntry
+
+	// 账号请求统计缓存,按渠道分键(各自刷新互不牵连;旧全量路径
+	// 用 "all" 键)。分页路径 stale-while-revalidate,TTL 见 requestCountCacheTTL。
+	reqCountMu         sync.RWMutex
+	reqCountCache      map[string]*requestCountCacheEntry
+	reqCountRefreshMu  sync.Mutex
+	reqCountRefreshing map[string]bool
+	// 大池分批聚合的断点续跑半成品,见 requestCountStaging。
+	reqCountStagingMu sync.Mutex
+	reqCountStaging   map[string]*requestCountStaging
+
+	// 管理后台账号分页使用的轻量快照。快照按渠道缓存，只保存筛选、排序和
+	// 当前页定位所需的信息；完整账号响应仍只为当前页构建。
+	accountListCacheMu sync.RWMutex
+	accountListCache   map[string]*accountListSnapshot
+	accountListBuildMu sync.Mutex
+	// accountCachesGen 在账号变更时递增;重建协程安装快照前校验代数,
+	// 防止变更前就开始读库的在途重建把旧数据写回缓存。
+	accountCachesGen atomic.Uint64
+	// Claude 用量采样只改变 Claude 列表投影；独立代数避免频繁采样让
+	// Codex 的大池快照无谓失效。
+	claudeAccountCachesGen atomic.Uint64
+
+	// 分析图表使用固定大小的聚合结果，避免把完整号池传给浏览器。与账号
+	// 快照分开缓存，只有展开分析区或 Dashboard runway 时才会构建。
+	accountAnalysisCacheMu        sync.RWMutex
+	accountAnalysisCache          map[string]*accountAnalysisCacheEntry
+	accountAnalysisBuildMu        sync.Mutex
+	accountAnalysisTrafficMu      sync.RWMutex
+	accountAnalysisTraffic        map[string]*accountAnalysisTrafficCacheEntry
+	accountAnalysisTrafficBuildMu sync.Mutex
+
+	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
+	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
+	resetCreditLocks          sync.Map
+	resetCreditLastSuccess    sync.Map
+	resetCreditSuccessfulIDs  sync.Map
+	autoResetCreditsWake      chan struct{}
+	autoResetCreditsStartOnce sync.Once
+	autoResetCreditsWG        sync.WaitGroup
+	autoActivate5hWake        chan struct{}
+	autoActivate5hStartOnce   sync.Once
+	autoActivate5hWG          sync.WaitGroup
+	resetCreditPostMu         sync.Mutex
+	resetCreditPostWG         sync.WaitGroup
+	resetCreditPostCtx        context.Context
+	resetCreditPostCancel     context.CancelFunc
+	resetCreditPostClosed     bool
+	settingsUpdateMu          sync.Mutex
+
+	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
+	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
+	mergeDuplicateMu sync.Mutex
+
+	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
+	// 防止并发请求在“检查不存在”后同时建号。
+	agentIdentityImportMu sync.Mutex
+}
+
+type responseCacheSettingsStore interface {
+	GetResponseCacheSettings(context.Context) (database.ResponseCacheSettings, error)
+	UpdateResponseCacheSettings(
+		context.Context,
+		database.ResponseCacheSettingsUpdate,
+	) (database.ResponseCacheSettings, error)
+}
+
+func validateResponseCacheSettingsUpdateRanges(update database.ResponseCacheSettingsUpdate) error {
+	switch {
+	case update.LocalMaxBytes != nil &&
+		(*update.LocalMaxBytes < database.MinResponseCacheLocalMaxBytes ||
+			*update.LocalMaxBytes > database.MaxResponseCacheLocalMaxBytes):
+		return fmt.Errorf(
+			"%w: response_cache_local_max_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheLocalMaxBytes,
+			database.MaxResponseCacheLocalMaxBytes,
+		)
+	case update.LocalMaxEntryBytes != nil &&
+		(*update.LocalMaxEntryBytes < database.MinResponseCacheLocalMaxEntryBytes ||
+			*update.LocalMaxEntryBytes > database.MaxResponseCacheLocalMaxEntryBytes):
+		return fmt.Errorf(
+			"%w: response_cache_local_max_entry_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheLocalMaxEntryBytes,
+			database.MaxResponseCacheLocalMaxEntryBytes,
+		)
+	case update.ReconstructMaxBytes != nil &&
+		(*update.ReconstructMaxBytes < database.MinResponseCacheReconstructMaxBytes ||
+			*update.ReconstructMaxBytes > database.MaxResponseCacheReconstructMaxBytes):
+		return fmt.Errorf(
+			"%w: response_cache_reconstruct_max_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheReconstructMaxBytes,
+			database.MaxResponseCacheReconstructMaxBytes,
+		)
+	case update.WritePolicy != nil && !database.ValidResponseCacheWritePolicy(*update.WritePolicy):
+		return fmt.Errorf(
+			"%w: response_cache_write_policy must be %q or %q",
+			database.ErrInvalidResponseCacheSettings,
+			database.ResponseCacheWritePolicyAlways,
+			database.ResponseCacheWritePolicyOnDemand,
+		)
+	default:
+		return nil
+	}
+}
+
+func (h *Handler) cacheSettingsStore() responseCacheSettingsStore {
+	if h == nil {
+		return nil
+	}
+	if h.cacheCfgStore != nil {
+		return h.cacheCfgStore
+	}
+	if h.db == nil {
+		return nil
+	}
+	return h.db
+}
+
+type chartCacheEntry struct {
+	data      *database.ChartAggregation
+	expiresAt time.Time
+}
+
+const (
+	adminUsageStatsCacheNamespace = "admin:usage-stats"
+	adminChartCacheNamespace      = "admin:chart-data"
+	// v2:响应结构新增 reconciliation 字段,升版命名空间让 Redis 里
+	// 部署前写入的旧条目失效,避免零值对账在滚动窗口内展示。
+	adminAPIKeyAccountsNamespace   = "admin:api-key-accounts:v2"
+	adminAPIKeyStatsNamespace      = "admin:api-key-stats"
+	adminAccountWindowsNamespace   = "admin:account-usage-windows"
+	adminAPIKeyCacheNamespace      = "api-key"
+	adminAPIKeyCountNamespace      = "api-key-count"
+	adminUsageStatsCacheTTL        = 5 * time.Second
+	adminUsageRangeCacheTTL        = 35 * time.Second
+	adminChartCacheTTL             = 10 * time.Second
+	adminAccountWindowsCacheTTL    = 30 * time.Second
+	importFileSizeLimitBytes       = 200 * 1024 * 1024
+	importFileSizeLimitLabel       = "200MB"
+	accountRefreshBatchConcurrency = 4
+)
+
+func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
+	if h == nil || h.cache == nil || dest == nil {
+		return false
+	}
+	raw, ok, err := h.cache.GetRuntime(ctx, namespace, key)
+	if err != nil {
+		log.Printf("读取运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	if !ok || len(raw) == 0 {
+		return false
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		log.Printf("解析运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) setRuntimeJSON(ctx context.Context, namespace, key string, value interface{}, ttl time.Duration) {
+	if h == nil || h.cache == nil || value == nil {
+		return
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		log.Printf("编码运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return
+	}
+	if err := h.cache.SetRuntime(ctx, namespace, key, payload, ttl); err != nil {
+		log.Printf("写入运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func validateImportFileSize(fh *multipart.FileHeader) error {
+	if fh.Size > importFileSizeLimitBytes {
+		return fmt.Errorf("文件 %s 大小超过 %s", fh.Filename, importFileSizeLimitLabel)
+	}
+	return nil
+}
+
+func (h *Handler) usageProbeFunc() func(context.Context, *auth.Account) error {
+	if h != nil && h.probeUsage != nil {
+		return h.probeUsage
+	}
+	if h != nil {
+		return h.ProbeUsageSnapshot
+	}
+	return nil
+}
+
+func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64, source string) {
+	if h == nil || h.store == nil {
+		return
+	}
+	account := h.store.FindByID(accountID)
+	if account == nil {
+		return
+	}
+	// Agent Identity 无 AccessToken 但可凭签名做 /responses 探针，不能被此门拦下。
+	if account.GetAccessToken() == "" && !account.IsCodexAgentIdentity() {
+		return
+	}
+	probeFn := h.usageProbeFunc()
+	if probeFn == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	if err := probeFn(probeCtx, account); err != nil {
+		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
+		return
+	}
+	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），Claude 也使用
+	// Anthropic account UUID 而非 ChatGPT workspace 身份；两者都不能进入
+	// Codex 的 email+workspace 查重链。
+	if !shouldMergeImportedIdentity(account) {
+		return
+	}
+	// AT / codex_at 账号的 OAuth 身份（email + 有效工作区）在插入时无法从
+	// JWT 解出，由上面的 wham 探针补齐并落库。身份既已可知，此刻回查是否与
+	// 已有账号同一身份：若重复则把凭证合并进旧账号并软删本账号——与 RT 路径
+	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口。
+	// 合并按 email + 有效工作区身份进行；Chatgpt-Account-Id 覆盖代表独立路由。
+	// 数据库生命周期 ctx 与串行合并锁（防并发导入互相软删）。
+	h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source)
+}
+
+func shouldMergeImportedIdentity(account *auth.Account) bool {
+	return account != nil && !account.IsCodexAgentIdentity()
+}
+
+func (h *Handler) startDBBackgroundTask(task func(context.Context)) bool {
+	if h == nil || task == nil {
+		return false
+	}
+	if h.db != nil {
+		return h.db.RunBackgroundTask(task)
+	}
+	go task(context.Background())
+	return true
+}
+
+// startDBBackgroundTaskWithParent ties a task to both a caller-owned service
+// context and the database lifecycle. Cancellation of either context stops the
+// task, while the database tracker guarantees shutdown waits for its exit.
+func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task func(context.Context)) bool {
+	if task == nil {
+		return false
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	return h.startDBBackgroundTask(func(lifecycle context.Context) {
+		ctx, cancel := context.WithCancel(lifecycle)
+		stopParent := context.AfterFunc(parent, cancel)
+		defer func() {
+			stopParent()
+			cancel()
+		}()
+		task(ctx)
+	})
+}
+
+type importLoadTier uint8
+
+const (
+	importLoadLow importLoadTier = iota
+	importLoadMedium
+	importLoadHigh
+)
+
+const (
+	maxImportDBConcurrency    = 12
+	maxImportProbeConcurrency = 8
+	importPermitPollInterval  = 25 * time.Millisecond
+	importTierRecoveryDelay   = 5 * time.Second
+	importDBWaitBackoff       = 10 * time.Second
+)
+
+type importRuntimeLoadSnapshot struct {
+	RPM         int64
+	Active      int64
+	DBInUse     int
+	DBMaxOpen   int
+	DBWaitCount int64
+}
+
+type importConcurrencyLimits struct {
+	db    int
+	probe int
+}
+
+func (h *Handler) currentImportRuntimeLoad() importRuntimeLoadSnapshot {
+	if h == nil {
+		return importRuntimeLoadSnapshot{}
+	}
+	if h.importLoadSnapshot != nil {
+		return h.importLoadSnapshot()
+	}
+	var snapshot importRuntimeLoadSnapshot
+	if h.rateLimiter != nil {
+		snapshot.RPM = h.rateLimiter.GetCurrentRPM()
+		snapshot.Active = h.rateLimiter.GetActiveRequests()
+	}
+	if h.db != nil {
+		stats := h.db.Stats()
+		snapshot.DBInUse = stats.InUse
+		snapshot.DBMaxOpen = stats.MaxOpenConnections
+		snapshot.DBWaitCount = stats.WaitCount
+	}
+	return snapshot
+}
+
+func importDBUsagePercent(snapshot importRuntimeLoadSnapshot) int {
+	if snapshot.DBMaxOpen <= 0 || snapshot.DBInUse <= 0 {
+		return 0
+	}
+	return snapshot.DBInUse * 100 / snapshot.DBMaxOpen
+}
+
+// nextImportLoadTier 使用不同的升/降档阈值形成滞回：负载升高立即收紧，
+// 回落则必须越过更低阈值，避免临界 RPM 附近反复增减 worker。
+func nextImportLoadTier(current importLoadTier, initialized bool, snapshot importRuntimeLoadSnapshot, dbWaitIncreased bool) importLoadTier {
+	dbUsage := importDBUsagePercent(snapshot)
+	enterHigh := dbWaitIncreased || snapshot.RPM >= 600 || snapshot.Active >= 64 || dbUsage >= 70
+	enterMedium := snapshot.RPM >= 180 || snapshot.Active >= 16 || dbUsage >= 40
+	if !initialized {
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+
+	switch current {
+	case importLoadHigh:
+		if dbWaitIncreased || snapshot.RPM >= 400 || snapshot.Active >= 32 || dbUsage >= 50 {
+			return importLoadHigh
+		}
+		// 每次最多降一档，让恢复过程保持平滑。
+		return importLoadMedium
+	case importLoadMedium:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if snapshot.RPM < 120 && snapshot.Active < 8 && dbUsage < 25 {
+			return importLoadLow
+		}
+		return importLoadMedium
+	default:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+}
+
+func importLimitsForTier(tier importLoadTier, snapshot importRuntimeLoadSnapshot) importConcurrencyLimits {
+	limits := importConcurrencyLimits{db: maxImportDBConcurrency, probe: maxImportProbeConcurrency}
+	switch tier {
+	case importLoadHigh:
+		limits.db, limits.probe = 4, 4
+	case importLoadMedium:
+		limits.db, limits.probe = 8, 6
+	}
+	// 导入最多使用连接池的约四分之一；SQLite 小连接池也不会被导入独占。
+	if snapshot.DBMaxOpen > 0 {
+		poolShare := snapshot.DBMaxOpen / 4
+		if poolShare < 1 {
+			poolShare = 1
+		}
+		if limits.db > poolShare {
+			limits.db = poolShare
+		}
+	}
+	return limits
+}
+
+func (h *Handler) adaptiveImportLimits() importConcurrencyLimits {
+	if h == nil {
+		return importConcurrencyLimits{db: 4, probe: 4}
+	}
+	snapshot := h.currentImportRuntimeLoad()
+	now := time.Now()
+	if h.importLoadNow != nil {
+		now = h.importLoadNow()
+	}
+	h.importLoadMu.Lock()
+	defer h.importLoadMu.Unlock()
+
+	waitIncreased := h.importLoadReady && snapshot.DBWaitCount > h.importLoadDBWait
+	if waitIncreased {
+		h.importLoadBusyTill = now.Add(importDBWaitBackoff)
+	}
+	if now.Before(h.importLoadBusyTill) {
+		waitIncreased = true
+	}
+	nextTier := nextImportLoadTier(h.importLoadTier, h.importLoadReady, snapshot, waitIncreased)
+	if h.importLoadReady && nextTier < h.importLoadTier && now.Sub(h.importLoadChanged) < importTierRecoveryDelay {
+		nextTier = h.importLoadTier
+	}
+	if !h.importLoadReady || nextTier != h.importLoadTier {
+		h.importLoadChanged = now
+	}
+	h.importLoadTier = nextTier
+	h.importLoadReady = true
+	h.importLoadDBWait = snapshot.DBWaitCount
+	return importLimitsForTier(h.importLoadTier, snapshot)
+}
+
+func (h *Handler) importProbeWorkerCapacity() int {
+	capacity := maxImportProbeConcurrency
+	if h != nil && h.store != nil {
+		if configured := h.store.GetUsageProbeConcurrency(); configured > 0 && configured < capacity {
+			capacity = configured
+		}
+	}
+	return capacity
+}
+
+func (h *Handler) importProbeConcurrency() int {
+	limit := h.adaptiveImportLimits().probe
+	if capacity := h.importProbeWorkerCapacity(); limit > capacity {
+		limit = capacity
+	}
+	return limit
+}
+
+func acquireAdaptivePermit(ctx context.Context, active *atomic.Int32, limit func() int) bool {
+	ticker := time.NewTicker(importPermitPollInterval)
+	defer ticker.Stop()
+	for {
+		maxActive := limit()
+		if maxActive < 1 {
+			maxActive = 1
+		}
+		current := active.Load()
+		if current < int32(maxActive) && active.CompareAndSwap(current, current+1) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// runImportProbeTask 把导入预热放进进程内队列，并按当前导入并发上限启动 worker。
+// 排队任务只占一个函数引用，不会各自创建 goroutine；worker 在队列清空后退出。
+func (h *Handler) runImportProbeTask(fn func(context.Context)) {
+	if h == nil || fn == nil {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeQueue = append(h.importProbeQueue, fn)
+	if h.importProbeWorkers >= h.importProbeWorkerCapacity() {
+		h.importProbeQueueMu.Unlock()
+		return
+	}
+	h.importProbeWorkers++
+	h.importProbeQueueMu.Unlock()
+
+	if h.startDBBackgroundTask(h.runImportProbeWorker) {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeWorkers--
+	h.importProbeQueue = nil
+	h.importProbeQueueMu.Unlock()
+}
+
+func (h *Handler) runImportProbeWorker(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			h.importProbeQueueMu.Lock()
+			h.importProbeQueue = nil
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+
+		h.importProbeQueueMu.Lock()
+		if len(h.importProbeQueue) == 0 {
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+		fn := h.importProbeQueue[0]
+		h.importProbeQueue[0] = nil
+		h.importProbeQueue = h.importProbeQueue[1:]
+		h.importProbeQueueMu.Unlock()
+
+		if !acquireAdaptivePermit(ctx, &h.importProbeActive, h.importProbeConcurrency) {
+			continue
+		}
+		fn(ctx)
+		h.importProbeActive.Add(-1)
+	}
+}
+
+type adaptiveImportDBLimiter struct {
+	handler *Handler
+	active  atomic.Int32
+}
+
+func (l *adaptiveImportDBLimiter) acquire(ctx context.Context) bool {
+	if l == nil || l.handler == nil {
+		return false
+	}
+	return acquireAdaptivePermit(ctx, &l.active, func() int {
+		return l.handler.adaptiveImportLimits().db
+	})
+}
+
+func (l *adaptiveImportDBLimiter) release() {
+	if l != nil {
+		l.active.Add(-1)
+	}
+}
+
+func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
+	h.runImportProbeTask(func(ctx context.Context) {
+		h.probeImportedAccountUsage(ctx, accountID, source)
+	})
+}
+
+// scheduleImportedAccountWarmup 导入后的换 AT / 用量探测。脚本批量加号和文件导入
+// 必须走同一道并发闸：裸 RT 换 AT 也会打上游，不限流会把网关和鉴权接口一起打满。
+func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, source string) {
+	if h == nil || acc == nil || id <= 0 {
+		return
+	}
+	if acc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, source)
+		return
+	}
+	if h.store != nil && !h.store.GetLazyMode() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
+		})
+	}
+}
+
+// commitImportedRuntimeAccounts 一次写入内存池，再按需排队预热。逐条 AddAccount
+// 会反复抢号池写锁；预热必须在入池之后，refreshAccountByID 靠 DBID 回查运行时账号。
+func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source string, skipRefresh bool) {
+	if h == nil || h.store == nil || len(accounts) == 0 {
+		return
+	}
+	h.store.AddAccounts(accounts)
+	if skipRefresh {
+		return
+	}
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		h.scheduleImportedAccountWarmup(acc, acc.DBID, source)
+	}
+}
+
+func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
+	if h == nil || h.store == nil || account == nil {
+		return
+	}
+	if h.store.MarkUsage7dRateLimited(account) {
+		log.Printf("导入账号 %d 已按 7d 用量耗尽标记限流 (%s)", account.DBID, source)
+	}
+}
+
+// importRefreshTransientRetryLimit 是导入换 AT 瞬时失败(超时/代理抖动/上游
+// 5xx/刷新锁竞争)的额外重试次数。瞬时失败不能一次就标粘性 error——error 没有
+// 任何自动重试,语义反而比 RT 死透(有冷却自愈)更重;批量导入撞上代理抖动
+// 会把一批好号永久标死。
+const importRefreshTransientRetryLimit = 3
+
+// importRefreshTransientRetryDelay 是两次导入刷新重试的间隔。var 便于测试缩短。
+var importRefreshTransientRetryDelay = 2 * time.Minute
+
+func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID int64, source string) {
+	h.refreshImportedAccountWithRetry(ctx, accountID, source, 0)
+}
+
+func (h *Handler) refreshImportedAccountWithRetry(ctx context.Context, accountID int64, source string, attempt int) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// 导入路径在身份合并后会统一 probe；刷新内部不再先 probe 一次，避免每个
+	// 裸 RT 成功换票后连续打两次 wham/subscription 上游。
+	err := h.refreshAccountByIDWithProbe(refreshCtx, accountID, false)
+	cancel()
+	if err != nil {
+		log.Printf("导入账号 %d 刷新失败(第 %d 次): %v", accountID, attempt+1, err)
+		if h.scheduleImportedRefreshRetry(accountID, source, attempt, err) {
+			return
+		}
+		h.markImportedRefreshFailure(accountID, err)
+		return
+	}
+	log.Printf("导入账号 %d 刷新成功", accountID)
+	// 裸 RT 导入时身份要等首次刷新后才可知：此刻回查身份重复，
+	// 若与已有账号同一身份则合并凭证并移除本账号（保留旧账号的用量统计）。
+	if h.mergeRefreshedDuplicateIntoExistingContext(ctx, accountID, source) {
+		return
+	}
+	h.probeImportedAccountUsage(ctx, accountID, source)
+}
+
+// scheduleImportedRefreshRetry 对瞬时刷新失败安排一次延迟重试:到点后重新走
+// 导入并发闸,不在闸内睡眠占槽。重试窗口内账号保持「刷新中」——这是真实状态
+// 且有界(最多 limit+1 次尝试)。永久失败或重试耗尽返回 false,交给调用方落状态。
+func (h *Handler) scheduleImportedRefreshRetry(accountID int64, source string, attempt int, err error) bool {
+	if h == nil || h.store == nil || err == nil {
+		return false
+	}
+	if auth.IsPermanentRefreshFailure(err) || attempt >= importRefreshTransientRetryLimit {
+		return false
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return false
+	}
+	time.AfterFunc(importRefreshTransientRetryDelay, func() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountWithRetry(ctx, accountID, source, attempt+1)
+		})
+	})
+	return true
+}
+
+// markImportedRefreshFailure 导入后换 AT 失败(瞬时失败已重试耗尽)时落状态，
+// 避免裸 RT 一直停在「刷新中」。会话作废 / RT 失效标未授权（时长由 unauthorized
+// 自适应 6/24h 策略决定，入参只是兜底）；其它失败标错误。
+func (h *Handler) markImportedRefreshFailure(accountID int64, err error) {
+	if h == nil || h.store == nil || err == nil {
+		return
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return
+	}
+	// store 的刷新路径对不可重试错误已经标过未授权冷却；再标一次会让
+	// FailureStreak 翻倍、自适应冷却直接跳 24h 档，并重复落库。
+	switch acc.RuntimeStatus() {
+	case "unauthorized", "error":
+		return
+	}
+	msg := err.Error()
+	if auth.IsPermanentRefreshFailure(err) {
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+		return
+	}
+	h.store.MarkError(acc, msg)
+}
+
+// mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
+// 同一 OAuth 身份。若重复，把新凭证（refresh_token 优先级最高，可自动续期）
+// 合并进已有账号——codex_* 用量快照键不在更新集里，旧账号的用量统计与按
+// 账号 ID 关联的请求历史全部保留——然后软删新插入的账号。返回 true 表示已合并。
+func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string) bool {
+	return h.mergeRefreshedDuplicateIntoExistingContext(context.Background(), newID, source)
+}
+
+func (h *Handler) mergeRefreshedDuplicateIntoExistingContext(parent context.Context, newID int64, source string) bool {
+	if h == nil || h.db == nil || h.store == nil {
+		return false
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	// 串行化合并：并发导入同一身份的多个账号时，两个合并流程若交错执行，
+	// 可能互相把对方选为“已有账号”，导致双方都被软删（账号丢失）。
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+
+	newRow, err := h.db.GetAccountByID(ctx, newID)
+	if err != nil || newRow == nil {
+		return false
+	}
+	email := strings.TrimSpace(newRow.GetCredential("email"))
+	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(
+		newRow.GetCredential("workspace_id"),
+		newRow.GetCredentialStringMap("custom_headers"),
+	)
+	if email == "" || effectiveWorkspaceID == "" {
+		return false
+	}
+	oldID, err := h.db.FindActiveAccountByOAuthRouteIdentity(ctx, email, effectiveWorkspaceID, newID)
+	if err != nil || oldID <= 0 {
+		return false
+	}
+	oldRow, err := h.db.GetAccountByID(ctx, oldID)
+	if err != nil || oldRow == nil {
+		return false
+	}
+
+	updates := make(map[string]interface{})
+	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "workspace_id", "user_id", "plan_type", "subscription_expires_at"} {
+		if v := strings.TrimSpace(newRow.GetCredential(key)); v != "" {
+			updates[key] = v
+		}
+	}
+	oldHeaders := oldRow.GetCredentialStringMap("custom_headers")
+	oldOverride := openaiidentity.WorkspaceOverrideFromHeaders(oldHeaders)
+	newOverride := openaiidentity.WorkspaceOverrideFromHeaders(newRow.GetCredentialStringMap("custom_headers"))
+	newTokenWorkspaceID := openaiidentity.NormalizeWorkspaceID(newRow.GetCredential("workspace_id"))
+	if oldOverride == "" && newOverride != "" && newTokenWorkspaceID != effectiveWorkspaceID {
+		// The duplicate is the same effective route only because the new row
+		// carries an explicit override. Preserve that route on the survivor
+		// before copying token-native identity fields from the new credentials.
+		updates["custom_headers"] = customHeadersWithWorkspaceOverride(oldHeaders, newOverride)
+	}
+	if len(updates) == 0 {
+		return false
+	}
+	proxyURL := strings.TrimSpace(newRow.ProxyURL)
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(oldRow.ProxyURL)
+	}
+	if err := h.db.UpdateOAuthAccountCredentials(ctx, oldID, updates, proxyURL); err != nil {
+		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
+		return false
+	}
+	// 新凭证刚在刷新/探针里验证过可用，旧账号此前的 error / 401 unauthorized 态
+	// 已经过时：不清掉的话，重授权后的 RT 被合并进来、新账号被软删，用户看到的
+	// 却是旧账号继续挂着"未授权"直到自适应冷却到期（issue #618）。与 JWT 可解出
+	// 身份、走 upsertOAuthIdentityAccount 的导入路径对齐；限速冷却不受影响。
+	if h.clearReimportedAccountErrorState(ctx, oldRow, "合并凭证") {
+		log.Printf("合并导入账号 %d 凭证时已清除已有账号 %d 的错误/401 状态", newID, oldID)
+	}
+	// 先软删新账号、再重载旧账号：reloadTokenAccount 会异步触发旧账号的
+	// 探针→再合并，若此刻新账号仍活跃，反向查重会把旧账号合并进新账号，
+	// 两边都被软删。软删前置让后续任何查重都看不到新账号。
+	if err := h.db.SoftDeleteAccount(ctx, newID); err != nil {
+		log.Printf("软删重复导入账号 %d 失败: %v", newID, err)
+	}
+	h.store.RemoveAccount(newID)
+	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
+		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
+	}
+	if err := h.db.InsertAccountEvent(ctx, newID, "deleted", fmt.Sprintf("merged_into_%d", oldID)); err != nil {
+		log.Printf("记录合并账号 %d 删除事件失败: %v", newID, err)
+	}
+	if err := h.db.InsertAccountEvent(ctx, oldID, "updated", "rt_upgrade_merge"); err != nil {
+		log.Printf("记录合并账号 %d 更新事件失败: %v", oldID, err)
+	}
+	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
+	return true
+}
+
+func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
+	if h == nil || h.cache == nil {
+		return
+	}
+	if err := h.cache.DeleteRuntime(ctx, namespace, key); err != nil {
+		log.Printf("删除运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey string) {
+	if h.authCacheProxy != nil {
+		h.authCacheProxy.InvalidateAPIKeyAuthCache(ctx)
+	}
+	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
+	if strings.TrimSpace(apiKey) != "" {
+		h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, apiKey)
+	}
+}
+
+func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*database.UsageStats, error) {
+	return h.getUsageStatsFilteredCached(ctx, rangeStart, rangeEnd, channel, database.UsageLogFilter{})
+}
+
+// getUsageStatsFilteredCached 带维度筛选(账号/密钥/模型/端点/搜索等)的完整统计。
+// 维度指纹并入缓存键:同一筛选组合在 30 秒桶内复用,不同组合互不串味。
+func (h *Handler) getUsageStatsFilteredCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, dim database.UsageLogFilter) (*database.UsageStats, error) {
+	cacheKey := ""
+	cacheTTL := adminUsageStatsCacheTTL
+	dimKey := usageStatsDimensionCacheKey(dim)
+	if rangeStart.IsZero() && rangeEnd.IsZero() && channel == "" && dimKey == "" {
+		cacheKey = "global"
+	} else if !rangeStart.IsZero() && !rangeEnd.IsZero() {
+		// 仪表盘每 15 秒刷新时 start/end 也会随之平移。按 30 秒桶复用完整统计结果，
+		// 既保留累计、区间、模型和分项口径，又避免同一分钟内重复扫描百万级日志。
+		cacheKey = fmt.Sprintf("range:%d:%d:%s%s", rangeStart.Unix()/30, rangeEnd.Unix()/30, channel, dimKey)
+		cacheTTL = adminUsageRangeCacheTTL
+	}
+	if cacheKey != "" {
+		var cached database.UsageStats
+		if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, &cached) {
+			return &cached, nil
+		}
+	}
+	stats, err := h.db.GetUsageStatsFiltered(ctx, rangeStart, rangeEnd, channel, dim, true)
+	if err != nil {
+		return nil, err
+	}
+	if cacheKey != "" {
+		h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, stats, cacheTTL)
+	}
+	return stats, nil
+}
+
+// usageStatsDimensionCacheKey 把维度筛选压成定长指纹(带前导冒号),无筛选时返回空串。
+// 搜索词可能很长且含任意字符,直接拼进缓存键既不稳妥也浪费,统一哈希。
+func usageStatsDimensionCacheKey(dim database.UsageLogFilter) string {
+	raw := dim.DimensionKey()
+	if raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return ":dim:" + hex.EncodeToString(sum[:8])
+}
+
+func (h *Handler) getUsageStatsSummaryCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*database.UsageStats, error) {
+	return h.getUsageStatsSummaryFilteredCached(ctx, rangeStart, rangeEnd, channel, database.UsageLogFilter{})
+}
+
+func (h *Handler) getUsageStatsSummaryFilteredCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, dim database.UsageLogFilter) (*database.UsageStats, error) {
+	cacheKey := "summary:global"
+	cacheTTL := adminUsageStatsCacheTTL
+	dimKey := usageStatsDimensionCacheKey(dim)
+	if !rangeStart.IsZero() && !rangeEnd.IsZero() {
+		cacheKey = fmt.Sprintf("summary:range:%d:%d:%s%s", rangeStart.Unix()/30, rangeEnd.Unix()/30, channel, dimKey)
+		cacheTTL = adminUsageRangeCacheTTL
+	} else {
+		if channel != "" {
+			cacheKey += ":" + channel
+		}
+		cacheKey += dimKey
+	}
+	var cached database.UsageStats
+	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, &cached) {
+		return &cached, nil
+	}
+	stats, err := h.db.GetUsageStatsFiltered(ctx, rangeStart, rangeEnd, channel, dim, false)
+	if err != nil {
+		return nil, err
+	}
+	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, stats, cacheTTL)
+	return stats, nil
+}
+
+// parseUsageChannel 解析 query 里的账号/用量渠道过滤参数。
+func parseUsageChannel(c *gin.Context) string {
+	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
+	case database.UpstreamChannelCodex:
+		return database.UpstreamChannelCodex
+	case database.UpstreamChannelClaude:
+		return database.UpstreamChannelClaude
+	case database.UpstreamChannelRelay:
+		return database.UpstreamChannelRelay
+	}
+	return ""
+}
+
+// SetAPIKeyAuthCacheHandler connects management changes to proxy cache invalidation.
+func (h *Handler) SetAPIKeyAuthCacheHandler(handler *proxy.Handler) { h.authCacheProxy = handler }
+
+// NewHandler 创建管理后台处理器
+func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
+	handler := &Handler{
+		store:          store,
+		cache:          tc,
+		db:             db,
+		cacheCfgStore:  db,
+		rateLimiter:    rl,
+		cpuSampler:     newCPUSampler(),
+		startedAt:      time.Now(),
+		databaseDriver: db.Driver(),
+		databaseLabel:  db.Label(),
+		cacheDriver:    tc.Driver(),
+		cacheLabel:     tc.Label(),
+		adminSecretEnv: adminSecretEnv,
+
+		chartCacheData:       make(map[string]*chartCacheEntry),
+		accountListCache:     make(map[string]*accountListSnapshot),
+		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+	}
+	store.SetUsageProbeCompletionFunc(handler.invalidateAccountSnapshotCaches)
+	handler.refreshAccount = handler.refreshSingleAccount
+	handler.probeUsage = handler.ProbeUsageSnapshot
+	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
+	handler.queryResetCredits = proxy.QueryWhamResetCredits
+	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
+	handler.queryWhamDailyUsage = proxy.QueryWhamDailyUsage
+	handler.queryWhamDailyTokenBreakdown = proxy.QueryWhamDailyTokenBreakdown
+	handler.whamDailyBackfillLast = make(map[int64]time.Time)
+	handler.whamDailyBackfillInFlight = make(map[int64]struct{})
+	handler.whamDailyBackfillFailedAt = make(map[int64]time.Time)
+	handler.whamDailySyncedOnce = make(map[int64]struct{})
+	handler.autoResetCreditsWake = make(chan struct{}, 1)
+	handler.autoActivate5hWake = make(chan struct{}, 1)
+	if db != nil {
+		handler.recordAccountEvent = db.InsertAccountEventAsync
+	}
+	return handler
+}
+
+// SetPoolSizes 设置连接池大小跟踪值（由 main.go 在启动时调用）
+func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
+	h.pgMaxConns = pgMaxConns
+	h.redisPoolSize = redisPoolSize
+}
+
+// RegisterRoutes 注册管理 API 路由
+func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
+	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
+	r.GET("/api/branding", h.GetBranding)
+	keyUsage := r.Group("/api/key-usage")
+	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
+	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
+
+	// 账号自助添加公开门户（无 admin 鉴权；开关门控 + IP 限流；见 self_service.go）
+	accountPortal := r.Group("/api/account-portal")
+	accountPortal.Use(h.accountPortalMiddleware())
+	accountPortal.POST("/generate-auth-url", h.GenerateAccountPortalAuthURL)
+	accountPortal.POST("/submit-code", h.SubmitAccountPortalCode)
+
+	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
+	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
+	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)
+	r.POST("/api/admin/bootstrap", h.PostBootstrap)
+	// Static, credential-free shell. Generated HTML is delivered by the parent via
+	// postMessage and remains in an opaque-origin sandbox, never stored by the server.
+	api := r.Group("/api/admin")
+	api.Use(h.adminAuthMiddleware())
+	api.Use(func(c *gin.Context) {
+		c.Next()
+		if shouldInvalidateAccountSnapshotCaches(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {
+			h.invalidateAccountSnapshotCaches()
+		}
+	})
+	api.GET("/stats", h.GetStats)
+	api.GET("/accounts", h.ListAccounts)
+	api.GET("/accounts/analysis", h.GetAccountAnalysis)
+	api.GET("/accounts/page-stats", h.GetAccountPageStats)
+	api.GET("/accounts/live", h.GetAccountLiveState)
+	api.GET("/accounts/:id", h.GetAccount)
+	api.POST("/accounts", h.AddAccount)
+	api.POST("/accounts/at", h.AddATAccount)
+	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)
+	api.POST("/accounts/codex/agent-identity/import", h.BatchImportCodexAgentIdentity)
+	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
+	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
+	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
+	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
+	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
+	api.POST("/accounts/import", h.ImportAccounts)
+	api.PATCH("/accounts/:id/models", h.UpdateAccountModels)
+	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
+	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
+	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.DELETE("/accounts/:id", h.DeleteAccount)
+	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
+	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
+	api.GET("/accounts/recycle-bin/export", h.ExportRecycleBinAccounts)
+	api.DELETE("/accounts/recycle-bin", h.EmptyRecycleBin)
+	api.POST("/accounts/recycle-bin/batch-test", h.RecycleBinBatchTest)
+	api.POST("/accounts/:id/restore", h.RestoreAccount)
+	api.DELETE("/accounts/:id/purge", h.PurgeAccount)
+	api.POST("/accounts/:id/refresh", h.RefreshAccount)
+	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
+	api.PATCH("/accounts/:id/note", h.UpdateAccountNote)
+	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
+	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
+	api.PATCH("/accounts/:id/model-cooldown-policy", h.UpdateAccountModelCooldownPolicy)
+	api.DELETE("/accounts/:id/model-cooldowns", h.ClearAllAccountModelCooldowns)
+	api.DELETE("/accounts/:id/model-cooldowns/:model", h.ClearAccountModelCooldown)
+	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
+	api.GET("/accounts/:id/reset-credits", h.GetResetCredits)
+	api.GET("/accounts/:id/wham-daily-usage", h.GetAccountWhamDailyUsage)
+	api.GET("/accounts/:id/test", h.TestConnection)
+	api.GET("/accounts/:id/usage", h.GetAccountUsage)
+	api.POST("/accounts/:id/usage/refresh", h.RefreshAccountUsage)
+	api.GET("/accounts/:id/subscription", h.GetAccountSubscription)
+	api.POST("/accounts/:id/subscription/refresh", h.RefreshAccountSubscription)
+	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
+	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
+	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/batch-refresh", h.BatchRefreshAccounts)
+	api.POST("/accounts/batch-refresh-usage", h.BatchRefreshCodexUsage)
+	api.POST("/accounts/batch-delete", h.BatchDeleteAccounts)
+	api.POST("/accounts/batch-update", h.BatchUpdateAccounts)
+	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
+	api.POST("/accounts/clean-banned", h.CleanBanned)
+	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
+	api.POST("/accounts/clean-error", h.CleanError)
+	api.GET("/accounts/export", h.ExportAccounts)
+	api.POST("/accounts/migrate", h.MigrateAccounts)
+	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
+	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
+	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
+	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
+	api.GET("/usage/logs", h.GetUsageLogs)
+	api.GET("/usage/logs/error-summary", h.GetUsageLogsErrorSummary)
+	api.GET("/usage/chart-data", h.GetChartData)
+	api.DELETE("/usage/logs", h.ClearUsageLogs)
+	api.GET("/setup-hints", h.GetSetupHints)
+	api.GET("/keys", h.ListAPIKeys)
+	api.POST("/keys", h.CreateAPIKey)
+	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
+	api.PATCH("/keys/:id", h.UpdateAPIKey)
+	api.POST("/keys/:id/reset-quota", h.ResetAPIKeyQuota)
+	api.GET("/keys/:id/scope-usage", h.GetAPIKeyScopeUsage)
+	api.GET("/keys/:id/model-request-usage", h.GetAPIKeyModelRequestUsage)
+	api.GET("/keys-scope-summary", h.GetAPIKeysScopeSummary)
+	api.POST("/keys/:id/scope-quota/reset", h.ResetAPIKeyScopeQuota)
+	api.DELETE("/keys/:id", h.DeleteAPIKey)
+	api.GET("/account-groups", h.ListAccountGroups)
+	api.POST("/account-groups", h.CreateAccountGroup)
+	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
+	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
+	api.GET("/health", h.GetHealth)
+	api.GET("/runtime-status", h.GetRuntimeStatus)
+	api.GET("/system/update", h.GetSystemUpdate)
+	api.POST("/system/update", h.PerformSystemUpdate)
+	api.GET("/ops/overview", h.GetOpsOverview)
+	api.GET("/ops/runtime-status", h.GetRuntimeStatus)
+	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
+	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
+	api.GET("/settings", h.GetSettings)
+	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/codex-user-agent/catalog", h.GetCodexUserAgentCatalog)
+	api.POST("/settings/codex-user-agent/preview", h.PreviewCodexUserAgent)
+	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
+	api.GET("/models", h.ListModels)
+	api.POST("/models/sync", h.SyncModels)
+	api.POST("/models/refresh-all", h.RefreshAllModels)
+	// OAuth 授权流程
+	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
+	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
+	api.GET("/oauth/poll-callback", h.PollOAuthCallback)
+
+	// OAuth 回调端点（无需 admin 鉴权，供 OpenAI 重定向调用）
+	r.GET("/auth/callback", h.OAuthCallback)
+}
+
+// adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
+//
+// 安全策略（fail-closed）：
+//   - 未配置 ADMIN_SECRET 时一律拒绝（503），防止 /api/admin/* 裸奔。
+//   - 用户应通过前端「首次初始化」页面（无鉴权的 /api/admin/bootstrap 端点）
+//     设置初始密钥，或者在 .env 中显式设置 ADMIN_SECRET 后重启。
+func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		adminSecret, source := h.resolveAdminSecret(c.Request.Context())
+		if adminSecret == "" {
+			// fail-closed：拒绝并提示用户配置 ADMIN_SECRET
+			security.SecurityAuditLog("ADMIN_BLOCKED_NO_SECRET", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "管理接口未初始化：ADMIN_SECRET 尚未配置。请在浏览器访问 /admin/ 完成首次初始化，或在 .env 中设置 ADMIN_SECRET 后重启。",
+				"code":  "bootstrap_required",
+			})
+			c.Abort()
+			return
+		}
+
+		adminKey := c.GetHeader("X-Admin-Key")
+		if adminKey == "" {
+			// 兼容 Authorization: Bearer 方式
+			authHeader := c.GetHeader("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				adminKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+
+		// 清理输入
+		adminKey = security.SanitizeInput(adminKey)
+
+		// 使用安全比较防止时序攻击
+		if !security.SecureCompare(adminKey, adminSecret) {
+			// 记录安全审计日志
+			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "管理密钥无效或缺失",
+			})
+			c.Abort()
+			return
+		}
+
+		// 成功认证，记录审计日志
+		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
+			security.SecurityAuditLog("ADMIN_ACCESS", fmt.Sprintf("path=%s ip=%s method=%s", c.Request.URL.Path, c.ClientIP(), c.Request.Method))
+		}
+
+		c.Next()
+	}
+}
+
+func (h *Handler) resolveAdminSecret(ctx context.Context) (string, string) {
+	if h.adminSecretEnv != "" {
+		return h.adminSecretEnv, "env"
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	settings, err := h.db.GetSystemSettings(readCtx)
+	if err != nil || settings == nil || settings.AdminSecret == "" {
+		return "", "disabled"
+	}
+	return settings.AdminSecret, "database"
+}
+
+func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
+	adminSecret, _ := h.resolveAdminSecret(ctx)
+	return strings.TrimSpace(adminSecret) != ""
+}
+
+// ==================== Stats ====================
+
+// GetStats 获取仪表盘统计
+func (h *Handler) GetStats(c *gin.Context) {
+	// Large installations may need more than five seconds to aggregate the
+	// dashboard inputs. Keep the request bounded without failing normal loads.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	accounts, err := h.db.ListActive(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	accountCounts, channelCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
+
+	todayByChannel, _ := h.db.CountTodayRequestsByChannel(ctx)
+	todayReqs := int64(0)
+	for _, count := range todayByChannel {
+		todayReqs += count
+	}
+
+	channels := make(map[string]statsChannelCounts, len(channelCounts))
+	for ch, counts := range channelCounts {
+		channels[ch] = statsChannelCounts{
+			Total:         counts.total,
+			Available:     counts.normal,
+			RateLimited:   counts.rateLimited,
+			Error:         counts.abnormal,
+			TodayRequests: todayByChannel[ch],
+		}
+	}
+
+	c.JSON(http.StatusOK, statsResponse{
+		Total:         accountCounts.total,
+		Available:     accountCounts.normal,
+		RateLimited:   accountCounts.rateLimited,
+		Error:         accountCounts.abnormal,
+		TodayRequests: todayReqs,
+		Channels:      channels,
+	})
+}
+
+type dashboardAccountCounts struct {
+	total       int
+	normal      int
+	rateLimited int
+	abnormal    int
+	disabled    int
+}
+
+// summarizeDashboardAccounts 汇总账号健康计数，并按独立账号渠道拆分。
+// 渠道判定优先用运行时账号，不在池中的行回退 upstream_type 凭据。
+func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) (dashboardAccountCounts, map[string]dashboardAccountCounts) {
+	runtimeByID := make(map[int64]*auth.Account, len(runtimeAccounts))
+	for _, acc := range runtimeAccounts {
+		if acc != nil {
+			runtimeByID[acc.DBID] = acc
+		}
+	}
+
+	var counts dashboardAccountCounts
+	channelCounts := map[string]dashboardAccountCounts{
+		database.UpstreamChannelCodex: {},
+	}
+	counts.total = len(rows)
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(row.Status))
+		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
+		usingCredits := false
+		acc := runtimeByID[row.ID]
+		if acc != nil {
+			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
+			cooldownReason = ""
+			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
+			usingCredits = acc.UsingCredits()
+		}
+		perChannel := channelCounts[database.UpstreamChannelCodex]
+		perChannel.total++
+
+		if !row.Enabled {
+			counts.disabled++
+			perChannel.disabled++
+		}
+		switch {
+		case isDashboardAbnormalAccount(status):
+			counts.abnormal++
+			perChannel.abnormal++
+		case !usingCredits && isDashboardRateLimitedAccount(status, cooldownReason):
+			counts.rateLimited++
+			perChannel.rateLimited++
+		case isDashboardUnsampledAccount(row, acc):
+			// 未采样不当作可用：仪表盘「可用」与账号页正常/调度中对齐。
+		default:
+			counts.normal++
+			perChannel.normal++
+		}
+		channelCounts[database.UpstreamChannelCodex] = perChannel
+	}
+	return counts, channelCounts
+}
+
+func isDashboardAbnormalAccount(status string) bool {
+	return status == "unauthorized" || status == "error"
+}
+
+func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
+	if acc != nil {
+		if acc.IsOpenAIResponsesAPI() {
+			return false
+		}
+		snapshot := acc.GetAccountListRuntimeSnapshot()
+		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
+		if status == "unauthorized" || status == "error" {
+			return false
+		}
+		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
+	}
+	if row == nil {
+		return false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(row.Status))
+	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	return true
+}
+
+func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
+	switch status {
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+		return true
+	}
+	switch cooldownReason {
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
+		return true
+	}
+	return false
+}
+
+// ==================== Accounts ====================
+
+type accountResponse struct {
+	CodexLastRefreshAt      string `json:"codex_last_refresh_at,omitempty"`
+	CodexRefreshError       string `json:"codex_refresh_error,omitempty"`
+	UpstreamRequestIDHeader string `json:"upstream_request_id_header"`
+	DetailLoaded            bool   `json:"detail_loaded,omitempty"`
+	ID                      int64  `json:"id"`
+	Name                    string `json:"name"`
+	Email                   string `json:"email"`
+	EmailDomain             string `json:"email_domain,omitempty"`
+	ChatGPTAccountID        string `json:"chatgpt_account_id,omitempty"`
+	TokenWorkspaceID        string `json:"token_workspace_id,omitempty"`
+	WorkspaceIDOverride     string `json:"workspace_id_override,omitempty"`
+	EffectiveWorkspaceID    string `json:"effective_workspace_id,omitempty"`
+	PlanType                string `json:"plan_type"`
+	SubscriptionExpiresAt   string `json:"subscription_expires_at,omitempty"`
+	// Subscription 服务端计算的订阅状态对象（业务状态 + 同步状态）；不跟踪订阅的
+	// 套餐（api/无到期时间的 free）为空。
+	Subscription          *auth.SubscriptionStatusView `json:"subscription,omitempty"`
+	Status                string                       `json:"status"`
+	ErrorMessage          string                       `json:"error_message,omitempty"`
+	ATOnly                bool                         `json:"at_only"`
+	CreditEnabled         bool                         `json:"credit_enabled"`
+	CreditSkipUsageWindow bool                         `json:"credit_skip_usage_window"`
+	// UsingCredits 是与 Status 并列的独立信号：用量窗口已打满但积分顶着，
+	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
+	UsingCredits                  bool                       `json:"using_credits,omitempty"`
+	SkipWarmTier                  bool                       `json:"skip_warm_tier"`
+	AccountType                   string                     `json:"account_type,omitempty"`
+	AccessTokenType               string                     `json:"access_token_type,omitempty"`
+	OpenAIResponsesAPI            bool                       `json:"openai_responses_api,omitempty"`
+	AgentIdentity                 bool                       `json:"agent_identity,omitempty"`
+	AvatarURL                     string                     `json:"avatar_url,omitempty"`
+	VerifiedEmail                 bool                       `json:"verified_email,omitempty"`
+	ProjectID                     string                     `json:"project_id,omitempty"`
+	BaseURL                       string                     `json:"base_url,omitempty"`
+	BalanceQueryURL               string                     `json:"balance_query_url,omitempty"`
+	Models                        []string                   `json:"models,omitempty"`
+	ModelMapping                  string                     `json:"model_mapping,omitempty"`
+	CodexClientMetadataMode       string                     `json:"codex_client_metadata_mode,omitempty"`
+	CodexPassthroughMode          string                     `json:"codex_passthrough_mode,omitempty"`
+	CodexFingerprintMode          string                     `json:"codex_fingerprint_mode,omitempty"`
+	Timezone                      string                     `json:"timezone,omitempty"`
+	CodexTurnState                string                     `json:"codex_turn_state,omitempty"`
+	CodexTurnStateModels          string                     `json:"codex_turn_state_models,omitempty"`
+	CodexTurnStateSetAt           string                     `json:"codex_turn_state_set_at,omitempty"`
+	CustomHeaders                 map[string]string          `json:"custom_headers,omitempty"`
+	HealthTier                    string                     `json:"health_tier"`
+	SchedulerScore                float64                    `json:"scheduler_score"`
+	DispatchScore                 float64                    `json:"dispatch_score"`
+	ScoreBiasOverride             *int64                     `json:"score_bias_override"`
+	ScoreBiasEffective            int64                      `json:"score_bias_effective"`
+	BaseConcurrencyOverride       *int64                     `json:"base_concurrency_override"`
+	BaseConcurrencyEffective      int64                      `json:"base_concurrency_effective"`
+	ConcurrencyCap                int64                      `json:"dynamic_concurrency_limit"`
+	ProxyURL                      string                     `json:"proxy_url"`
+	CreatedAt                     string                     `json:"created_at"`
+	UpdatedAt                     string                     `json:"updated_at"`
+	CodexUsageUpdatedAt           string                     `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt         string                     `json:"codex_5h_usage_updated_at,omitempty"`
+	ActiveRequests                int64                      `json:"active_requests"`
+	OccupiedRequests              int64                      `json:"occupied_requests"`
+	SessionSlotBufferEnabled      bool                       `json:"session_slot_buffer_enabled"`
+	TotalRequests                 int64                      `json:"total_requests"`
+	LastUsedAt                    string                     `json:"last_used_at"`
+	SuccessRequests               int64                      `json:"success_requests"`
+	ErrorRequests                 int64                      `json:"error_requests"`
+	RetryErrorRequests            int64                      `json:"retry_error_requests"`
+	RateLimitAttempts             int64                      `json:"rate_limit_attempts"`
+	ErrorStatusCounts             map[string]int64           `json:"error_status_counts,omitempty"`
+	SuccessModelCounts            map[string]int64           `json:"success_model_counts,omitempty"`
+	UsagePercent7d                *float64                   `json:"usage_percent_7d"`
+	UsagePercent5h                *float64                   `json:"usage_percent_5h"`
+	UsagePercentSpark             *float64                   `json:"usage_percent_spark"`
+	RateLimitResetCredits         *int                       `json:"rate_limit_reset_credits"`
+	ApplicableResetCredits        *int                       `json:"applicable_reset_credits"`
+	CreditsValid                  bool                       `json:"credits_valid"`
+	CreditsBalance                *string                    `json:"credits_balance"`
+	CreditsHasCredits             *bool                      `json:"credits_has_credits"`
+	CreditsUnlimited              *bool                      `json:"credits_unlimited"`
+	CreditsOverageLimitReached    *bool                      `json:"credits_overage_limit_reached"`
+	CreditsSpendControlReached    *bool                      `json:"credits_spend_control_reached,omitempty"`
+	CreditsRateLimitReachedType   string                     `json:"credits_rate_limit_reached_type,omitempty"`
+	AutoPause5hThreshold          *float64                   `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold          *float64                   `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled           bool                       `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled           bool                       `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride            *bool                      `json:"ignore_usage_limit_status_override"`
+	UsageLimitEffective           bool                       `json:"ignore_usage_limit_status_effective"`
+	DispatchCountLimit            *int64                     `json:"dispatch_count_limit"`
+	DispatchCountUsed             int64                      `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt          string                     `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited          bool                       `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority             *int64                     `json:"scheduler_priority"`
+	Usage5hDetail                 *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail                 *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
+	Reset5hAt                     string                     `json:"reset_5h_at,omitempty"`
+	Reset7dAt                     string                     `json:"reset_7d_at,omitempty"`
+	ResetSparkAt                  string                     `json:"reset_spark_at,omitempty"`
+	Window7dKind                  string                     `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
+	Window7dSeconds               *int64                     `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
+	Billed5h                      *float64                   `json:"billed_5h"`
+	Billed7d                      *float64                   `json:"billed_7d"`
+	ScoreBreakdown                schedulerBreakdownResponse `json:"scheduler_breakdown"`
+	LastUnauthorizedAt            string                     `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt             string                     `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt                 string                     `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt             string                     `json:"last_server_error_at,omitempty"`
+	CooldownReason                string                     `json:"cooldown_reason,omitempty"`
+	CooldownUntil                 string                     `json:"cooldown_until,omitempty"`
+	ModelCooldowns                []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
+	ModelCooldownModeOverride     *string                    `json:"model_cooldown_mode_override"`
+	ModelCooldownSecondsOverride  *int                       `json:"model_cooldown_seconds_override"`
+	ModelCooldownBackoffOverride  *bool                      `json:"model_cooldown_backoff_override"`
+	ModelCooldownModeEffective    string                     `json:"model_cooldown_mode_effective"`
+	ModelCooldownSecondsEffective int                        `json:"model_cooldown_seconds_effective"`
+	ModelCooldownBackoffEffective bool                       `json:"model_cooldown_backoff_effective"`
+	Enabled                       bool                       `json:"enabled"`
+	Locked                        bool                       `json:"locked"`
+	AllowedAPIKeyIDs              []int64                    `json:"allowed_api_key_ids"`
+	Tags                          []string                   `json:"tags"`
+	GroupIDs                      []int64                    `json:"group_ids"`
+	Note                          string                     `json:"note"`
+	// 图片配额信息
+	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
+	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
+	TodayUsedCount      *int   `json:"today_used_count,omitempty"`
+	ImageQuotaResetAt   string `json:"image_quota_reset_at,omitempty"`
+}
+
+type modelCooldownResponse struct {
+	Model     string `json:"model"`
+	Reason    string `json:"reason"`
+	ResetAt   string `json:"reset_at"`
+	Remaining int64  `json:"remaining_seconds"`
+}
+
+type accountUsageWindow struct {
+	Requests             int64              `json:"requests"`
+	Tokens               int64              `json:"tokens"`
+	AccountBilled        float64            `json:"account_billed"`
+	UserBilled           float64            `json:"user_billed"`
+	ModelCounts          map[string]int64   `json:"model_counts,omitempty"`
+	ModelSuccessCounts   map[string]int64   `json:"model_success_counts,omitempty"`
+	ModelAvgFirstTokenMs map[string]float64 `json:"model_avg_first_token_ms,omitempty"`
+}
+
+func accountEmailDomain(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || strings.ContainsAny(email, " \t\r\n") {
+		return ""
+	}
+	at := strings.LastIndex(email, "@")
+	if at <= 0 || at == len(email)-1 {
+		return ""
+	}
+	domain := strings.Trim(strings.TrimSpace(email[at+1:]), ".")
+	if domain == "" || strings.ContainsAny(domain, " /\\:") || !strings.Contains(domain, ".") {
+		return ""
+	}
+	return domain
+}
+
+func accountAccessTokenType(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if tokenType := strings.TrimSpace(row.GetCredential("access_token_type")); tokenType != "" {
+		return tokenType
+	}
+	return accessTokenTypeForToken(row.GetCredential("access_token"))
+}
+
+type schedulerBreakdownResponse struct {
+	UnauthorizedPenalty float64 `json:"unauthorized_penalty"`
+	RateLimitPenalty    float64 `json:"rate_limit_penalty"`
+	TimeoutPenalty      float64 `json:"timeout_penalty"`
+	ServerPenalty       float64 `json:"server_penalty"`
+	FailurePenalty      float64 `json:"failure_penalty"`
+	SuccessBonus        float64 `json:"success_bonus"`
+	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
+	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
+	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
+	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
+	LatencyPenalty      float64 `json:"latency_penalty"`
+	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
+}
+
+// ListAccounts 获取账号列表
+func (h *Handler) ListAccounts(c *gin.Context) {
+	view := strings.ToLower(strings.TrimSpace(c.Query("view")))
+	timeout := 5 * time.Second
+	if view == "page" {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+	defer cancel()
+
+	// ?view=lite — 轻量视图:只返回身份/绑定字段,跳过用量富化与探测触发。
+	// 供代理绑定弹窗等只需要"账号是谁、绑了哪条代理"的场景,大号池下不再传输
+	// 全量调度指标(代理页卡死问题)。
+	if view == "lite" {
+		h.listAccountsLite(c, ctx)
+		return
+	}
+
+	// The paged list is a read path and must never fan out probes across a
+	// 40k-account pool. Existing background schedulers and explicit refresh
+	// actions own probing; the legacy full response preserves its old behavior.
+	if view != "page" {
+		h.store.TriggerUsageProbeAsync()
+		h.store.TriggerRecoveryProbeAsync()
+	}
+
+	// Optional ?channel=codex|claude — server-side filter so each channel's
+	// admin page only transfers and enriches its own account set.
+	channel := parseUsageChannel(c)
+	var pageSelection *accountPageSelection
+	var rows []*database.AccountRow
+	var err error
+	if view == "page" {
+		pageSelection, err = h.getAccountPageSelection(ctx, c, channel)
+		if err == nil {
+			rows = pageSelection.Rows
+		}
+	} else {
+		rows, err = h.db.ListActiveByChannel(ctx, channel)
+	}
+	if err != nil {
+		var queryErr *accountPageQueryError
+		if view == "page" && errors.As(err, &queryErr) {
+			writeError(c, http.StatusBadRequest, err.Error())
+		} else {
+			writeInternalError(c, err)
+		}
+		return
+	}
+
+	// 合并内存中的调度指标
+	accountMap := make(map[int64]*auth.Account)
+	if view == "page" {
+		for _, row := range rows {
+			if acc := h.store.FindByID(row.ID); acc != nil {
+				accountMap[row.ID] = acc
+			}
+		}
+	} else {
+		for _, acc := range h.store.Accounts() {
+			accountMap[acc.DBID] = acc
+		}
+	}
+
+	var reqCounts map[int64]*database.AccountRequestCount
+	var usage5h, usage7d map[int64]*database.AccountTimeRangeUsage
+	if view == "page" {
+		pageIDs := make([]int64, 0, len(rows))
+		for _, row := range rows {
+			pageIDs = append(pageIDs, row.ID)
+		}
+		reqCounts, err = h.db.GetAccountRequestCountsByIDs(ctx, pageIDs)
+		if err != nil {
+			log.Printf("获取当前页账号请求统计失败: %v", err)
+			reqCounts = make(map[int64]*database.AccountRequestCount)
+		}
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+	} else {
+		// 旧全量接口保持原行为和缓存语义。
+		reqCounts = h.getCachedRequestCounts()
+		usage5h, usage7d = h.getAccountUsageWindows(ctx)
+	}
+
+	accounts := make([]accountResponse, 0, len(rows))
+	for _, row := range rows {
+		accounts = append(accounts, h.buildAccountResponse(
+			row,
+			accountMap[row.ID],
+			reqCounts[row.ID],
+			usage5h[row.ID],
+			usage7d[row.ID],
+			view != "page",
+		))
+	}
+
+	if view != "page" {
+		billing5hWindows := make(map[int64]time.Time)
+		billing7dWindows := make(map[int64]time.Time)
+		for i := range accounts {
+			acc, ok := accountMap[accounts[i].ID]
+			if !ok {
+				continue
+			}
+			if t := acc.GetReset5hAt(); !t.IsZero() {
+				billing5hWindows[accounts[i].ID] = t.Add(-5 * time.Hour)
+			}
+			if t := acc.GetReset7dAt(); !t.IsZero() {
+				// 长窗口起点 = reset - 真实周期。free/team 是月窗(约 30 天),
+				// 写死减 7 天会把起点算到未来,成本恒为 0 (issue #324)。
+				windowDur := 7 * 24 * time.Hour
+				if sec := acc.GetWindow7dSeconds(); sec > 0 {
+					windowDur = time.Duration(sec) * time.Second
+				}
+				billing7dWindows[accounts[i].ID] = t.Add(-windowDur)
+			}
+		}
+
+		billed5h, billingErr := h.db.GetAccountsBilledSince(ctx, billing5hWindows)
+		if billingErr != nil {
+			log.Printf("批量获取账号 5h 成本失败: %v", billingErr)
+			billed5h = nil
+		}
+		billed7d, billingErr := h.db.GetAccountsBilledSince(ctx, billing7dWindows)
+		if billingErr != nil {
+			log.Printf("批量获取账号 7d 成本失败: %v", billingErr)
+			billed7d = nil
+		}
+		for i := range accounts {
+			if billed, ok := billed5h[accounts[i].ID]; ok {
+				accounts[i].Billed5h = &billed
+			}
+			if billed, ok := billed7d[accounts[i].ID]; ok {
+				accounts[i].Billed7d = &billed
+			}
+		}
+	}
+
+	if pageSelection != nil {
+		c.JSON(http.StatusOK, accountsPageResponse{
+			Accounts: accounts,
+			Page:     pageSelection.Page, PageSize: pageSelection.PageSize, Total: pageSelection.Total,
+			Summary: pageSelection.Summary, Facets: pageSelection.Facets,
+			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: pageSelection.StatsState,
+			DisabledSorts: pageSelection.DisabledSorts,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+}
+
+// GetAccount returns the fully enriched representation for one account. Large
+// account pages call this endpoint only when a row is opened or after a
+// mutation, keeping expensive detail fields off the critical list path.
+// GET /api/admin/accounts/:id
+func (h *Handler) GetAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+
+	requestCounts, err := h.db.GetAccountRequestCountsByIDs(ctx, []int64{id})
+	if err != nil {
+		log.Printf("获取账号 %d 请求统计失败: %v", id, err)
+		requestCounts = make(map[int64]*database.AccountRequestCount)
+	}
+	now := time.Now()
+	usage5h, usage7d, err := h.db.GetAccountUsageWindowsByIDs(ctx, []int64{id}, now.Add(-5*time.Hour), now.AddDate(0, 0, -7))
+	if err != nil {
+		log.Printf("获取账号 %d 用量统计失败: %v", id, err)
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+	}
+
+	runtimeAccount := h.store.FindByID(id)
+	resp := h.buildAccountResponse(row, runtimeAccount, requestCounts[id], usage5h[id], usage7d[id], true)
+	if runtimeAccount != nil {
+		if resetAt := runtimeAccount.GetReset5hAt(); !resetAt.IsZero() {
+			if billed, billedErr := h.db.GetAccountBilledSince(ctx, id, resetAt.Add(-5*time.Hour)); billedErr == nil {
+				resp.Billed5h = &billed
+			} else {
+				log.Printf("获取账号 %d 5h 成本失败: %v", id, billedErr)
+			}
+		}
+		if resetAt := runtimeAccount.GetReset7dAt(); !resetAt.IsZero() {
+			windowDuration := 7 * 24 * time.Hour
+			if seconds := runtimeAccount.GetWindow7dSeconds(); seconds > 0 {
+				windowDuration = time.Duration(seconds) * time.Second
+			}
+			if billed, billedErr := h.db.GetAccountBilledSince(ctx, id, resetAt.Add(-windowDuration)); billedErr == nil {
+				resp.Billed7d = &billed
+			} else {
+				log.Printf("获取账号 %d 长窗口成本失败: %v", id, billedErr)
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// accountLiteResponse 是 ?view=lite 的账号条目:身份 + 绑定字段,无调度/用量指标。
+// 字段名与完整版 accountResponse 对齐,前端可直接当 AccountRow 子集消费。
+type accountLiteResponse struct {
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Email              string `json:"email"`
+	PlanType           string `json:"plan_type"`
+	Status             string `json:"status"`
+	Enabled            bool   `json:"enabled"`
+	ProxyURL           string `json:"proxy_url"`
+	ATOnly             bool   `json:"at_only"`
+	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
+	AgentIdentity      bool   `json:"agent_identity"`
+}
+
+func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
+	channel := parseUsageChannel(c)
+	rows, err := h.db.ListActiveByChannel(ctx, channel)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	// 运行时状态覆盖 DB 状态(与完整视图一致),其余富化一律跳过。
+	runtimeStatus := make(map[int64]string)
+	for _, acc := range h.store.Accounts() {
+		runtimeStatus[acc.DBID] = acc.RuntimeStatus()
+	}
+
+	accounts := make([]accountLiteResponse, 0, len(rows))
+	for _, row := range rows {
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		email := row.GetCredential("email")
+		if isOpenAIResponsesAccount && email == "" {
+			email = row.GetCredential("base_url")
+		}
+		planType := row.GetCredential("plan_type")
+		if isOpenAIResponsesAccount && planType == "" {
+			planType = "api"
+		}
+		status := row.Status
+		if rt, ok := runtimeStatus[row.ID]; ok && rt != "" {
+			status = rt
+		}
+		accounts = append(accounts, accountLiteResponse{
+			ID:                 row.ID,
+			Name:               row.Name,
+			Email:              email,
+			PlanType:           planType,
+			Status:             status,
+			Enabled:            row.Enabled,
+			ProxyURL:           row.ProxyURL,
+			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			AgentIdentity:      isAgentIdentityCredentialRow(row),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
+}
+
+type updateAccountSchedulerReq struct {
+	UpstreamRequestIDHeader json.RawMessage `json:"upstream_request_id_header"`
+	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
+	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
+	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
+	Tags                    json.RawMessage `json:"tags"`
+	GroupIDs                json.RawMessage `json:"group_ids"`
+	AutoPause5hThreshold    json.RawMessage `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold    json.RawMessage `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled     json.RawMessage `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride      json.RawMessage `json:"ignore_usage_limit_status_override"`
+	DispatchCountLimit      json.RawMessage `json:"dispatch_count_limit"`
+	SchedulerPriority       json.RawMessage `json:"scheduler_priority"`
+	ProxyURL                json.RawMessage `json:"proxy_url"`
+	CustomHeaders           json.RawMessage `json:"custom_headers"`
+	CodexFingerprintMode    json.RawMessage `json:"codex_fingerprint_mode"`
+	Timezone                json.RawMessage `json:"timezone"`
+	CodexTurnState          json.RawMessage `json:"codex_turn_state"`
+	CodexTurnStateModels    json.RawMessage `json:"codex_turn_state_models"`
+}
+
+type accountSchedulerUpdate struct {
+	ScoreBiasOverride       database.OptionalNullInt64
+	BaseConcurrencyOverride database.OptionalNullInt64
+	SkipWarmTier            database.OptionalBool
+	AllowedAPIKeyIDs        database.OptionalInt64Slice
+	Tags                    optionalStringSlice
+	GroupIDs                database.OptionalInt64Slice
+	AutoPause5hThreshold    optionalFloat64
+	AutoPause7dThreshold    optionalFloat64
+	AutoPause5hDisabled     database.OptionalBool
+	AutoPause7dDisabled     database.OptionalBool
+	UsageLimitOverride      optionalNullableBool
+	DispatchCountLimit      database.OptionalNullInt64
+	SchedulerPriority       database.OptionalNullInt64
+	ProxyURL                database.OptionalString
+	CustomHeaders           optionalCustomHeaders
+	CodexFingerprintMode    database.OptionalString
+	Timezone                database.OptionalString
+	CodexTurnState          database.OptionalString
+	CodexTurnStateModels    database.OptionalString
+	CredentialUpdates       map[string]interface{}
+}
+
+func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
+	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	// 基础并发覆盖：最小 1，无上限（与全局 max_concurrency 一致）
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, math.MaxInt64)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	tags, err := parseOptionalStringSliceField(req.Tags, "tags")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	groupIDs, err := parseOptionalIntegerSliceField(req.GroupIDs, "group_ids")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause5hThreshold, err := parseOptionalRatioField(req.AutoPause5hThreshold, "auto_pause_5h_threshold")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause7dThreshold, err := parseOptionalRatioField(req.AutoPause7dThreshold, "auto_pause_7d_threshold")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause5hDisabled, err := parseOptionalBoolField(req.AutoPause5hDisabled, "auto_pause_5h_disabled")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause7dDisabled, err := parseOptionalBoolField(req.AutoPause7dDisabled, "auto_pause_7d_disabled")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	ignoreUsageLimitStatusOverride, err := parseOptionalNullableBoolField(req.UsageLimitOverride, "ignore_usage_limit_status_override")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	dispatchCountLimit, err := parseOptionalIntegerField(req.DispatchCountLimit, "dispatch_count_limit", 0, 1000000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	schedulerPriority, err := parseOptionalIntegerField(req.SchedulerPriority, "scheduler_priority", -100, 100)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+
+	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	customHeaders, err := parseOptionalCustomHeadersField(req.CustomHeaders)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	// null 视为重置为默认档 off。
+	codexFingerprintMode, err := parseOptionalStringField(req.CodexFingerprintMode, "codex_fingerprint_mode", validateCodexFingerprintMode)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	timezoneField, err := parseOptionalStringField(req.Timezone, "timezone", validateAccountTimezone)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	codexTurnStateField, err := parseOptionalStringField(req.CodexTurnState, "codex_turn_state", auth.ValidateCodexTurnState)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	codexTurnStateModelsField, err := parseOptionalStringField(req.CodexTurnStateModels, "codex_turn_state_models", auth.ValidateCodexTurnStateModels)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if codexTurnStateModelsField.Set {
+		codexTurnStateModelsField.Value = auth.NormalizeCodexTurnStateModels(codexTurnStateModelsField.Value)
+	}
+	if codexFingerprintMode.Set {
+		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
+	}
+	requestIDHeader, err := parseOptionalStringField(req.UpstreamRequestIDHeader, "upstream_request_id_header", auth.ValidateUpstreamRequestIDHeader)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	credentialUpdates := make(map[string]interface{})
+	if requestIDHeader.Set {
+		credentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey] = strings.TrimSpace(requestIDHeader.Value)
+	}
+	if customHeaders.Set {
+		credentialUpdates["custom_headers"] = cloneCustomHeaders(customHeaders.Values)
+	}
+	if codexFingerprintMode.Set {
+		credentialUpdates[auth.CodexFingerprintModeCredentialKey] = codexFingerprintMode.Value
+	}
+	if timezoneField.Set {
+		credentialUpdates[auth.AccountTimezoneCredentialKey] = strings.TrimSpace(timezoneField.Value)
+	}
+	if codexTurnStateField.Set {
+		credentialUpdates[auth.CodexTurnStateCredentialKey] = codexTurnStateField.Value
+		// 时效起点默认随值一起刷新（批量接口拿不到逐账号旧值，只能按"换了新值"处理）；
+		// 单账号接口在值未变且已有起点时保留旧起点，见 refineCodexTurnStateSetAt。
+		setAt := ""
+		if codexTurnStateField.Value != "" {
+			setAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		credentialUpdates[auth.CodexTurnStateSetAtCredentialKey] = setAt
+	}
+	if codexTurnStateModelsField.Set {
+		credentialUpdates[auth.CodexTurnStateModelsCredentialKey] = codexTurnStateModelsField.Value
+	}
+	if autoPause5hThreshold.Set {
+		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
+	}
+	if autoPause7dThreshold.Set {
+		credentialUpdates["auto_pause_7d_threshold"] = autoPause7dThreshold.Value
+	}
+	if autoPause5hDisabled.Set {
+		credentialUpdates["auto_pause_5h_disabled"] = autoPause5hDisabled.Value
+	}
+	if autoPause7dDisabled.Set {
+		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if ignoreUsageLimitStatusOverride.Set {
+		if ignoreUsageLimitStatusOverride.Value == nil {
+			credentialUpdates["ignore_usage_limit_status_override"] = nil
+		} else {
+			credentialUpdates["ignore_usage_limit_status_override"] = *ignoreUsageLimitStatusOverride.Value
+		}
+	}
+	if dispatchCountLimit.Set {
+		if dispatchCountLimit.Value.Valid {
+			credentialUpdates["dispatch_count_limit"] = dispatchCountLimit.Value.Int64
+		} else {
+			credentialUpdates["dispatch_count_limit"] = int64(0)
+		}
+	}
+	if schedulerPriority.Set {
+		if schedulerPriority.Value.Valid {
+			credentialUpdates["scheduler_priority"] = schedulerPriority.Value.Int64
+		} else {
+			credentialUpdates["scheduler_priority"] = int64(0)
+		}
+	}
+	if len(credentialUpdates) == 0 {
+		credentialUpdates = nil
+	}
+
+	return accountSchedulerUpdate{
+		ScoreBiasOverride:       scoreBiasOverride,
+		BaseConcurrencyOverride: baseConcurrencyOverride,
+		SkipWarmTier:            skipWarmTier,
+		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
+		Tags:                    tags,
+		GroupIDs:                groupIDs,
+		AutoPause5hThreshold:    autoPause5hThreshold,
+		AutoPause7dThreshold:    autoPause7dThreshold,
+		AutoPause5hDisabled:     autoPause5hDisabled,
+		AutoPause7dDisabled:     autoPause7dDisabled,
+		UsageLimitOverride:      ignoreUsageLimitStatusOverride,
+		DispatchCountLimit:      dispatchCountLimit,
+		SchedulerPriority:       schedulerPriority,
+		ProxyURL:                proxyURL,
+		CustomHeaders:           customHeaders,
+		CodexFingerprintMode:    codexFingerprintMode,
+		Timezone:                timezoneField,
+		CodexTurnState:          codexTurnStateField,
+		CodexTurnStateModels:    codexTurnStateModelsField,
+		CredentialUpdates:       credentialUpdates,
+	}, nil
+}
+
+// validateAccountTimezone 允许空串(=清除);非空必须是可加载的 IANA 时区。
+func validateAccountTimezone(value string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil
+	}
+	if strings.EqualFold(v, "Local") {
+		return fmt.Errorf("timezone must identify a fixed IANA location, not Local")
+	}
+	if _, err := time.LoadLocation(v); err != nil {
+		return fmt.Errorf("timezone must be a valid IANA timezone, e.g. Asia/Shanghai")
+	}
+	return nil
+}
+
+// validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
+func validateCodexFingerprintMode(value string) error {
+	if value == "" || auth.IsValidCodexFingerprintMode(value) {
+		return nil
+	}
+	return errors.New("必须是 off、device、session 或 full")
+}
+
+// refineCodexTurnStateSetAt 让时效起点只在注入值真正换掉时重置：原样重提同一个值不
+// 重置（它还是上游那时候签发的那一个 state）；存量行没有起点时补一次，让倒计时能从
+// 这一刻开始走，而不是逼用户先清空再粘贴一遍。
+func refineCodexTurnStateSetAt(row *database.AccountRow, update accountSchedulerUpdate) {
+	if row == nil || !update.CodexTurnState.Set || update.CodexTurnState.Value == "" {
+		return
+	}
+	current := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey))
+	currentSetAt := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey))
+	if current == update.CodexTurnState.Value && currentSetAt != "" {
+		delete(update.CredentialUpdates, auth.CodexTurnStateSetAtCredentialKey)
+	}
+}
+
+func (u accountSchedulerUpdate) hasChanges() bool {
+	return u.ScoreBiasOverride.Set ||
+		u.CodexTurnState.Set ||
+		u.CodexTurnStateModels.Set ||
+		u.BaseConcurrencyOverride.Set ||
+		u.SkipWarmTier.Set ||
+		u.AllowedAPIKeyIDs.Set ||
+		u.Tags.Set ||
+		u.GroupIDs.Set ||
+		u.AutoPause5hThreshold.Set ||
+		u.AutoPause7dThreshold.Set ||
+		u.AutoPause5hDisabled.Set ||
+		u.AutoPause7dDisabled.Set ||
+		u.UsageLimitOverride.Set ||
+		u.DispatchCountLimit.Set ||
+		u.SchedulerPriority.Set ||
+		u.ProxyURL.Set ||
+		u.CustomHeaders.Set ||
+		u.CodexFingerprintMode.Set ||
+		u.Timezone.Set
+}
+
+func optionalBoolFromPtr(value *bool) database.OptionalBool {
+	if value == nil {
+		return database.OptionalBool{}
+	}
+	return database.OptionalBool{Set: true, Value: *value}
+}
+
+// UpdateAccountScheduler 更新账号调度配置。
+// UpdateAccountCredit 更新账号信用设置
+func (h *Handler) UpdateAccountCredit(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		CreditEnabled         *bool `json:"credit_enabled"`
+		CreditSkipUsageWindow *bool `json:"credit_skip_usage_window"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+
+	// 传入 *bool：nil = 不修改该字段
+	if err := h.store.UpdateAccountCredit(id, req.CreditEnabled, req.CreditSkipUsageWindow); err != nil {
+		writeError(c, http.StatusInternalServerError, "更新信用设置失败: "+err.Error())
+		return
+	}
+
+	acc = h.store.FindByID(id)
+	if acc != nil {
+		// 开关刚打开时账号可能已经背着用量窗口判罚。不主动释放就得干等到窗口重置，
+		// 而「发现限流了才去开开关」正是最常见的用法。
+		released := h.store.ReleaseUsageWindowCooldownForCredits(acc)
+		c.JSON(http.StatusOK, gin.H{
+			"message":                  "信用设置已更新",
+			"credit_enabled":           acc.CreditEnabled,
+			"credit_skip_usage_window": acc.CreditSkipUsageWindow,
+			"using_credits":            acc.UsingCredits(),
+			"cooldown_released":        released,
+		})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"message": "信用设置已更新"})
+	}
+}
+
+func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req updateAccountSchedulerReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	update, err := parseAccountSchedulerUpdate(req)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if update.CodexTurnState.Set && update.CodexTurnState.Value != "" {
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "读取账号失败: "+err.Error())
+			return
+		}
+		refineCodexTurnStateSetAt(row, update)
+	}
+	if update.AllowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
+			return
+		}
+		if len(missingAPIKeyIDs) > 0 {
+			values := make([]string, 0, len(missingAPIKeyIDs))
+			for _, value := range missingAPIKeyIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+	if update.GroupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, update.GroupIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
+			return
+		}
+		if len(missingGroupIDs) > 0 {
+			values := make([]string, 0, len(missingGroupIDs))
+			for _, value := range missingGroupIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+		if len(update.GroupIDs.Values) > 0 {
+			row, err := h.db.GetAccountByID(ctx, id)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					writeError(c, http.StatusNotFound, "账号不存在")
+					return
+				}
+				writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+				return
+			}
+			if err := h.validateGroupChannelForRows(ctx, []*database.AccountRow{row}, update.GroupIDs.Values); err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	}
+	if update.CustomHeaders.Set {
+		h.mergeDuplicateMu.Lock()
+		defer h.mergeDuplicateMu.Unlock()
+
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+			return
+		}
+		seed := tokenCredentialSeedFromAccountRow(row)
+		previousOverride := openaiidentity.WorkspaceOverrideFromHeaders(seed.customHeaders)
+		seed.customHeaders = cloneCustomHeaders(update.CustomHeaders.Values)
+		seed = normalizeTokenCredentialSeed(seed)
+		nextOverride := openaiidentity.WorkspaceOverrideFromHeaders(seed.customHeaders)
+
+		if previousOverride != nextOverride {
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+				duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id)
+				if err != nil {
+					writeError(c, http.StatusInternalServerError, "校验工作区路由失败: "+err.Error())
+					return
+				}
+				if duplicateID > 0 {
+					writeError(c, http.StatusConflict, fmt.Sprintf("该登录身份的目标工作区已存在 (id=%d)", duplicateID))
+					return
+				}
+			}
+			duplicateID, err := h.findCredentialWorkspaceRouteDuplicate(ctx, seed, id)
+			if err != nil {
+				writeError(c, http.StatusInternalServerError, "校验凭证工作区路由失败: "+err.Error())
+				return
+			}
+			if duplicateID > 0 {
+				writeError(c, http.StatusConflict, fmt.Sprintf("相同凭证的目标工作区已存在 (id=%d)", duplicateID))
+				return
+			}
+		}
+	}
+
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新账号调度配置失败: "+err.Error())
+		return
+	}
+	h.applyAccountSchedulerRuntimeUpdate(id, update)
+
+	writeMessage(c, http.StatusOK, "账号调度配置已更新")
+}
+
+func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSchedulerUpdate) {
+	if h.store == nil {
+		return
+	}
+	if update.ScoreBiasOverride.Set || update.BaseConcurrencyOverride.Set || update.SkipWarmTier.Set {
+		h.store.ApplyAccountSchedulerOverridePatch(
+			id,
+			update.ScoreBiasOverride.Set,
+			nullableInt64Pointer(update.ScoreBiasOverride.Value),
+			update.BaseConcurrencyOverride.Set,
+			nullableInt64Pointer(update.BaseConcurrencyOverride.Value),
+			optionalBoolPtr(update.SkipWarmTier),
+		)
+	}
+	if update.AllowedAPIKeyIDs.Set {
+		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
+	}
+	if update.AutoPause5hThreshold.Set || update.AutoPause7dThreshold.Set || update.AutoPause5hDisabled.Set || update.AutoPause7dDisabled.Set {
+		h.store.ApplyAccountQuotaAutoPauseConfig(
+			id,
+			optionalFloat64Ptr(update.AutoPause5hThreshold),
+			optionalFloat64Ptr(update.AutoPause7dThreshold),
+			optionalBoolPtr(update.AutoPause5hDisabled),
+			optionalBoolPtr(update.AutoPause7dDisabled),
+		)
+	}
+	if update.UsageLimitOverride.Set {
+		h.store.ApplyAccountIgnoreUsageLimitStatus(id, update.UsageLimitOverride.Value)
+	}
+	if update.DispatchCountLimit.Set {
+		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
+	}
+	if update.SchedulerPriority.Set {
+		h.store.ApplyAccountSchedulerPriority(id, nullableInt64Pointer(update.SchedulerPriority.Value))
+	}
+	if update.Tags.Set {
+		h.store.ApplyAccountTags(id, update.Tags.Values)
+	}
+	if update.GroupIDs.Set {
+		h.store.ApplyAccountGroups(id, update.GroupIDs.Values)
+	}
+	if update.ProxyURL.Set {
+		h.store.ApplyAccountProxyURL(id, update.ProxyURL.Value)
+	}
+	if value, ok := update.CredentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey].(string); ok {
+		h.store.ApplyAccountUpstreamRequestIDHeader(id, value)
+	}
+	if update.CodexTurnState.Set || update.CodexTurnStateModels.Set {
+		if account := h.store.FindByID(id); account != nil {
+			value, models, setAt := account.CodexTurnStateConfig()
+			if update.CodexTurnState.Set {
+				value = update.CodexTurnState.Value
+			}
+			if update.CodexTurnStateModels.Set {
+				models = update.CodexTurnStateModels.Value
+			}
+			if raw, ok := update.CredentialUpdates[auth.CodexTurnStateSetAtCredentialKey].(string); ok {
+				setAt = auth.ParseCodexTurnStateSetAt(raw)
+			}
+			h.store.ApplyAccountCodexTurnState(id, value, models, setAt)
+		}
+	}
+	if update.CustomHeaders.Set {
+		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	} else if update.Timezone.Set {
+		// A timezone edit rebuilds the identity headers in CredentialUpdates;
+		// publish the same snapshot immediately instead of waiting for the
+		// scheduler outbox/restart to refresh runtime state.
+		if headers, ok := update.CredentialUpdates["custom_headers"].(map[string]string); ok {
+			h.store.ApplyAccountCustomHeaders(id, headers)
+		}
+	}
+	if update.CodexFingerprintMode.Set {
+		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
+	}
+	if update.Timezone.Set {
+		h.store.ApplyAccountTimezone(id, update.Timezone.Value)
+	}
+}
+
+type optionalCustomHeaders struct {
+	Set    bool
+	Values map[string]string
+}
+
+type optionalNullableBool struct {
+	Set   bool
+	Value *bool
+}
+
+func parseOptionalCustomHeadersField(raw json.RawMessage) (optionalCustomHeaders, error) {
+	if len(raw) == 0 {
+		return optionalCustomHeaders{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalCustomHeaders{Set: true}, nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal(raw, &headers); err != nil {
+		return optionalCustomHeaders{}, fmt.Errorf("custom_headers 必须是对象或 null")
+	}
+	normalized, err := normalizeCustomHeaders(headers)
+	if err != nil {
+		return optionalCustomHeaders{}, err
+	}
+	return optionalCustomHeaders{Set: true, Values: normalized}, nil
+}
+
+func normalizeCustomHeaders(headers map[string]string) (map[string]string, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	if len(headers) > 64 {
+		return nil, fmt.Errorf("custom_headers 最多支持 64 个请求头")
+	}
+	out := make(map[string]string, len(headers))
+	for rawName, rawValue := range headers {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		if len(name) > 128 || !isValidHeaderName(name) {
+			return nil, fmt.Errorf("custom_headers 包含无效请求头名称: %s", name)
+		}
+		value := strings.TrimSpace(rawValue)
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("custom_headers.%s 不能包含换行符", name)
+		}
+		if len(value) > 8192 {
+			return nil, fmt.Errorf("custom_headers.%s 不能超过 8192 字符", name)
+		}
+		canonicalName := http.CanonicalHeaderKey(name)
+		if previous, exists := out[canonicalName]; exists && previous != value {
+			return nil, fmt.Errorf("custom_headers 包含大小写重复且值冲突的请求头: %s", canonicalName)
+		}
+		out[canonicalName] = value
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func normalizeAccountModelMapping(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return "", fmt.Errorf("模型映射必须是 JSON 对象")
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return "", fmt.Errorf("模型映射必须是 JSON 对象")
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", fmt.Errorf("模型映射格式错误")
+		}
+		key, ok := keyTok.(string)
+		if !ok || strings.TrimSpace(key) == "" {
+			return "", fmt.Errorf("模型映射的源模型不能为空")
+		}
+		// 源模型别名会进入 /v1/models 响应、模型校验和使用日志，
+		// 必须与 models 列表同标准校验，防止任意字符串注入。
+		if err := security.ValidateModelName(strings.TrimSpace(key)); err != nil {
+			return "", fmt.Errorf("模型映射的源模型 %q 无效: %w", key, err)
+		}
+		var value string
+		if err := dec.Decode(&value); err != nil {
+			return "", fmt.Errorf("模型映射的目标模型必须是字符串")
+		}
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("模型映射的目标模型不能为空")
+		}
+		if err := security.ValidateModelName(strings.TrimSpace(value)); err != nil {
+			return "", fmt.Errorf("模型映射的目标模型 %q 无效: %w", value, err)
+		}
+	}
+	endTok, err := dec.Token()
+	if err != nil {
+		return "", fmt.Errorf("模型映射格式错误")
+	}
+	end, ok := endTok.(json.Delim)
+	if !ok || end != '}' {
+		return "", fmt.Errorf("模型映射格式错误")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return "", fmt.Errorf("模型映射只能包含一个 JSON 对象")
+	}
+	return raw, nil
+}
+
+func isValidHeaderName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return name != ""
+}
+
+func cloneCustomHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name, value := range headers {
+		out[name] = value
+	}
+	return out
+}
+
+func customHeadersWithWorkspaceOverride(headers map[string]string, workspaceID string) map[string]string {
+	out := make(map[string]string, len(headers)+1)
+	for name, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(name), openaiidentity.ChatGPTAccountIDHeader) {
+			continue
+		}
+		out[name] = value
+	}
+	if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
+		out[openaiidentity.ChatGPTAccountIDHeader] = workspaceID
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func credentialWorkspaceRouteKey(kind, token string, customHeaders map[string]string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	return kind + "\x00" + token + "\x00" + openaiidentity.WorkspaceOverrideFromHeaders(customHeaders)
+}
+
+func tokenCredentialSeedWorkspaceRouteKeys(seed tokenCredentialSeed) []string {
+	seed = normalizeTokenCredentialSeed(seed)
+	keys := make([]string, 0, 3)
+	for _, credential := range []struct {
+		kind  string
+		token string
+	}{
+		{kind: "rt", token: seed.refreshToken},
+		{kind: "st", token: seed.sessionToken},
+		{kind: "at", token: seed.accessToken},
+	} {
+		if key := credentialWorkspaceRouteKey(credential.kind, credential.token, seed.customHeaders); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func accountCredentialWorkspaceRouteKeys(row *database.AccountRow) []string {
+	if row == nil {
+		return nil
+	}
+	return tokenCredentialSeedWorkspaceRouteKeys(tokenCredentialSeedFromAccountRow(row))
+}
+
+// existingCredentialWorkspaceRouteOwners 返回「凭证工作区路由键 → 持有该凭证的
+// 活跃账号 ID」。去重命中时调用方凭 ID 回查账号状态，决定是普通跳过还是
+// 复活一个处于异常态的旧账号。同一路由理论上只有一个活跃账号；万一有多个
+// （allow_duplicate 导入过），保留先遇到的那个即可。
+func (h *Handler) existingCredentialWorkspaceRouteOwners(ctx context.Context) (map[string]int64, error) {
+	if h == nil || h.db == nil {
+		return nil, fmt.Errorf("database is not configured")
+	}
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	owners := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		for _, key := range accountCredentialWorkspaceRouteKeys(row) {
+			if _, exists := owners[key]; !exists {
+				owners[key] = row.ID
+			}
+		}
+	}
+	return owners, nil
+}
+
+// reviveDuplicateRouteOwner 在按凭证路由去重命中已有账号后，尝试复活它（仅当
+// 该账号处于 error / unauthorized 态）。返回 true 表示已复活，调用方应计入
+// "更新"而非"重复"。
+func (h *Handler) reviveDuplicateRouteOwner(ctx context.Context, ownerID int64, source string) bool {
+	if h == nil || h.db == nil || ownerID <= 0 {
+		return false
+	}
+	row, err := h.db.GetAccountByID(ctx, ownerID)
+	if err != nil || row == nil {
+		return false
+	}
+	return h.reviveReimportedAccount(ctx, row, source)
+}
+
+func (h *Handler) findCredentialWorkspaceRouteDuplicate(ctx context.Context, seed tokenCredentialSeed, excludeID int64) (int64, error) {
+	candidateKeys := tokenCredentialSeedWorkspaceRouteKeys(seed)
+	if len(candidateKeys) == 0 {
+		return 0, nil
+	}
+	candidates := make(map[string]struct{}, len(candidateKeys))
+	for _, key := range candidateKeys {
+		candidates[key] = struct{}{}
+	}
+	rows, err := h.db.ListActive(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		if row.ID == excludeID {
+			continue
+		}
+		for _, key := range accountCredentialWorkspaceRouteKeys(row) {
+			if _, ok := candidates[key]; ok {
+				return row.ID, nil
+			}
+		}
+	}
+	return 0, nil
+}
+
+type optionalStringSlice struct {
+	Set    bool
+	Values []string
+}
+
+type optionalFloat64 struct {
+	Set   bool
+	Value float64
+}
+
+func accountQuotaAutoPauseThreshold(row *database.AccountRow, key string) *float64 {
+	value, ok := row.GetCredentialFloat64(key)
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1 {
+		value = 1
+	}
+	return &value
+}
+
+func accountDispatchCountLimit(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("dispatch_count_limit")
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1000000 {
+		value = 1000000
+	}
+	return &value
+}
+
+func accountSchedulerPriority(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("scheduler_priority")
+	if !ok || value == 0 {
+		return nil
+	}
+	if value > 100 {
+		value = 100
+	}
+	if value < -100 {
+		value = -100
+	}
+	return &value
+}
+
+func parseOptionalStringSliceField(raw json.RawMessage, field string) (optionalStringSlice, error) {
+	if len(raw) == 0 {
+		return optionalStringSlice{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalStringSlice{Set: true, Values: []string{}}, nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return optionalStringSlice{}, fmt.Errorf("%s 必须是字符串数组或 null", field)
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		clean := strings.TrimSpace(value)
+		if clean == "" {
+			continue
+		}
+		if utf8.RuneCountInString(clean) > 40 {
+			return optionalStringSlice{}, fmt.Errorf("%s 单个标签不能超过 40 字符", field)
+		}
+		key := strings.ToLower(clean)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, clean)
+	}
+	if len(out) > 32 {
+		return optionalStringSlice{}, fmt.Errorf("%s 最多 32 个标签", field)
+	}
+	return optionalStringSlice{Set: true, Values: out}, nil
+}
+
+func parseOptionalStringField(raw json.RawMessage, field string, validator func(string) error) (database.OptionalString, error) {
+	if len(raw) == 0 {
+		return database.OptionalString{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalString{Set: true, Value: ""}, nil
+	}
+
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalString{}, fmt.Errorf("%s 必须是字符串或 null", field)
+	}
+	value = strings.TrimSpace(value)
+	if validator != nil {
+		if err := validator(value); err != nil {
+			return database.OptionalString{}, fmt.Errorf("%s 无效: %w", field, err)
+		}
+	}
+	return database.OptionalString{Set: true, Value: value}, nil
+}
+
+func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (database.OptionalNullInt64, error) {
+	if len(raw) == 0 {
+		return database.OptionalNullInt64{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalNullInt64{Set: true}, nil
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+	}
+	value, err := number.Int64()
+	if err != nil {
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+	}
+	if value < minValue || value > maxValue {
+		if maxValue == math.MaxInt64 {
+			return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须 >= %d", field, minValue)
+		}
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
+	}
+	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
+}
+
+func parseOptionalRatioField(raw json.RawMessage, field string) (optionalFloat64, error) {
+	if len(raw) == 0 {
+		return optionalFloat64{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalFloat64{Set: true, Value: 0}, nil
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return optionalFloat64{}, fmt.Errorf("%s 必须是 0..1 之间的小数或 null", field)
+	}
+	value, err := number.Float64()
+	if err != nil {
+		return optionalFloat64{}, fmt.Errorf("%s 必须是 0..1 之间的小数或 null", field)
+	}
+	if value < 0 || value > 1 {
+		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 0..1 之间", field)
+	}
+	return optionalFloat64{Set: true, Value: value}, nil
+}
+
+func parseOptionalBoolField(raw json.RawMessage, field string) (database.OptionalBool, error) {
+	if len(raw) == 0 {
+		return database.OptionalBool{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalBool{Set: true, Value: false}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return database.OptionalBool{Set: true, Value: value}, nil
+}
+
+func parseOptionalNullableBoolField(raw json.RawMessage, field string) (optionalNullableBool, error) {
+	if len(raw) == 0 {
+		return optionalNullableBool{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalNullableBool{Set: true}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return optionalNullableBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return optionalNullableBool{Set: true, Value: &value}, nil
+}
+
+func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
+	if len(raw) == 0 {
+		return database.OptionalInt64Slice{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	var values []json.Number
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+	}
+	if len(values) == 0 {
+		return database.OptionalInt64Slice{Set: true, Values: []int64{}}, nil
+	}
+
+	unique := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, number := range values {
+		value, err := number.Int64()
+		if err != nil {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 必须是整数数组或 null", field)
+		}
+		if value <= 0 {
+			return database.OptionalInt64Slice{}, fmt.Errorf("%s 中的值必须是正整数", field)
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	return database.OptionalInt64Slice{Set: true, Values: result}, nil
+}
+
+func (h *Handler) findMissingAPIKeyIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	keys, err := h.db.ListAPIKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[int64]struct{}, len(keys))
+	for _, key := range keys {
+		if key == nil {
+			continue
+		}
+		existing[key.ID] = struct{}{}
+	}
+
+	missing := make([]int64, 0)
+	for _, id := range ids {
+		if _, ok := existing[id]; ok {
+			continue
+		}
+		missing = append(missing, id)
+	}
+	return missing, nil
+}
+
+func nullableInt64Pointer(v sql.NullInt64) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	value := v.Int64
+	return &value
+}
+
+func optionalFloat64Ptr(value optionalFloat64) *float64 {
+	if !value.Set {
+		return nil
+	}
+	v := value.Value
+	return &v
+}
+
+func optionalBoolPtr(value database.OptionalBool) *bool {
+	if !value.Set {
+		return nil
+	}
+	v := value.Value
+	return &v
+}
+
+func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
+	if override.Valid {
+		return override.Int64
+	}
+	// 与 auth.defaultScoreBiasForPlan 保持一致；k12 是教育版 team (issue #282)
+	switch auth.NormalizePlanType(planType) {
+	case "pro", "plus", "team", "k12":
+		return 50
+	default:
+		return 0
+	}
+}
+
+func effectiveBaseConcurrency(override sql.NullInt64, defaultValue int64) int64 {
+	if override.Valid {
+		return override.Int64
+	}
+	return defaultValue
+}
+
+func dispatchScoreFallback(schedulerScore float64, scoreBiasEffective int64, healthTier string, status string) float64 {
+	if schedulerScore == 0 {
+		return 0
+	}
+	if !allowScoreBias(healthTier, status) {
+		return schedulerScore
+	}
+	return schedulerScore + float64(scoreBiasEffective)
+}
+
+func allowScoreBias(healthTier string, status string) bool {
+	if status != "" && status != "active" {
+		return false
+	}
+	switch strings.ToLower(healthTier) {
+	case "healthy", "warm":
+		return true
+	default:
+		return false
+	}
+}
+
+// 这里优先读取 auth 层并行实现新增的 runtime/debug 字段，字段名约定为：
+// DispatchScore / ScoreBiasEffective / BaseConcurrencyEffective。
+// 若主分支尚未集成这些字段，则回退到管理层可推导的兼容值，避免阻塞前后端联调。
+func reflectFloat64Field(value interface{}, field string) (float64, bool) {
+	v := reflect.Indirect(reflect.ValueOf(value))
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := v.FieldByName(field)
+	if !f.IsValid() {
+		return 0, false
+	}
+	switch f.Kind() {
+	case reflect.Float32, reflect.Float64:
+		return f.Convert(reflect.TypeOf(float64(0))).Float(), true
+	default:
+		return 0, false
+	}
+}
+
+func reflectInt64Field(value interface{}, field string) (int64, bool) {
+	v := reflect.Indirect(reflect.ValueOf(value))
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := v.FieldByName(field)
+	if !f.IsValid() {
+		return 0, false
+	}
+	switch f.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return f.Int(), true
+	default:
+		return 0, false
+	}
+}
+
+// getCachedRequestCounts preserves the legacy full-list behavior: a blocking
+// global aggregation cached under its own key, so it never contends with the
+// per-channel paged caches.
+func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCount {
+	const cacheKey = "all"
+	h.reqCountMu.RLock()
+	entry := h.reqCountCache[cacheKey]
+	if entry != nil && time.Now().Before(entry.expiresAt) {
+		h.reqCountMu.RUnlock()
+		return entry.counts
+	}
+	h.reqCountMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	counts, err := h.db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		log.Printf("获取账号请求统计失败: %v", err)
+		return make(map[int64]*database.AccountRequestCount)
+	}
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
+	return counts
+}
+
+func (h *Handler) getAccountUsageWindows(ctx context.Context) (map[int64]*database.AccountTimeRangeUsage, map[int64]*database.AccountTimeRangeUsage) {
+	type cachedUsageWindows struct {
+		Usage5h map[int64]*database.AccountTimeRangeUsage `json:"usage_5h"`
+		Usage7d map[int64]*database.AccountTimeRangeUsage `json:"usage_7d"`
+	}
+	var cached cachedUsageWindows
+	if h.getRuntimeJSON(ctx, adminAccountWindowsNamespace, "global", &cached) && cached.Usage5h != nil && cached.Usage7d != nil {
+		return cached.Usage5h, cached.Usage7d
+	}
+	now := time.Now()
+	usage5h, usage7d, err := h.db.GetAccountUsageWindows(ctx, now.Add(-5*time.Hour), now.AddDate(0, 0, -7))
+	if err != nil {
+		log.Printf("获取账号 5h/7d 用量统计失败: %v", err)
+		usage5h = make(map[int64]*database.AccountTimeRangeUsage)
+		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
+		return usage5h, usage7d
+	}
+	h.setRuntimeJSON(ctx, adminAccountWindowsNamespace, "global", cachedUsageWindows{Usage5h: usage5h, Usage7d: usage7d}, adminAccountWindowsCacheTTL)
+	return usage5h, usage7d
+}
+
+type addAccountReq struct {
+	Name           string            `json:"name"`
+	RefreshToken   string            `json:"refresh_token"`
+	SessionToken   string            `json:"session_token"`
+	ProxyURL       string            `json:"proxy_url"`
+	CustomHeaders  map[string]string `json:"custom_headers"`
+	AllowDuplicate bool              `json:"allow_duplicate"`
+	// SkipRefresh 只入库、不换 AT、不打用量探测。大批量脚本导入时应打开，
+	// 避免每批 50 个裸 RT 立刻拉起无上限的上游刷新把网关打卡。
+	SkipRefresh bool `json:"skip_refresh"`
+	// GroupIDs 让添加时就把新账号绑进指定分组；重复跳过的账号不受影响。
+	GroupIDs json.RawMessage `json:"group_ids"`
+}
+
+func splitAccountCredentialLines(raw string, sanitize bool) []string {
+	lines := strings.Split(raw, "\n")
+	tokens := make([]string, 0, len(lines))
+	for _, line := range lines {
+		token := strings.TrimSpace(line)
+		if sanitize {
+			token = strings.TrimSpace(security.SanitizeInput(token))
+		}
+		if token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
+}
+
+// accountCredentialDedup 跟踪 RT/ST 原文去重（用于 RT/ST 单账号/批量添加路径）。
+// 身份型（OAuth）去重在文件导入与 AT 路径单独处理，这里只覆盖加入时无法解出身份的 RT/ST。
+type accountCredentialDedup struct {
+	// existingOwners 路由键 → 库里持有该凭证的活跃账号 ID。
+	existingOwners map[string]int64
+	seenRoutes     map[string]bool
+}
+
+func (h *Handler) newAccountCredentialDedup(ctx context.Context) *accountCredentialDedup {
+	d := &accountCredentialDedup{
+		seenRoutes: make(map[string]bool),
+	}
+	existingOwners, err := h.existingCredentialWorkspaceRouteOwners(ctx)
+	if err != nil {
+		log.Printf("查询已有凭证工作区路由失败: %v", err)
+		existingOwners = make(map[string]int64)
+	}
+	d.existingOwners = existingOwners
+	return d
+}
+
+func (d *accountCredentialDedup) routeKeys(seed tokenCredentialSeed) []string {
+	keys := make([]string, 0, 2)
+	if key := credentialWorkspaceRouteKey("rt", seed.refreshToken, seed.customHeaders); key != "" {
+		keys = append(keys, key)
+	}
+	if key := credentialWorkspaceRouteKey("st", seed.sessionToken, seed.customHeaders); key != "" {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// checkAndMarkOwner 返回该 seed 是否与已有库或本批次重复（应跳过）；非重复时
+// 记录其凭证。重复命中库里已有账号时一并返回该账号 ID（本批次内部重复返回
+// 0），供调用方判断是否复活异常态旧账号。
+func (d *accountCredentialDedup) checkAndMarkOwner(seed tokenCredentialSeed) (bool, int64) {
+	keys := d.routeKeys(seed)
+	for _, key := range keys {
+		if ownerID, ok := d.existingOwners[key]; ok && ownerID > 0 {
+			return true, ownerID
+		}
+		if d.seenRoutes[key] {
+			return true, 0
+		}
+	}
+	for _, key := range keys {
+		d.seenRoutes[key] = true
+	}
+	return false, 0
+}
+
+// AddAccount 添加新账号（支持批量：refresh_token/session_token 按行分割）
+func (h *Handler) AddAccount(c *gin.Context) {
+	var req addAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	// 输入验证和清理
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+
+	if strings.TrimSpace(req.RefreshToken) == "" && strings.TrimSpace(req.SessionToken) == "" {
+		writeError(c, http.StatusBadRequest, "refresh_token 或 session_token 是必填字段")
+		return
+	}
+
+	// 检查XSS和SQL注入
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+
+	// 验证名称长度
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	// 验证代理URL
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CustomHeaders = customHeaders
+
+	// 按行分割，支持批量添加。refresh_token 与 session_token 同时填写时，
+	// session_token 可填写一行应用到所有 RT，也可与 RT 行数一一对应。
+	refreshTokens := splitAccountCredentialLines(req.RefreshToken, true)
+	sessionTokens := splitAccountCredentialLines(req.SessionToken, true)
+	total := len(refreshTokens)
+	if total == 0 {
+		total = len(sessionTokens)
+	}
+	if len(refreshTokens) > 0 && len(sessionTokens) > 1 && len(sessionTokens) != len(refreshTokens) {
+		writeError(c, http.StatusBadRequest, "session_token 行数需为 1 或与 refresh_token 行数一致")
+		return
+	}
+
+	var seeds []tokenCredentialSeed
+	for i := 0; i < total; i++ {
+		seed := tokenCredentialSeed{allowDuplicate: req.AllowDuplicate, customHeaders: customHeaders}
+		if len(refreshTokens) > 0 {
+			seed.refreshToken = refreshTokens[i]
+		}
+		if len(sessionTokens) == 1 {
+			seed.sessionToken = sessionTokens[0]
+		} else if len(sessionTokens) > 1 {
+			seed.sessionToken = sessionTokens[i]
+		}
+		seeds = append(seeds, seed)
+	}
+
+	if len(seeds) == 0 {
+		writeError(c, http.StatusBadRequest, "未找到有效的 Refresh Token 或 Session Token")
+		return
+	}
+
+	// 限制批量添加数量
+	if len(seeds) > 100 {
+		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
+		return
+	}
+
+	// 分组校验放在插账号之前：分组 ID 打错时不该留下一半已入库的账号。
+	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	groupIDs, err := h.resolveImportGroupIDsJSON(groupCtx, req.GroupIDs)
+	groupCancel()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddAccounts(c, req, seeds, groupIDs)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	successCount := 0
+	failCount := 0
+	duplicateCount := 0
+	revivedCount := 0
+	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != "" {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
+
+	for i, seed := range seeds {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("account-%d", i+1)
+		} else if len(seeds) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		if dedup != nil {
+			if duplicate, ownerID := dedup.checkAndMarkOwner(seed); duplicate {
+				// 同一凭证再添加一次且旧账号正挂在 error / 401 态：视为要求复活。
+				if h.reviveDuplicateRouteOwner(ctx, ownerID, "manual_add") {
+					revivedCount++
+					continue
+				}
+				duplicateCount++
+				log.Printf("添加账号 %d 已存在（RT/ST 重复），跳过", i+1)
+				continue
+			}
+		}
+
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
+			failCount++
+			continue
+		}
+
+		successCount++
+		createdIDs.add(id)
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
+	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
+
+	// 记录安全审计日志
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, revivedCount, duplicateCount, failCount, c.ClientIP()))
+
+	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
+	if revivedCount > 0 {
+		msg += fmt.Sprintf("，%d 个已有账号已恢复", revivedCount)
+	}
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
+	if failCount > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failCount)
+	}
+	boundGroups := len(groupIDs) > 0
+	if err := h.bindImportedAccountGroups(ctx, createdIDs.snapshot(), groupIDs); err != nil {
+		// 账号已入库，只是分组没绑上——必须说出来，否则用户以为绑好了。
+		boundGroups = false
+		msg += "，但分组绑定失败: " + err.Error()
+	}
+
+	newAccountIDs := createdIDs.snapshot()
+	c.JSON(http.StatusOK, gin.H{
+		"message":      msg,
+		"success":      successCount,
+		"updated":      revivedCount,
+		"duplicate":    duplicateCount,
+		"failed":       failCount,
+		"bound_groups": boundGroups,
+		"group_ids":    groupIDs,
+		"created_ids":  newAccountIDs,
+	})
+}
+
+func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []tokenCredentialSeed, groupIDs []int64) {
+	setupSSE(c)
+
+	total := len(seeds)
+	successCount := 0
+	failCount := 0
+	duplicateCount := 0
+	revivedCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Updated: 0, Duplicate: 0, Failed: 0,
+	})
+	progress := func(current int) {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: current, Total: total,
+			Success: successCount, Updated: revivedCount, Duplicate: duplicateCount, Failed: failCount,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(req.CustomHeaders) != "" {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
+	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
+
+	for i, seed := range seeds {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("account-%d", i+1)
+		} else if len(seeds) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		if dedup != nil {
+			if duplicate, ownerID := dedup.checkAndMarkOwner(seed); duplicate {
+				// 同一凭证再添加一次且旧账号正挂在 error / 401 态：视为要求复活。
+				if h.reviveDuplicateRouteOwner(ctx, ownerID, "manual_add") {
+					revivedCount++
+				} else {
+					duplicateCount++
+				}
+				progress(i + 1)
+				continue
+			}
+		}
+
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
+			failCount++
+			progress(i + 1)
+			continue
+		}
+
+		successCount++
+		createdIDs.add(id)
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
+
+		progress(i + 1)
+	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
+
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, revivedCount, duplicateCount, failCount, c.ClientIP()))
+	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
+	if err := h.bindImportedAccountGroups(ctx, createdIDs.snapshot(), groupIDs); err != nil {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: total, Total: total,
+			Success: successCount, Updated: revivedCount, Duplicate: duplicateCount, Failed: failCount,
+			Warning: "账号已添加，但分组绑定失败: " + err.Error(),
+		})
+	}
+	newAccountIDs := createdIDs.snapshot()
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Updated: revivedCount, Duplicate: duplicateCount, Failed: failCount,
+		CreatedIDs: newAccountIDs,
+	})
+}
+
+// addATAccountReq AT 模式添加账号请求
+type addATAccountReq struct {
+	Name           string            `json:"name"`
+	AccessToken    string            `json:"access_token"`
+	ProxyURL       string            `json:"proxy_url"`
+	CustomHeaders  map[string]string `json:"custom_headers"`
+	AllowDuplicate bool              `json:"allow_duplicate"`
+	// GroupIDs 让添加时就把新账号绑进指定分组；重复跳过与命中已有身份被更新的账号不受影响。
+	GroupIDs json.RawMessage `json:"group_ids"`
+}
+
+// AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
+func (h *Handler) AddATAccount(c *gin.Context) {
+	var req addATAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+
+	if req.AccessToken == "" {
+		writeError(c, http.StatusBadRequest, "access_token 是必填字段")
+		return
+	}
+
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CustomHeaders = customHeaders
+
+	// 按行分割，支持批量添加
+	lines := strings.Split(req.AccessToken, "\n")
+	var tokens []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			tokens = append(tokens, t)
+		}
+	}
+
+	if len(tokens) == 0 {
+		writeError(c, http.StatusBadRequest, "未找到有效的 Access Token")
+		return
+	}
+
+	if len(tokens) > 100 {
+		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
+		return
+	}
+
+	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	groupIDs, err := h.resolveImportGroupIDsJSON(groupCtx, req.GroupIDs)
+	groupCancel()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddATAccounts(c, req, tokens, groupIDs)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	successCount := 0
+	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
+
+	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 有效工作区，如 codex_at）
+	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
+	//（email + 有效工作区）去重/更新。显式 Chatgpt-Account-Id 可把同一 AT
+	// 拆成多个独立工作区路由；同一路由仍会更新已有账号。
+	existingATRoutes := make(map[string]int64)
+	seenATRoutes := make(map[string]bool)
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != ""
+	if !req.AllowDuplicate || workspaceOverrideKnown {
+		if got, err := h.existingCredentialWorkspaceRouteOwners(ctx); err != nil {
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
+		} else {
+			existingATRoutes = got
+		}
+	}
+
+	whoami := &patWhoAmIHydrator{proxyURL: req.ProxyURL}
+	for i, at := range tokens {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("at-account-%d", i+1)
+		} else if len(tokens) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+			accessToken:    at,
+			allowDuplicate: req.AllowDuplicate,
+			customHeaders:  customHeaders,
+		})
+		// codex_at 不走 OAuth 身份去重：whoami 补出来的 email+工作区会撞上同工作区的
+		// OAuth 账号，把 PAT 合并进去等于用 PAT 覆盖它的 access_token。PAT 始终按 token 路由键去重。
+		if seed.accessTokenType != accessTokenTypeCodexAT && seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+				failCount++
+				continue
+			}
+			if updated {
+				// 已有账号只更新凭证，不计入"新增"。
+				updatedCount++
+				log.Printf("AT 账号 %d 命中已有身份并更新凭证 (id=%d)", i+1, id)
+			} else {
+				successCount++
+				createdIDs.add(id)
+				pending = append(pending, newAcc)
+				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
+			}
+			continue
+		}
+
+		if !req.AllowDuplicate || workspaceOverrideKnown {
+			routeKey := credentialWorkspaceRouteKey("at", at, seed.customHeaders)
+			if ownerID, exists := existingATRoutes[routeKey]; exists || seenATRoutes[routeKey] {
+				// 同一 AT 再添加一次且旧账号正挂在 error / 401 态：视为要求复活。
+				if exists && h.reviveDuplicateRouteOwner(ctx, ownerID, "manual_at") {
+					updatedCount++
+					continue
+				}
+				duplicateCount++
+				log.Printf("AT 账号 %d 已存在（access_token 与目标工作区重复），跳过", i+1)
+				continue
+			}
+			seenATRoutes[routeKey] = true
+		}
+
+		// 去重之后再补身份：重导已知批次不该再付 N 次网络往返。
+		seed = whoami.hydrate(ctx, seed)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+			failCount++
+			continue
+		}
+
+		successCount++
+		createdIDs.add(id)
+
+		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
+		// 身份信息后续由 wham 用量查询补齐。
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
+		pending = append(pending, newAcc)
+		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
+	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
+
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
+
+	msg := fmt.Sprintf("成功新增 %d 个 AT 账号", successCount)
+	if updatedCount > 0 {
+		msg += fmt.Sprintf("，%d 个已有账号更新", updatedCount)
+	}
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
+	if failCount > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failCount)
+	}
+	boundGroups := len(groupIDs) > 0
+	if err := h.bindImportedAccountGroups(ctx, createdIDs.snapshot(), groupIDs); err != nil {
+		boundGroups = false
+		msg += "，但分组绑定失败: " + err.Error()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      msg,
+		"success":      successCount,
+		"updated":      updatedCount,
+		"duplicate":    duplicateCount,
+		"failed":       failCount,
+		"bound_groups": boundGroups,
+		"group_ids":    groupIDs,
+	})
+}
+
+// streamAddATAccounts 以 SSE 流式推送 AT 批量添加进度（与 streamAddAccounts 对齐）。
+func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, tokens []string, groupIDs []int64) {
+	setupSSE(c)
+
+	total := len(tokens)
+	successCount := 0
+	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Updated: 0, Duplicate: 0, Failed: 0,
+	})
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	existingATRoutes := make(map[string]int64)
+	seenATRoutes := make(map[string]bool)
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(req.CustomHeaders) != ""
+	if !req.AllowDuplicate || workspaceOverrideKnown {
+		if got, err := h.existingCredentialWorkspaceRouteOwners(ctx); err != nil {
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
+		} else {
+			existingATRoutes = got
+		}
+	}
+
+	progress := func(current int) {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: current, Total: total,
+			Success: successCount, Updated: updatedCount, Duplicate: duplicateCount, Failed: failCount,
+		})
+	}
+	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
+
+	whoami := &patWhoAmIHydrator{proxyURL: req.ProxyURL}
+	for i, at := range tokens {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("at-account-%d", i+1)
+		} else if total > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
+		// 同 AddATAccount：codex_at 不进 OAuth 身份去重，见上方注释。
+		if seed.accessTokenType != accessTokenTypeCodexAT && seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at", overwriteAccountProxy)
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+				failCount++
+			} else if updated {
+				// 已有账号只更新凭证，不计入"新增"（重复添加时新增应为 0）。
+				updatedCount++
+				log.Printf("AT 账号 %d 命中已有身份并更新凭证 (id=%d)", i+1, id)
+			} else {
+				successCount++
+				createdIDs.add(id)
+				pending = append(pending, newAcc)
+				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
+			}
+			progress(i + 1)
+			continue
+		}
+
+		if !req.AllowDuplicate || workspaceOverrideKnown {
+			routeKey := credentialWorkspaceRouteKey("at", at, seed.customHeaders)
+			if ownerID, exists := existingATRoutes[routeKey]; exists || seenATRoutes[routeKey] {
+				// 同一 AT 再添加一次且旧账号正挂在 error / 401 态：视为要求复活。
+				if exists && h.reviveDuplicateRouteOwner(ctx, ownerID, "manual_at") {
+					updatedCount++
+				} else {
+					duplicateCount++
+				}
+				progress(i + 1)
+				continue
+			}
+			seenATRoutes[routeKey] = true
+		}
+
+		seed = whoami.hydrate(ctx, seed)
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+			failCount++
+			progress(i + 1)
+			continue
+		}
+
+		successCount++
+		createdIDs.add(id)
+		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
+		pending = append(pending, newAcc)
+		progress(i + 1)
+	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
+
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
+	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
+	if err := h.bindImportedAccountGroups(ctx, createdIDs.snapshot(), groupIDs); err != nil {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: total, Total: total,
+			Success: successCount, Updated: updatedCount, Duplicate: duplicateCount, Failed: failCount,
+			Warning: "账号已添加，但分组绑定失败: " + err.Error(),
+		})
+	}
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Updated: updatedCount, Duplicate: duplicateCount, Failed: failCount,
+	})
+}
+
+type addOpenAIResponsesAccountReq struct {
+	Name                    string            `json:"name"`
+	BaseURL                 string            `json:"base_url"`
+	APIKey                  string            `json:"api_key"`
+	BalanceQueryURL         string            `json:"balance_query_url"`
+	Models                  []string          `json:"models"`
+	ModelMapping            string            `json:"model_mapping"`
+	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
+	CodexPassthroughMode    *string           `json:"codex_passthrough_mode"`
+	ProxyURL                string            `json:"proxy_url"`
+	CustomHeaders           map[string]string `json:"custom_headers"`
+}
+
+type fetchOpenAIResponsesModelsReq struct {
+	AccountID     int64             `json:"account_id"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
+}
+
+func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	balanceQueryURL, err := normalizeOpenAIResponsesBalanceQueryURL(req.BalanceQueryURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	modelMapping, err := normalizeAccountModelMapping(req.ModelMapping)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	codexClientMetadataMode := auth.CodexClientMetadataModeAuto
+	if req.CodexClientMetadataMode != nil {
+		if !auth.IsValidCodexClientMetadataMode(*req.CodexClientMetadataMode) {
+			writeError(c, http.StatusBadRequest, "codex_client_metadata_mode 必须是 auto、always 或 off")
+			return
+		}
+		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
+	}
+	codexPassthroughMode := auth.CodexPassthroughModeOff
+	if req.CodexPassthroughMode != nil {
+		if !auth.IsValidCodexPassthroughMode(*req.CodexPassthroughMode) {
+			writeError(c, http.StatusBadRequest, "codex_passthrough_mode 必须是 off、auto 或 always")
+			return
+		}
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	existing, err := h.db.GetAllOpenAIAPIKeys(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if existing[req.APIKey] {
+		writeError(c, http.StatusConflict, "该 API Key 已存在")
+		return
+	}
+
+	name := req.Name
+	if name == "" {
+		name = "openai-responses"
+	}
+	credentials := map[string]interface{}{
+		"upstream_type":                          auth.UpstreamOpenAIResponses,
+		"base_url":                               baseURL,
+		"api_key":                                req.APIKey,
+		openAIResponsesBalanceQueryURLCredential: balanceQueryURL,
+		"models":                                 models,
+		"model_mapping":                          modelMapping,
+		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"codex_passthrough_mode":                 codexPassthroughMode,
+		"plan_type":                              "api",
+		"email":                                  baseURL,
+	}
+	if len(customHeaders) > 0 {
+		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
+	}
+	id, err := h.db.InsertOpenAIResponsesAccount(ctx, name, credentials, req.ProxyURL)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
+
+	h.store.AddAccount(&auth.Account{
+		DBID:                    id,
+		ProxyURL:                req.ProxyURL,
+		HealthTier:              auth.HealthTierHealthy,
+		UpstreamType:            auth.UpstreamOpenAIResponses,
+		BaseURL:                 baseURL,
+		APIKey:                  req.APIKey,
+		Models:                  models,
+		ModelMapping:            modelMapping,
+		CodexClientMetadataMode: codexClientMetadataMode,
+		CodexPassthroughMode:    codexPassthroughMode,
+		CustomHeaders:           customHeaders,
+		Email:                   baseURL,
+		PlanType:                "api",
+	})
+
+	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "成功添加 OpenAI Responses API 账号",
+		"id":      id,
+	})
+}
+
+func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
+	var req fetchOpenAIResponsesModelsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	if req.AccountID > 0 && req.APIKey == "" {
+		row, err := h.db.GetAccountByID(c.Request.Context(), req.AccountID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeInternalError(c, err)
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+			writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持使用已保存的 API Key 获取模型")
+			return
+		}
+		req.APIKey = row.GetCredential("api_key")
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = row.GetCredential("base_url")
+		}
+		if strings.TrimSpace(req.ProxyURL) == "" {
+			req.ProxyURL = row.ProxyURL
+		}
+		if len(req.CustomHeaders) == 0 {
+			req.CustomHeaders = row.GetCredentialStringMap("custom_headers")
+		}
+	}
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"models":   models,
+		"base_url": baseURL,
+	})
+}
+
+func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+		writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持账号设置")
+		return
+	}
+
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	balanceQueryURL, err := normalizeOpenAIResponsesBalanceQueryURL(req.BalanceQueryURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	modelMapping, err := normalizeAccountModelMapping(req.ModelMapping)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	codexClientMetadataMode := auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
+	if req.CodexClientMetadataMode != nil {
+		if !auth.IsValidCodexClientMetadataMode(*req.CodexClientMetadataMode) {
+			writeError(c, http.StatusBadRequest, "codex_client_metadata_mode 必须是 auto、always 或 off")
+			return
+		}
+		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(*req.CodexClientMetadataMode)
+	}
+	codexPassthroughMode := auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	if req.CodexPassthroughMode != nil {
+		if !auth.IsValidCodexPassthroughMode(*req.CodexPassthroughMode) {
+			writeError(c, http.StatusBadRequest, "codex_passthrough_mode 必须是 off、auto 或 always")
+			return
+		}
+		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	name := req.Name
+	if name == "" {
+		name = row.Name
+	}
+	if name == "" {
+		name = "openai-responses"
+	}
+
+	credentials := map[string]interface{}{
+		"upstream_type":                          auth.UpstreamOpenAIResponses,
+		"base_url":                               baseURL,
+		openAIResponsesBalanceQueryURLCredential: balanceQueryURL,
+		"models":                                 models,
+		"model_mapping":                          modelMapping,
+		"codex_client_metadata_mode":             codexClientMetadataMode,
+		"codex_passthrough_mode":                 codexPassthroughMode,
+		"plan_type":                              "api",
+		"email":                                  baseURL,
+		"custom_headers":                         cloneCustomHeaders(customHeaders),
+	}
+	if req.APIKey != "" {
+		credentials["api_key"] = req.APIKey
+	}
+	if req.APIKey == "" && strings.TrimSpace(row.GetCredential("api_key")) == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+
+	if err := h.db.UpdateOpenAIResponsesAccount(ctx, id, name, credentials, req.ProxyURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if h.store != nil {
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, codexClientMetadataMode, codexPassthroughMode, req.ProxyURL)
+		h.store.ApplyAccountCustomHeaders(id, customHeaders)
+	}
+	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
+
+	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
+}
+
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+		return nil, fmt.Errorf("代理URL无效: %w", err)
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建模型列表请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	for name, value := range customHeaders {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求 /v1/models 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, readErr := proxy.ReadModelsListBody(resp.Body, proxy.CurrentRuntimeSettings().ModelsListReadMaxBytes)
+	if readErr != nil {
+		return nil, fmt.Errorf("读取 /v1/models 响应失败: %w", readErr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+		if message == "" {
+			message = strings.TrimSpace(string(body))
+		}
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("/v1/models 返回 %d: %s", resp.StatusCode, message)
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("解析 /v1/models 响应失败: %w", err)
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		models = append(models, item.ID)
+	}
+	models = auth.NormalizeOpenAIResponsesModels(models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("/v1/models 未返回可用模型")
+	}
+	return models, nil
+}
+
+type updateAccountModelsRequest struct {
+	Models []string `json:"models"`
+}
+
+// UpdateAccountModels 设置 OAuth 账号的支持模型白名单。
+// Claude 账号仅接受 claude-* 原生模型；空数组 = 清空白名单，放行全部模型；
+// 非空时调度器只会把白名单内模型的请求派给该账号。
+func (h *Handler) UpdateAccountModels(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	var req updateAccountModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	models := auth.NormalizeAccountModels(req.Models)
+	if len(models) > 200 {
+		writeError(c, http.StatusBadRequest, "模型数量不能超过 200")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsRelayStyle() {
+		writeError(c, http.StatusBadRequest, "中转账号请在账号设置中编辑模型列表")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"models": models}); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.store.ApplyAccountModels(id, models)
+	h.db.InsertAccountEventAsync(id, "updated", "account_models")
+	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
+// SyncAccountUpstreamModels 用账号自身凭据实时拉取上游模型清单，
+// 返回该账号真实可用的模型 slug 列表。账号白名单本身只读不落库，由管理端确认后再保存；
+// 但清单里注册表尚不认识的模型会顺手学习进注册表（只增不改不删，与客户端刷新
+// 选单时的学习同一实现）：否则 Trusted Access for Cyber 这类只有个别账号才有的模型
+// 探测看得见、保存进白名单后 /v1/models 却不列、调用直接报模型不存在（issue #624）。
+func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsOpenAIResponsesAPI() {
+		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号请使用账号设置中的模型同步")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+	if err != nil {
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
+		return
+	}
+	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
+	if len(models) == 0 {
+		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
+		return
+	}
+	// 学习失败只记日志，不影响本次探测结果的返回。
+	if added, learnErr := proxy.LearnModelsFromManifest(ctx, h.db, manifest.Body, time.Now().UTC()); learnErr != nil {
+		log.Printf("[账号 %d] 模型清单学习失败（不影响探测结果）: %v", id, learnErr)
+	} else if len(added) > 0 {
+		log.Printf("[账号 %d] 已从上游模型清单学习 %d 个新模型进注册表: %s", id, len(added), strings.Join(added, ", "))
+	}
+	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
+// importToken 导入时的统一 token 载体
+type importToken struct {
+	refreshToken          string
+	sessionToken          string
+	accessToken           string // AT-only 兼容路径
+	name                  string
+	email                 string
+	idToken               string
+	accountID             string
+	chatgptAccountID      string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
+	planType              string
+	expiresAt             string
+	codex7DUsedPercent    string
+	codex7DResetAt        string
+	codex5HUsedPercent    string
+	codex5HResetAt        string
+	codex5HUsageUpdatedAt string
+	codexUsageUpdatedAt   string
+	// Agent Identity（auth_mode=agentIdentity）：无 RT/ST/AT，凭私钥动态签名。
+	agentRuntimeID  string
+	agentPrivateKey string
+	agentTaskID     string
+	chatgptUserID   string
+	agentFedRAMP    bool
+	// proxyURL 是导入文件里携带的代理，仅在 import_proxy 打开时生效。
+	// 它绝不能进 importTokenSeed / 去重指纹：同一个账号换了代理仍然是同一个账号，
+	// 参与指纹会让它被当成两条独立记录导入两遍。
+	proxyURL     string
+	proxyLabel   string
+	proxyEnabled *bool
+}
+
+// importSettings 汇总一次导入请求的表单开关。这些开关要穿过"入口 → 4 个格式
+// 解析函数 → importAccountsCommon"三层，继续用位置参数堆叠会越加越长。
+type importSettings struct {
+	// defaultProxyURL 是表单里填的代理：文件没带代理时的兜底。
+	defaultProxyURL string
+	allowDuplicate  bool
+	customHeaders   map[string]string
+}
+
+// proxyForToken 返回该条目最终生效的代理：文件内代理优先，缺失时回落表单值。
+func (s importSettings) proxyForToken(t importToken) string {
+	return strings.TrimSpace(s.defaultProxyURL)
+}
+
+// proxyOverwritePolicy 决定 upsert 命中已有账号时怎么处理代理绑定。
+type proxyOverwritePolicy int
+
+const (
+	// overwriteAccountProxy 用本次请求/导入带来的代理覆盖已有绑定。
+	overwriteAccountProxy proxyOverwritePolicy = iota
+	// preserveAccountProxy 保留目标账号已有的代理绑定。
+	preserveAccountProxy
+)
+
+// proxyOverwritePolicyForToken 决定 upsert 命中已有账号时怎么处理代理绑定。
+// 文件带来的代理是被动数据，不覆盖目标端已有的绑定（那里可能已经做过精细分配）；
+// 表单里填的代理是操作员的显式换绑意图，维持既有的覆盖语义。
+func (s importSettings) proxyOverwritePolicyForToken(t importToken) proxyOverwritePolicy {
+	if strings.TrimSpace(t.proxyURL) != "" {
+		return preserveAccountProxy
+	}
+	return overwriteAccountProxy
+}
+
+func (t importToken) isAgentIdentity() bool {
+	return strings.TrimSpace(t.agentRuntimeID) != "" && strings.TrimSpace(t.agentPrivateKey) != ""
+}
+
+// jsonAgentIdentityNode 是 CLIProxyAPI/Sub2Api 导出里的 agent_identity 子对象。
+type jsonAgentIdentityNode struct {
+	AgentRuntimeID  string `json:"agent_runtime_id"`
+	AgentPrivateKey string `json:"agent_private_key"`
+	TaskID          string `json:"task_id"`
+	AccountID       string `json:"account_id"`
+	ChatGPTUserID   string `json:"chatgpt_user_id"`
+	Email           string `json:"email"`
+	PlanType        string `json:"plan_type"`
+	FedRAMP         bool   `json:"chatgpt_account_is_fedramp"`
+}
+
+// agentIdentityNodeFromFlatCredentials 从平铺在 credentials 里的 Agent Identity 字段
+// 合成 agent_identity 节点：sub2api / codex2api 的账号导出把这些字段直接摊在
+// credentials 对象上（auth_mode=agentIdentity + agent_runtime_id…），不套
+// agent_identity 子对象。既有子对象则不必调用本函数。
+func agentIdentityNodeFromFlatCredentials(authMode, runtimeID, privateKey, taskID, accountID, userID, email, planType string, fedramp bool) *jsonAgentIdentityNode {
+	runtimeID = strings.TrimSpace(runtimeID)
+	// 仅当 auth_mode 声明或带 runtime_id 时才认为是 Agent Identity 平铺形态。
+	if !strings.EqualFold(strings.TrimSpace(authMode), auth.CodexAuthModeAgentIdentity) && runtimeID == "" {
+		return nil
+	}
+	if runtimeID == "" || strings.TrimSpace(privateKey) == "" {
+		return nil
+	}
+	return &jsonAgentIdentityNode{
+		AgentRuntimeID:  runtimeID,
+		AgentPrivateKey: strings.TrimSpace(privateKey),
+		TaskID:          strings.TrimSpace(taskID),
+		AccountID:       strings.TrimSpace(accountID),
+		ChatGPTUserID:   strings.TrimSpace(userID),
+		Email:           strings.TrimSpace(email),
+		PlanType:        strings.TrimSpace(planType),
+		FedRAMP:         fedramp,
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// agentIdentityImportTokenFromNode 把 agent_identity 子对象转成 importToken（无有效字段时返回 ok=false）。
+func agentIdentityImportTokenFromNode(node *jsonAgentIdentityNode, fallbackName string) (importToken, bool) {
+	if node == nil {
+		return importToken{}, false
+	}
+	runtimeID := strings.TrimSpace(node.AgentRuntimeID)
+	privateKey := strings.TrimSpace(node.AgentPrivateKey)
+	if runtimeID == "" || privateKey == "" {
+		return importToken{}, false
+	}
+	email := strings.TrimSpace(node.Email)
+	name := firstNonEmpty(fallbackName, email)
+	return importToken{
+		name:            name,
+		email:           email,
+		accountID:       strings.TrimSpace(node.AccountID),
+		planType:        strings.TrimSpace(node.PlanType),
+		agentRuntimeID:  runtimeID,
+		agentPrivateKey: privateKey,
+		agentTaskID:     strings.TrimSpace(node.TaskID),
+		chatgptUserID:   strings.TrimSpace(node.ChatGPTUserID),
+		agentFedRAMP:    node.FedRAMP,
+	}, true
+}
+
+// jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
+type jsonAccountEntry struct {
+	AuthMode              string                 `json:"auth_mode"`
+	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
+	AgentRuntimeID        string                 `json:"agent_runtime_id"`
+	AgentPrivateKey       string                 `json:"agent_private_key"`
+	AgentTaskID           string                 `json:"task_id"`
+	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
+	AgentFedRAMP          bool                   `json:"chatgpt_account_is_fedramp"`
+	RefreshToken          string                 `json:"refresh_token"`
+	SessionToken          string                 `json:"session_token"`
+	SessionTokenCamel     string                 `json:"sessionToken"`
+	AccessToken           string                 `json:"access_token"`
+	AccessTokenCamel      string                 `json:"accessToken"`
+	IDToken               string                 `json:"id_token"`
+	IDTokenCamel          string                 `json:"idToken"`
+	AccountID             string                 `json:"account_id"`
+	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
+	Email                 string                 `json:"email"`
+	Name                  string                 `json:"name"`
+	PlanType              string                 `json:"plan_type"`
+	PlanTypeCamel         string                 `json:"planType"`
+	User                  jsonAccountUser        `json:"user"`
+	Account               jsonAccountAccount     `json:"account"`
+	Expired               importJSONScalarString `json:"expired"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
+	Expires               importJSONScalarString `json:"expires"`
+	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
+	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
+	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	ProxyURL              string                 `json:"proxy_url"`
+	ProxyLabel            string                 `json:"proxy_label"`
+	ProxyEnabled          *bool                  `json:"proxy_enabled"`
+}
+
+type jsonAccountUser struct {
+	Email string `json:"email"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+}
+
+type jsonAccountAccount struct {
+	PlanType      string `json:"plan_type"`
+	PlanTypeCamel string `json:"planType"`
+	ID            string `json:"id"`
+}
+
+type sub2apiImportPayload struct {
+	Accounts []sub2apiAccountEntry `json:"accounts"`
+}
+
+type sub2apiAccountEntry struct {
+	Name        string                    `json:"name"`
+	Credentials sub2apiAccountCredentials `json:"credentials"`
+	// 代理是账号属性而不是凭据，不同导出实现有的写在条目根上、有的塞进
+	// credentials，两处都收，根上的优先。
+	ProxyURL     string `json:"proxy_url"`
+	ProxyLabel   string `json:"proxy_label"`
+	ProxyEnabled *bool  `json:"proxy_enabled"`
+}
+
+// proxyFields 返回该条目最终采用的代理三件套：条目根优先，回退到 credentials。
+// URL 决定用哪一组，避免根上只写了 label 却把 URL 从 credentials 拿过来配错。
+func (a sub2apiAccountEntry) proxyFields() (string, string, *bool) {
+	if url := strings.TrimSpace(a.ProxyURL); url != "" {
+		return url, strings.TrimSpace(a.ProxyLabel), a.ProxyEnabled
+	}
+	return strings.TrimSpace(a.Credentials.ProxyURL), strings.TrimSpace(a.Credentials.ProxyLabel), a.Credentials.ProxyEnabled
+}
+
+type sub2apiAccountCredentials struct {
+	AuthMode              string                 `json:"auth_mode"`
+	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
+	AgentRuntimeID        string                 `json:"agent_runtime_id"`
+	AgentPrivateKey       string                 `json:"agent_private_key"`
+	AgentTaskID           string                 `json:"task_id"`
+	ChatGPTUserID         string                 `json:"chatgpt_user_id"`
+	AgentFedRAMP          bool                   `json:"chatgpt_account_is_fedramp"`
+	RefreshToken          string                 `json:"refresh_token"`
+	SessionToken          string                 `json:"session_token"`
+	SessionTokenCamel     string                 `json:"sessionToken"`
+	AccessToken           string                 `json:"access_token"`
+	AccessTokenCamel      string                 `json:"accessToken"`
+	IDToken               string                 `json:"id_token"`
+	IDTokenCamel          string                 `json:"idToken"`
+	AccountID             string                 `json:"account_id"`
+	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
+	Email                 string                 `json:"email"`
+	PlanType              string                 `json:"plan_type"`
+	PlanTypeCamel         string                 `json:"planType"`
+	User                  jsonAccountUser        `json:"user"`
+	Account               jsonAccountAccount     `json:"account"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
+	Expired               importJSONScalarString `json:"expired"`
+	Expires               importJSONScalarString `json:"expires"`
+	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
+	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
+	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	ProxyURL              string                 `json:"proxy_url"`
+	ProxyLabel            string                 `json:"proxy_label"`
+	ProxyEnabled          *bool                  `json:"proxy_enabled"`
+}
+
+type importJSONScalarString string
+
+func (v *importJSONScalarString) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var raw interface{}
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+
+	switch value := raw.(type) {
+	case string:
+		*v = importJSONScalarString(strings.TrimSpace(value))
+	case json.Number:
+		*v = importJSONScalarString(value.String())
+	case bool:
+		*v = importJSONScalarString(strconv.FormatBool(value))
+	default:
+		*v = ""
+	}
+
+	return nil
+}
+
+func (v importJSONScalarString) String() string {
+	return strings.TrimSpace(string(v))
+}
+
+var utf8BOM = []byte{0xef, 0xbb, 0xbf}
+
+func trimUTF8BOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, utf8BOM)
+}
+
+// parseImportJSONTokens 同时兼容现有扁平 JSON 和 Sub2Api 顶层对象。
+func parseImportJSONTokens(data []byte) ([]importToken, error) {
+	data = trimUTF8BOM(data)
+	if !json.Valid(data) {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	if tokens := parseFlatJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	if tokens := parseSub2APIJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	return nil, nil
+}
+
+// parseUploadedImportJSONFile 打开上传的 JSON 文件并流式解析,不把整个文件读进
+// 内存。multipart 大文件(>32MB)由 ParseMultipartForm 落在临时文件,fh.Open()
+// 返回的 reader 直接喂给流式解析器。
+func parseUploadedImportJSONFile(fh *multipart.FileHeader) ([]importToken, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+	}
+	defer f.Close()
+	return parseImportJSONTokensStream(f)
+}
+
+// parseImportJSONTokensStream 流式解析导入 JSON,避免把整个文件(可达 200MB)
+// 一次性读进内存 + 整体 Unmarshal。逐个数组元素解码,内存峰值降到单条账号量级。
+// 覆盖三种形态:顶层数组 [ {...} ]、sub2api 顶层对象 { "accounts": [ {...} ] }、
+// 单个平铺对象 { ... };无法流式判定时回退到全量 parseImportJSONTokens。
+func parseImportJSONTokensStream(r io.Reader) ([]importToken, error) {
+	// json.Decoder 不剥 UTF-8 BOM,而部分导出文件带 BOM(与全量路径的
+	// trimUTF8BOM 对齐):peek 前 3 字节,是 BOM 就丢弃。
+	br := bufio.NewReader(r)
+	if prefix, err := br.Peek(3); err == nil && prefix[0] == 0xef && prefix[1] == 0xbb && prefix[2] == 0xbf {
+		_, _ = br.Discard(3)
+	}
+	dec := json.NewDecoder(br)
+	first, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid import json")
+	}
+	delim, ok := first.(json.Delim)
+	if !ok {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	switch delim {
+	case '[':
+		// 顶层数组:逐个 jsonAccountEntry 解码。
+		var tokens []importToken
+		for dec.More() {
+			var entry jsonAccountEntry
+			if err := dec.Decode(&entry); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			tokens = append(tokens, jsonAccountEntriesToTokens([]jsonAccountEntry{entry})...)
+		}
+		return tokens, nil
+
+	case '{':
+		// 顶层对象:可能是 sub2api {accounts:[...]} 或单个平铺账号对象。
+		// 遍历顶层字段,accounts 数组逐元素流式解码;其余字段(通常很小)收集
+		// 成 RawMessage,遍历完若未见 accounts 则按单个平铺对象重建解析。
+		var tokens []importToken
+		sawAccounts := false
+		other := map[string]json.RawMessage{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			key, _ := keyTok.(string)
+			if key == "accounts" {
+				sawAccounts = true
+				arrTok, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				if d, ok := arrTok.(json.Delim); !ok || d != '[' {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				for dec.More() {
+					var account sub2apiAccountEntry
+					if err := dec.Decode(&account); err != nil {
+						return nil, fmt.Errorf("invalid import json")
+					}
+					tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+				}
+				if _, err := dec.Token(); err != nil { // consume ']'
+					return nil, fmt.Errorf("invalid import json")
+				}
+				continue
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			other[key] = raw
+		}
+		if sawAccounts {
+			return tokens, nil
+		}
+		// 没有 accounts 字段:这是单个平铺账号对象,用收集到的字段重建后按
+		// 平铺形态解析(单对象很小,无内存压力)。
+		objBytes, err := json.Marshal(other)
+		if err != nil {
+			return nil, fmt.Errorf("invalid import json")
+		}
+		return parseFlatJSONImportTokens(objBytes), nil
+	}
+
+	return nil, fmt.Errorf("invalid import json")
+}
+
+func parseFlatJSONImportTokens(data []byte) []importToken {
+	var entries []jsonAccountEntry
+	if err := json.Unmarshal(data, &entries); err == nil {
+		return jsonAccountEntriesToTokens(entries)
+	}
+
+	var single jsonAccountEntry
+	if err := json.Unmarshal(data, &single); err == nil {
+		return jsonAccountEntriesToTokens([]jsonAccountEntry{single})
+	}
+
+	return nil
+}
+
+func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
+	tokens := make([]importToken, 0, len(entries))
+	for _, entry := range entries {
+		rt := strings.TrimSpace(entry.RefreshToken)
+		st := firstNonEmpty(entry.SessionToken, entry.SessionTokenCamel)
+		at := firstNonEmpty(entry.AccessToken, entry.AccessTokenCamel)
+		idTok := firstNonEmpty(entry.IDToken, entry.IDTokenCamel)
+		email := firstNonEmpty(entry.Email, entry.User.Email)
+		name := firstNonEmpty(entry.Name, entry.User.Name, email)
+		planType := firstNonEmpty(entry.PlanType, entry.PlanTypeCamel, entry.Account.PlanType, entry.Account.PlanTypeCamel)
+		accID := firstNonEmpty(entry.AccountID, entry.User.ID, entry.Account.ID)
+		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
+
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
+		// 平铺在条目根上的 Agent Identity 字段（sub2api / codex2api 导出形态）。
+		agentNode := entry.AgentIdentity
+		if agentNode == nil {
+			agentNode = agentIdentityNodeFromFlatCredentials(entry.AuthMode, entry.AgentRuntimeID, entry.AgentPrivateKey, entry.AgentTaskID, accID, entry.ChatGPTUserID, email, planType, entry.AgentFedRAMP)
+		}
+		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
+			tok.proxyURL = strings.TrimSpace(entry.ProxyURL)
+			tok.proxyLabel = strings.TrimSpace(entry.ProxyLabel)
+			tok.proxyEnabled = entry.ProxyEnabled
+			tokens = append(tokens, tok)
+			continue
+		}
+
+		if rt != "" || st != "" || at != "" {
+			tokens = append(tokens, importToken{
+				refreshToken:          rt,
+				sessionToken:          st,
+				accessToken:           at,
+				name:                  name,
+				email:                 email,
+				idToken:               idTok,
+				accountID:             strings.TrimSpace(entry.AccountID),
+				chatgptAccountID:      firstNonEmpty(entry.ChatGPTAccountID, accID),
+				planType:              planType,
+				expiresAt:             expiresAt,
+				codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent.String()),
+				codex7DResetAt:        strings.TrimSpace(entry.Codex7DResetAt),
+				codex5HUsedPercent:    strings.TrimSpace(entry.Codex5HUsedPercent.String()),
+				codex5HResetAt:        strings.TrimSpace(entry.Codex5HResetAt),
+				codex5HUsageUpdatedAt: strings.TrimSpace(entry.Codex5HUsageUpdatedAt),
+				codexUsageUpdatedAt:   strings.TrimSpace(entry.CodexUsageUpdatedAt),
+				proxyURL:              strings.TrimSpace(entry.ProxyURL),
+				proxyLabel:            strings.TrimSpace(entry.ProxyLabel),
+				proxyEnabled:          entry.ProxyEnabled,
+			})
+		}
+	}
+	return tokens
+}
+
+func parseSub2APIJSONImportTokens(data []byte) []importToken {
+	var payload sub2apiImportPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+
+	tokens := make([]importToken, 0, len(payload.Accounts))
+	for _, account := range payload.Accounts {
+		tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+	}
+	return tokens
+}
+
+// sub2apiAccountEntryToTokens 把单个 sub2api 账号条目转换成 importToken(0 或 1 个)。
+// 从 parseSub2APIJSONImportTokens 抽出,供流式解析逐元素复用,避免两份逻辑漂移。
+func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
+	var tokens []importToken
+	{
+		c := account.Credentials
+		rt := strings.TrimSpace(c.RefreshToken)
+		st := firstNonEmpty(c.SessionToken, c.SessionTokenCamel)
+		at := firstNonEmpty(c.AccessToken, c.AccessTokenCamel)
+		idTok := firstNonEmpty(c.IDToken, c.IDTokenCamel)
+		name := firstNonEmpty(account.Name, c.User.Name)
+		email := firstNonEmpty(c.Email, c.User.Email)
+
+		if name == "" {
+			name = email
+		}
+		planType := firstNonEmpty(c.PlanType, c.PlanTypeCamel, c.Account.PlanType, c.Account.PlanTypeCamel)
+		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
+		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
+		proxyURL, proxyLabel, proxyEnabled := account.proxyFields()
+
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
+		// 平铺在 credentials 里的 Agent Identity 字段（sub2api 导出形态）。
+		agentNode := c.AgentIdentity
+		if agentNode == nil {
+			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
+		}
+		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
+			tok.proxyURL = proxyURL
+			tok.proxyLabel = proxyLabel
+			tok.proxyEnabled = proxyEnabled
+			return append(tokens, tok)
+		}
+
+		if rt != "" || st != "" || at != "" {
+			tokens = append(tokens, importToken{
+				refreshToken:          rt,
+				sessionToken:          st,
+				accessToken:           at,
+				name:                  name,
+				email:                 email,
+				idToken:               idTok,
+				accountID:             strings.TrimSpace(c.AccountID),
+				chatgptAccountID:      firstNonEmpty(c.ChatGPTAccountID, accID),
+				planType:              planType,
+				expiresAt:             expiresAt,
+				codex7DUsedPercent:    strings.TrimSpace(c.Codex7DUsedPercent.String()),
+				codex7DResetAt:        strings.TrimSpace(c.Codex7DResetAt),
+				codex5HUsedPercent:    strings.TrimSpace(c.Codex5HUsedPercent.String()),
+				codex5HResetAt:        strings.TrimSpace(c.Codex5HResetAt),
+				codex5HUsageUpdatedAt: strings.TrimSpace(c.Codex5HUsageUpdatedAt),
+				codexUsageUpdatedAt:   strings.TrimSpace(c.CodexUsageUpdatedAt),
+				proxyURL:              proxyURL,
+				proxyLabel:            proxyLabel,
+				proxyEnabled:          proxyEnabled,
+			})
+		}
+	}
+
+	return tokens
+}
+
+func importTokenCredentialIdentity(t importToken) string {
+	switch {
+	case t.refreshToken != "":
+		return "rt:" + t.refreshToken
+	case t.sessionToken != "":
+		return "st:" + t.sessionToken
+	case t.accessToken != "":
+		return "at:" + t.accessToken
+	default:
+		return ""
+	}
+}
+
+func importCredentialFingerprint(refreshToken, sessionToken, accessToken string) string {
+	return strings.TrimSpace(refreshToken) + "\x00" + strings.TrimSpace(sessionToken) + "\x00" + strings.TrimSpace(accessToken)
+}
+
+func importTokenCredentialFingerprint(t importToken, conflicts map[string]bool) string {
+	seed := importTokenSeed(t, conflicts)
+	return importCredentialFingerprint(seed.refreshToken, seed.sessionToken, seed.accessToken)
+}
+
+func importTokenCredentialWorkspaceRouteKeys(t importToken, conflicts map[string]bool, customHeaders map[string]string) []string {
+	seed := importTokenSeed(t, conflicts)
+	seed.customHeaders = cloneCustomHeaders(customHeaders)
+	return tokenCredentialSeedWorkspaceRouteKeys(seed)
+}
+
+func importAccountCredentialFingerprint(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	return importCredentialFingerprint(
+		row.GetCredential("refresh_token"),
+		row.GetCredential("session_token"),
+		row.GetCredential("access_token"),
+	)
+}
+
+func conflictingImportChatGPTIDs(tokens []importToken) map[string]bool {
+	identitiesByID := make(map[string]map[string]struct{})
+	for _, t := range tokens {
+		id := strings.TrimSpace(t.chatgptAccountID)
+		if id == "" {
+			continue
+		}
+		identity := importTokenCredentialIdentity(t)
+		if identity == "" {
+			continue
+		}
+		identities := identitiesByID[id]
+		if identities == nil {
+			identities = make(map[string]struct{}, 1)
+			identitiesByID[id] = identities
+		}
+		identities[identity] = struct{}{}
+	}
+
+	conflicts := make(map[string]bool)
+	for id, identities := range identitiesByID {
+		if len(identities) > 1 {
+			conflicts[id] = true
+		}
+	}
+	return conflicts
+}
+
+func reliableImportChatGPTID(t importToken, conflicts map[string]bool) string {
+	id := strings.TrimSpace(t.chatgptAccountID)
+	if id == "" || conflicts[id] {
+		return ""
+	}
+	return id
+}
+
+func importStoredAccountID(t importToken, conflicts map[string]bool) string {
+	if strings.TrimSpace(t.accountID) != "" {
+		return strings.TrimSpace(t.accountID)
+	}
+	return reliableImportChatGPTID(t, conflicts)
+}
+
+func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSeed {
+	return normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken:          t.refreshToken,
+		sessionToken:          t.sessionToken,
+		accessToken:           t.accessToken,
+		idToken:               t.idToken,
+		accountID:             importStoredAccountID(t, conflicts),
+		email:                 t.email,
+		planType:              t.planType,
+		expiresAtRaw:          t.expiresAt,
+		codex7DUsedPercent:    t.codex7DUsedPercent,
+		codex7DResetAt:        t.codex7DResetAt,
+		codex5HUsedPercent:    t.codex5HUsedPercent,
+		codex5HResetAt:        t.codex5HResetAt,
+		codex5HUsageUpdatedAt: t.codex5HUsageUpdatedAt,
+		codexUsageUpdatedAt:   t.codexUsageUpdatedAt,
+	})
+}
+
+func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) string {
+	seed := importTokenSeed(t, conflicts)
+	email := strings.ToLower(strings.TrimSpace(seed.email))
+	workspaceID := strings.TrimSpace(seed.workspaceID)
+	if email == "" || workspaceID == "" {
+		return ""
+	}
+	return email + "\x00" + workspaceID
+}
+
+// ImportAccounts 批量导入账号（支持 TXT / JSON）
+func (h *Handler) ImportAccounts(c *gin.Context) {
+	format := c.DefaultPostForm("format", "txt")
+	customHeaders, err := parseCustomHeadersForm(c.PostForm("custom_headers"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	settings := importSettings{
+		defaultProxyURL: c.PostForm("proxy_url"),
+		// TXT 系格式一行一个 token，物理上不可能携带代理。这里忽略开关而不是
+		// 报错，免得前端还要跟着格式切换清理该状态。
+		allowDuplicate: parseBoolForm(c.PostForm("allow_duplicate")),
+		customHeaders:  customHeaders,
+	}
+	// 分组校验放在解析文件之前：分组 ID 打错时一个账号都不该被导入。
+	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	groupIDs, err := h.resolveImportGroupIDsForm(groupCtx, c.PostForm(importGroupIDsField))
+	groupCancel()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.Set(importGroupIDsContextKey, groupIDs)
+
+	switch format {
+	case "json":
+		h.importAccountsJSON(c, settings)
+	case "json_at":
+		h.importAccountsJSONPreferAT(c, settings)
+	case "at_txt":
+		h.importAccountsATTXT(c, settings)
+	default:
+		h.importAccountsTXT(c, settings)
+	}
+}
+
+// parseBoolForm 解析表单中的布尔开关（1/true/yes/on 视为真）。
+func parseBoolForm(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseCustomHeadersForm(raw string) (map[string]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(trimmed), &headers); err != nil {
+		return nil, fmt.Errorf("custom_headers 必须是 JSON 对象")
+	}
+	return normalizeCustomHeaders(headers)
+}
+
+type uploadedImportFile struct {
+	name string
+	data []byte
+}
+
+func readUploadedImportFiles(c *gin.Context) ([]uploadedImportFile, error) {
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		return nil, fmt.Errorf("解析表单失败")
+	}
+
+	files := c.Request.MultipartForm.File["file"]
+	if len(files) == 0 {
+		return nil, fmt.Errorf("请上传文件（字段名: file）")
+	}
+
+	result := make([]uploadedImportFile, 0, len(files))
+	for _, fh := range files {
+		if err := validateImportFileSize(fh); err != nil {
+			return nil, err
+		}
+
+		f, err := fh.Open()
+		if err != nil {
+			return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+		}
+		data, readErr := io.ReadAll(f)
+		closeErr := f.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取文件 %s 失败", fh.Filename)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("关闭文件 %s 失败", fh.Filename)
+		}
+
+		result = append(result, uploadedImportFile{name: fh.Filename, data: data})
+	}
+	return result, nil
+}
+
+func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string) importToken) []importToken {
+	seen := make(map[string]bool)
+	var tokens []importToken
+	for _, file := range files {
+		lines := strings.Split(string(trimUTF8BOM(file.data)), "\n")
+		for _, line := range lines {
+			t := strings.TrimSpace(line)
+			if t != "" && !seen[t] {
+				seen[t] = true
+				tokens = append(tokens, makeToken(t))
+			}
+		}
+	}
+	return tokens
+}
+
+// importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
+func (h *Handler) importAccountsTXT(c *gin.Context, settings importSettings) {
+	files, err := readUploadedImportFiles(c)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tokens := importTokensFromTextFiles(files, func(token string) importToken {
+		return importToken{refreshToken: token}
+	})
+	if len(tokens) == 0 {
+		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Refresh Token")
+		return
+	}
+
+	h.importAccountsCommon(c, tokens, settings)
+}
+
+// importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
+func (h *Handler) importAccountsJSON(c *gin.Context, settings importSettings) {
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		writeError(c, http.StatusBadRequest, "解析表单失败")
+		return
+	}
+
+	files := c.Request.MultipartForm.File["file"]
+	if len(files) == 0 {
+		writeError(c, http.StatusBadRequest, "请上传至少一个 JSON 文件")
+		return
+	}
+
+	var allTokens []importToken
+
+	for _, fh := range files {
+		if err := validateImportFileSize(fh); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		tokens, err := parseUploadedImportJSONFile(fh)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
+			return
+		}
+
+		allTokens = append(allTokens, tokens...)
+	}
+
+	if len(allTokens) == 0 {
+		writeError(c, http.StatusBadRequest, "JSON 文件中未找到有效的 refresh_token 或 access_token")
+		return
+	}
+
+	h.importAccountsCommon(c, allTokens, settings)
+}
+
+// importAccountsJSONPreferAT 通过 JSON 文件导入，但只信任 access_token，
+// 用于一些导出工具中 refresh_token / session_token 是占位/重复值的场景。
+func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, settings importSettings) {
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		writeError(c, http.StatusBadRequest, "解析表单失败")
+		return
+	}
+
+	files := c.Request.MultipartForm.File["file"]
+	if len(files) == 0 {
+		writeError(c, http.StatusBadRequest, "请上传至少一个 JSON 文件")
+		return
+	}
+
+	var allTokens []importToken
+
+	for _, fh := range files {
+		if err := validateImportFileSize(fh); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		tokens, err := parseUploadedImportJSONFile(fh)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
+			return
+		}
+
+		for _, t := range tokens {
+			if strings.TrimSpace(t.accessToken) == "" {
+				continue
+			}
+			t.refreshToken = ""
+			t.sessionToken = ""
+			allTokens = append(allTokens, t)
+		}
+	}
+
+	if len(allTokens) == 0 {
+		writeError(c, http.StatusBadRequest, "JSON 文件中未找到有效的 access_token")
+		return
+	}
+
+	h.importAccountsCommon(c, allTokens, settings)
+}
+
+// importEvent SSE 导入进度事件
+type importEvent struct {
+	Type      string `json:"type"` // progress | complete
+	Current   int    `json:"current"`
+	Total     int    `json:"total"`
+	Success   int    `json:"success"`
+	Updated   int    `json:"updated"`
+	Duplicate int    `json:"duplicate"`
+	Failed    int    `json:"failed"`
+	// Warning 用于「账号已入库、但收尾动作出了问题」这类必须告知却不该当成失败的情况，
+	// 例如导入成功但分组绑定失败。空值时序列化省略，老前端不受影响。
+	Warning string `json:"warning,omitempty"`
+	// CreatedIDs 只在 complete 事件下发，供前端拉取本次导入账号的邀请收益评估。
+	// 空值时省略，老前端不受影响。
+	CreatedIDs []int64 `json:"created_ids,omitempty"`
+}
+
+// sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
+func sendImportEvent(c *gin.Context, e importEvent) bool {
+	return sendSSEJSON(c, e)
+}
+
+// importProgressInterval 是导入进度事件的推送间隔。
+const importProgressInterval = 200 * time.Millisecond
+
+// runImportProgressPusher 按固定间隔推送导入进度，返回一个在推送协程退出后关闭的
+// channel。三种情况会停：导入结束（done 关闭）、下游断开（reqCtx 取消）、或者写
+// 失败。后两种必须停——导入本身还要继续跑完，但连接已经死了，继续写只会每个
+// 间隔刷一条 broken pipe 日志直到导入结束。
+//
+// 调用方在 close(done) 之后必须等返回的 channel 关闭再写收尾事件：gin 的
+// ResponseWriter 不支持并发写，两边同时写会让事件交错，前端解析不到 complete，
+// 进度条永远停在最后一个百分比。
+func runImportProgressPusher(reqCtx context.Context, done <-chan struct{}, interval time.Duration, snapshot func() importEvent, send func(importEvent) bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	var clientGone <-chan struct{}
+	if reqCtx != nil {
+		clientGone = reqCtx.Done()
+	}
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !send(snapshot()) {
+					return
+				}
+			case <-clientGone:
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return stopped
+}
+
+func setupSSE(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+}
+
+func sendSSEJSON(c *gin.Context, event any) bool {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("序列化 SSE 事件失败: %v", err)
+		return false
+	}
+	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+		log.Printf("写入 SSE 事件失败: %v", err)
+		return false
+	}
+	c.Writer.Flush()
+	return true
+}
+
+// importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, settings importSettings) {
+	importCustomHeaders := settings.customHeaders
+	allowDuplicate := settings.allowDuplicate
+
+	// Agent Identity 条目单独处理（无 RT/ST/AT，按 runtime_id 去重、动态签名），
+	// 从常规 token 流里拆出，计数在收尾时并入总响应。
+	var agentTokens, regularTokens []importToken
+	for _, t := range tokens {
+		if t.isAgentIdentity() {
+			agentTokens = append(agentTokens, t)
+		} else {
+			regularTokens = append(regularTokens, t)
+		}
+	}
+	agentSuccess, agentDuplicate, agentFailed := 0, 0, 0
+	var agentCreatedIDs []int64
+	if len(agentTokens) > 0 {
+		agentCtx, agentCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		agentSuccess, agentDuplicate, agentFailed, agentCreatedIDs = h.importAgentIdentityTokens(agentCtx, agentTokens, settings)
+		agentCancel()
+		log.Printf("导入: Agent Identity 条目 %d 个（新增 %d，跳过 %d，失败 %d）", len(agentTokens), agentSuccess, agentDuplicate, agentFailed)
+	}
+	tokens = regularTokens
+	// 文件内去重：
+	// 1) 当 JWT 可解析出 email + workspace_id 时，以它作为 OAuth 身份键；
+	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
+	// 2) 没有 OAuth 身份时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
+	// 3) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
+	//    会被全部保留为独立账号；数据库层面 refresh_token 没有 UNIQUE 约束，因此安全。
+	conflictingChatGPTIDs := conflictingImportChatGPTIDs(tokens)
+	type oauthIdentityImportState struct {
+		count        int
+		fingerprints map[string]struct{}
+	}
+	oauthIdentityStates := make(map[string]*oauthIdentityImportState)
+	for _, t := range tokens {
+		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		if oauthIdentity == "" {
+			continue
+		}
+		state := oauthIdentityStates[oauthIdentity]
+		if state == nil {
+			state = &oauthIdentityImportState{fingerprints: make(map[string]struct{}, 1)}
+			oauthIdentityStates[oauthIdentity] = state
+		}
+		state.count++
+		state.fingerprints[importTokenCredentialFingerprint(t, conflictingChatGPTIDs)] = struct{}{}
+	}
+
+	seenOAuthIdentity := make(map[string]bool)
+	seenRT := make(map[string]bool)
+	seenST := make(map[string]bool)
+	seenAT := make(map[string]bool)
+	var unique []importToken
+	ambiguousOAuthIdentityCount := 0
+	for _, t := range tokens {
+		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		if oauthIdentity != "" {
+			state := oauthIdentityStates[oauthIdentity]
+			if state != nil && len(state.fingerprints) > 1 {
+				if !seenOAuthIdentity[oauthIdentity] {
+					ambiguousOAuthIdentityCount += state.count
+					seenOAuthIdentity[oauthIdentity] = true
+				}
+				continue
+			}
+			if seenOAuthIdentity[oauthIdentity] {
+				continue
+			}
+			seenOAuthIdentity[oauthIdentity] = true
+			if t.refreshToken != "" {
+				seenRT[t.refreshToken] = true
+			}
+			if t.sessionToken != "" {
+				seenST[t.sessionToken] = true
+			}
+			if t.accessToken != "" {
+				seenAT[t.accessToken] = true
+			}
+			unique = append(unique, t)
+			continue
+		}
+		if t.refreshToken != "" {
+			if !seenRT[t.refreshToken] {
+				seenRT[t.refreshToken] = true
+				unique = append(unique, t)
+			}
+			if t.sessionToken != "" {
+				seenST[t.sessionToken] = true
+			}
+			if t.accessToken != "" {
+				seenAT[t.accessToken] = true
+			}
+		} else if t.sessionToken != "" {
+			if !seenST[t.sessionToken] {
+				seenST[t.sessionToken] = true
+				unique = append(unique, t)
+			}
+			if t.accessToken != "" {
+				seenAT[t.accessToken] = true
+			}
+		} else if t.accessToken != "" {
+			if !seenAT[t.accessToken] {
+				seenAT[t.accessToken] = true
+				unique = append(unique, t)
+			}
+		}
+	}
+
+	// 数据库去重（独立短超时）
+	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dedupeCancel()
+
+	fileDuplicateCount := len(tokens) - len(unique) - ambiguousOAuthIdentityCount
+	if fileDuplicateCount < 0 {
+		fileDuplicateCount = 0
+	}
+	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复，%d 条 OAuth 身份冲突跳过）", len(tokens), len(unique), fileDuplicateCount, ambiguousOAuthIdentityCount)
+
+	var newTokens []importToken
+	duplicateCount := ambiguousOAuthIdentityCount
+
+	// 命中「凭证一字不差的已有账号」时：账号状态正常计 duplicate 跳过；正挂在
+	// error / 401 unauthorized 态的进复活队列，稍后与新账号一起处理并计入
+	// "更新"——用户把同一份凭证再导一遍，就是在要求把这个号捞回来（issue #618）。
+	// 队列在去重阶段只读状态、不写库，复活动作放到后面的并发闸里执行。
+	var reviveRows []*database.AccountRow
+	queuedReviveIDs := make(map[int64]bool)
+	queueDuplicate := func(row *database.AccountRow) {
+		if row != nil && accountErrorStateNeedsReset(row) && !queuedReviveIDs[row.ID] {
+			queuedReviveIDs[row.ID] = true
+			reviveRows = append(reviveRows, row)
+			return
+		}
+		duplicateCount++
+	}
+
+	workspaceOverrideKnown := openaiidentity.WorkspaceOverrideFromHeaders(importCustomHeaders) != ""
+	if allowDuplicate && !workspaceOverrideKnown {
+		knownCount := 0
+		for _, t := range tokens {
+			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) == "" {
+				newTokens = append(newTokens, t)
+			} else {
+				knownCount++
+			}
+		}
+		knownUniqueCount := 0
+		for _, t := range unique {
+			if importTokenOAuthIdentityKey(t, conflictingChatGPTIDs) != "" {
+				knownUniqueCount++
+				seed := importTokenSeed(t, conflictingChatGPTIDs)
+				seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", err)
+				} else if duplicateID > 0 {
+					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+					if err != nil {
+						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+						queueDuplicate(row)
+						continue
+					}
+				}
+				newTokens = append(newTokens, t)
+			}
+		}
+		duplicateCount += knownCount - knownUniqueCount - ambiguousOAuthIdentityCount
+	} else {
+		// 路由键 → 持有者账号 ID；本批次新占的键记 0（无持有者，只用于批内去重）。
+		existingCredentialRoutes, err := h.existingCredentialWorkspaceRouteOwners(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有凭证工作区路由失败: %v", err)
+			existingCredentialRoutes = make(map[string]int64)
+		}
+
+		for _, t := range unique {
+			seed := importTokenSeed(t, conflictingChatGPTIDs)
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", err)
+				} else if duplicateID > 0 {
+					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+					if err != nil {
+						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+						queueDuplicate(row)
+						continue
+					}
+				}
+				newTokens = append(newTokens, t)
+				continue
+			}
+
+			routeKeys := importTokenCredentialWorkspaceRouteKeys(t, conflictingChatGPTIDs, importCustomHeaders)
+			isDuplicate := false
+			var ownerID int64
+			for _, key := range routeKeys {
+				if id, exists := existingCredentialRoutes[key]; exists {
+					isDuplicate = true
+					ownerID = id
+					break
+				}
+			}
+			if isDuplicate {
+				var ownerRow *database.AccountRow
+				if ownerID > 0 {
+					if row, err := h.db.GetAccountByID(dedupeCtx, ownerID); err != nil {
+						log.Printf("查询已有凭证账号 %d 失败: %v", ownerID, err)
+					} else {
+						ownerRow = row
+					}
+				}
+				queueDuplicate(ownerRow)
+				continue
+			}
+			newTokens = append(newTokens, t)
+			for _, key := range routeKeys {
+				existingCredentialRoutes[key] = 0
+			}
+		}
+	}
+
+	total := len(unique) + ambiguousOAuthIdentityCount + len(agentTokens)
+	if allowDuplicate && !workspaceOverrideKnown {
+		total = len(tokens) + len(agentTokens)
+	}
+	duplicateCount += agentDuplicate
+
+	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待复活 %d 条, 待导入 %d 条", total, duplicateCount, len(reviveRows), len(newTokens))
+
+	if len(newTokens) == 0 && len(reviveRows) == 0 {
+		// 无常规 token 待导入（可能是纯 Agent Identity 文件）；反映 agent 计数。
+		if err := h.bindImportedAccountGroups(c.Request.Context(), agentCreatedIDs, importGroupIDsFromContext(c)); err != nil {
+			log.Printf("导入: Agent Identity 账号分组绑定失败: %v", err)
+		}
+		response := gin.H{
+			"message":   fmt.Sprintf("导入完成：新增 %d 个，跳过 %d 个，失败 %d 个", agentSuccess, duplicateCount, agentFailed),
+			"success":   agentSuccess,
+			"duplicate": duplicateCount,
+			"failed":    agentFailed,
+			"total":     total,
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	// 切换到 SSE 流式响应
+	setupSSE(c)
+
+	var successCount int64
+	var updatedCount int64
+	var failCount int64
+	var current int64
+	// 本次真正新建的账号，收尾时统一绑分组（命中已有账号的分组不动）。
+	createdIDs := &importedAccountIDs{}
+	createdATIDs := &importedAccountIDs{}
+	createdRTIDs := &importedAccountIDs{}
+	type pendingRuntimeAccount struct {
+		account *auth.Account
+		source  string
+	}
+	var pendingMu sync.Mutex
+	pendingRuntime := make([]pendingRuntimeAccount, 0, len(newTokens))
+	addPendingRuntime := func(account *auth.Account, source string) {
+		if account == nil {
+			return
+		}
+		pendingMu.Lock()
+		pendingRuntime = append(pendingRuntime, pendingRuntimeAccount{account: account, source: source})
+		pendingMu.Unlock()
+	}
+	// 写库并发根据近一分钟代理流量与连接池压力动态调整。生产者在启动 goroutine
+	// 前先拿 permit，因此无论目标并发如何变化，都不会堆积等待中的 goroutine。
+	dbLimiter := &adaptiveImportDBLimiter{handler: h}
+	var wg sync.WaitGroup
+
+	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈。
+	done := make(chan struct{})
+	progressStopped := runImportProgressPusher(
+		c.Request.Context(), done, importProgressInterval,
+		func() importEvent {
+			return importEvent{
+				Type:      "progress",
+				Current:   int(atomic.LoadInt64(&current)) + duplicateCount,
+				Total:     total,
+				Success:   int(atomic.LoadInt64(&successCount)),
+				Updated:   int(atomic.LoadInt64(&updatedCount)),
+				Failed:    int(atomic.LoadInt64(&failCount)),
+				Duplicate: duplicateCount,
+			}
+		},
+		func(e importEvent) bool { return sendImportEvent(c, e) },
+	)
+
+	// 复活队列：凭证一字不差、但旧账号正挂在 error / 401 态的重复条目。走同一个
+	// 写库并发闸，复活成功计入"更新"，状态已被别的流程清掉则退回"重复"。
+	// duplicateCount 被进度推送 goroutine 并发读取，这里只能改原子计数。
+	var revivedAsDuplicate int64
+	for _, row := range reviveRows {
+		if !dbLimiter.acquire(context.Background()) {
+			break
+		}
+		wg.Add(1)
+		go func(row *database.AccountRow) {
+			defer wg.Done()
+			defer dbLimiter.release()
+			reviveCtx, reviveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer reviveCancel()
+			if h.reviveReimportedAccount(reviveCtx, row, "import") {
+				atomic.AddInt64(&updatedCount, 1)
+			} else {
+				atomic.AddInt64(&revivedAsDuplicate, 1)
+			}
+			atomic.AddInt64(&current, 1)
+		}(row)
+	}
+
+	for i, t := range newTokens {
+		if !dbLimiter.acquire(context.Background()) {
+			break
+		}
+		wg.Add(1)
+		go func(idx int, tok importToken) {
+			defer wg.Done()
+			defer dbLimiter.release()
+
+			name := tok.name
+			// 文件内代理优先、表单代理兜底；registerImportedProxies 已经把非法值
+			// 清空，所以这里拿到的一定是校验过的 URL。
+			proxyURL := settings.proxyForToken(tok)
+
+			seed := importTokenSeed(tok, conflictingChatGPTIDs)
+			seed.allowDuplicate = allowDuplicate
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
+			importSource := "import"
+			if tok.accessToken != "" && tok.refreshToken == "" {
+				importSource = "import_at"
+			}
+			if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+				if name == "" {
+					if importSource == "import_at" {
+						name = fmt.Sprintf("at-import-%d", idx+1)
+					} else {
+						name = fmt.Sprintf("import-%d", idx+1)
+					}
+				}
+
+				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource, settings.proxyOverwritePolicyForToken(tok))
+				upsertCancel()
+				if err != nil {
+					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				if updated {
+					// 已有账号只更新凭证，不计入"新增"，分组也保持原样。
+					atomic.AddInt64(&updatedCount, 1)
+					if h.store != nil {
+						if acc := h.store.FindByID(id); acc != nil {
+							h.applyImportedAccountUsageState(acc, importSource)
+							if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
+								h.runImportProbeTask(func(ctx context.Context) {
+									h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
+								})
+							}
+						}
+					}
+				} else {
+					atomic.AddInt64(&successCount, 1)
+					createdIDs.add(id)
+					if importSource == "import_at" {
+						createdATIDs.add(id)
+					} else {
+						createdRTIDs.add(id)
+					}
+					addPendingRuntime(newAcc, importSource)
+				}
+				atomic.AddInt64(&current, 1)
+				return
+			}
+
+			if tok.accessToken != "" && tok.refreshToken == "" {
+				// AT-only 导入路径
+				if name == "" {
+					name = fmt.Sprintf("at-import-%d", idx+1)
+				}
+
+				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
+				insertCancel()
+
+				if err != nil {
+					log.Printf("导入 AT 账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				atomic.AddInt64(&successCount, 1)
+				createdIDs.add(id)
+				createdATIDs.add(id)
+				atomic.AddInt64(&current, 1)
+
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
+				addPendingRuntime(newAcc, "import_at")
+			} else {
+				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
+				if name == "" {
+					name = fmt.Sprintf("import-%d", idx+1)
+				}
+
+				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, err := h.db.InsertAccountWithCredentials(insertCtx, name, h.newCodexAccountCredentials(seed), proxyURL)
+				insertCancel()
+
+				if err != nil {
+					log.Printf("导入账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				atomic.AddInt64(&successCount, 1)
+				createdIDs.add(id)
+				createdRTIDs.add(id)
+				atomic.AddInt64(&current, 1)
+
+				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
+				addPendingRuntime(newAcc, "import")
+			}
+		}(i, t)
+	}
+
+	wg.Wait()
+	h.db.BatchInsertAccountEventsAsync(createdATIDs.snapshot(), "added", "import_at")
+	h.db.BatchInsertAccountEventsAsync(createdRTIDs.snapshot(), "added", "import")
+	if len(pendingRuntime) > 0 && h.store != nil {
+		accounts := make([]*auth.Account, 0, len(pendingRuntime))
+		for _, pending := range pendingRuntime {
+			accounts = append(accounts, pending.account)
+		}
+		// 一个 Store 锁 + 一个 FastScheduler 锁提交整个批次，避免高 RPM 的 Acquire
+		// 在两个账号之间反复触发全桶排序。
+		h.store.AddAccounts(accounts)
+		for _, pending := range pendingRuntime {
+			h.applyImportedAccountUsageState(pending.account, pending.source)
+			h.scheduleImportedAccountWarmup(pending.account, pending.account.DBID, pending.source)
+		}
+	}
+	close(done)
+	// 等推送 goroutine 真正退出再写收尾事件：gin 的 ResponseWriter 不支持并发写，
+	// 只 close(done) 不等待的话，收尾事件可能和最后一帧进度事件交错，
+	// 前端解析不到 complete，进度条永远停在最后一个百分比。
+	<-progressStopped
+	// 推送 goroutine 已退出，可以安全并入复活失败退回的重复计数。
+	duplicateCount += int(atomic.LoadInt64(&revivedAsDuplicate))
+
+	// 发送完成事件（并入 Agent Identity 计数）
+	suc := int(atomic.LoadInt64(&successCount)) + agentSuccess
+	upd := int(atomic.LoadInt64(&updatedCount))
+	fai := int(atomic.LoadInt64(&failCount)) + agentFailed
+	// 分组绑定要在 complete 之前完成：前端收到 complete 就会刷新列表，
+	// 晚一步绑定会让人以为没生效。Agent Identity 条目一起绑，避免同一次导入
+	// 只有一半账号进了分组。
+	newAccountIDs := append(createdIDs.snapshot(), agentCreatedIDs...)
+	if err := h.bindImportedAccountGroups(c.Request.Context(), newAccountIDs, importGroupIDsFromContext(c)); err != nil {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: total, Total: total,
+			Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
+			Warning: "账号已导入，但分组绑定失败: " + err.Error(),
+		})
+	}
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
+		CreatedIDs: newAccountIDs,
+	})
+
+	log.Printf("导入完成: success=%d, updated=%d, duplicate=%d, failed=%d, total=%d", suc, upd, duplicateCount, fai, total)
+}
+
+// importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
+func (h *Handler) importAccountsATTXT(c *gin.Context, settings importSettings) {
+	files, err := readUploadedImportFiles(c)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tokens := importTokensFromTextFiles(files, func(token string) importToken {
+		return importToken{accessToken: token}
+	})
+	if len(tokens) == 0 {
+		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Access Token")
+		return
+	}
+
+	h.importAccountsCommon(c, tokens, settings)
+}
+
+// GetAccountUsage 查询单个账号的用量统计
+func (h *Handler) GetAccountUsage(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	days := 30
+	if raw := strings.TrimSpace(c.Query("days")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 || parsed > 3650 {
+			writeError(c, http.StatusBadRequest, "days 参数无效，需要 0-3650 的整数")
+			return
+		}
+		days = parsed
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	detail, err := h.db.GetAccountUsageStats(ctx, id, days)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, detail)
+}
+
+// RefreshAccountUsage 同步刷新单个账号的用量快照（优先走零成本的 wham 端点），
+// 完成后返回该账号最新的 5h/7d 用量字段，供前端用量列即时更新进度条。
+// POST /api/admin/accounts/:id/usage/refresh
+func (h *Handler) RefreshAccountUsage(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := h.ProbeUsageSnapshot(ctx, account); err != nil {
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("刷新用量失败: %s", err.Error()))
+		return
+	}
+
+	resp := gin.H{"refreshed": true}
+	if pct, ok := account.GetUsagePercent5h(); ok {
+		resp["usage_percent_5h"] = pct
+	}
+	if pct, ok := account.GetUsagePercent7d(); ok {
+		resp["usage_percent_7d"] = pct
+	}
+	if pct, ok := account.GetUsagePercentSpark(); ok {
+		resp["usage_percent_spark"] = pct
+	}
+	if t := account.GetReset5hAt(); !t.IsZero() {
+		resp["reset_5h_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetReset7dAt(); !t.IsZero() {
+		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetResetSparkAt(); !t.IsZero() {
+		resp["reset_spark_at"] = t.Format(time.RFC3339)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+type batchAccountIDsRequest struct {
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
+}
+
+type batchUpdateAccountsReq struct {
+	updateAccountSchedulerReq
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
+	Enabled  *bool                     `json:"enabled"`
+	Locked   *bool                     `json:"locked"`
+}
+
+func (h *Handler) accountOperationIdentity(id int64) (string, string) {
+	h.accountListCacheMu.RLock()
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelClaude, database.UpstreamChannelRelay} {
+		snapshot := h.accountListCache[channel]
+		if snapshot == nil {
+			continue
+		}
+		index := sort.Search(len(snapshot.Items), func(index int) bool {
+			return snapshot.Items[index].ID >= id
+		})
+		if index < len(snapshot.Items) && snapshot.Items[index].ID == id {
+			item := snapshot.Items[index]
+			name := strings.TrimSpace(item.Row.Name)
+			email := strings.TrimSpace(item.Email)
+			h.accountListCacheMu.RUnlock()
+			return name, email
+		}
+	}
+	h.accountListCacheMu.RUnlock()
+	if h.store == nil {
+		return "", ""
+	}
+	return runtimeAccountOperationIdentity(h.store.FindByID(id))
+}
+
+// DeleteAccount 删除账号
+func (h *Handler) DeleteAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
+	if err := h.deleteAccountByID(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
+		return
+	}
+	h.pruneAccountsFromSnapshotCaches([]int64{id})
+
+	writeMessage(c, http.StatusOK, "账号已删除")
+}
+
+func (h *Handler) deleteAccountByID(ctx context.Context, id int64) error {
+	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+		return err
+	}
+	h.store.RemoveAccount(id)
+	h.db.InsertAccountEventAsync(id, "deleted", "manual")
+	return nil
+}
+
+type recycleBinAccountResponse struct {
+	ID                 int64    `json:"id"`
+	Name               string   `json:"name"`
+	Email              string   `json:"email"`
+	PlanType           string   `json:"plan_type"`
+	ATOnly             bool     `json:"at_only"`
+	AccessTokenType    string   `json:"access_token_type,omitempty"`
+	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
+	BaseURL            string   `json:"base_url,omitempty"`
+	Models             []string `json:"models,omitempty"`
+	CreatedAt          string   `json:"created_at"`
+	DeletedAt          string   `json:"deleted_at,omitempty"`
+	LastTestStatus     string   `json:"last_test_status,omitempty"`
+	LastTestAt         string   `json:"last_test_at,omitempty"`
+}
+
+// ListRecycleBinAccounts 获取回收站账号列表
+// GET /api/admin/accounts/recycle-bin
+func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListDeleted(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	accounts := make([]recycleBinAccountResponse, 0, len(rows))
+	for _, row := range rows {
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		email := row.GetCredential("email")
+		baseURL := row.GetCredential("base_url")
+		if isOpenAIResponsesAccount && email == "" {
+			email = baseURL
+		}
+		planType := row.GetCredential("plan_type")
+		if isOpenAIResponsesAccount && planType == "" {
+			planType = "api"
+		}
+		resp := recycleBinAccountResponse{
+			ID:                 row.ID,
+			Name:               row.Name,
+			Email:              email,
+			PlanType:           planType,
+			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccessTokenType:    accountAccessTokenType(row),
+			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			BaseURL:            baseURL,
+			Models:             row.GetCredentialStringSlice("models"),
+			CreatedAt:          row.CreatedAt.Format(time.RFC3339),
+			LastTestStatus:     row.GetCredential("recycle_last_test_status"),
+			LastTestAt:         row.GetCredential("recycle_last_test_at"),
+		}
+		if row.DeletedAt.Valid {
+			resp.DeletedAt = row.DeletedAt.Time.Format(time.RFC3339)
+		} else if !row.UpdatedAt.IsZero() {
+			// 旧数据可能没有 deleted_at；软删除会刷新 updated_at，用它兜底。
+			resp.DeletedAt = row.UpdatedAt.Format(time.RFC3339)
+		}
+		accounts = append(accounts, resp)
+	}
+	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
+}
+
+// RestoreAccount 将回收站中的账号恢复到账号池
+// POST /api/admin/accounts/:id/restore
+func (h *Handler) RestoreAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.restoreAccountByID(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
+			return
+		}
+		if errors.Is(err, errDuplicateOAuthIdentity) || errors.Is(err, errDuplicateCredentialWorkspaceRoute) {
+			writeError(c, http.StatusConflict, "恢复失败: "+err.Error())
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "恢复失败: "+err.Error())
+		return
+	}
+	writeMessage(c, http.StatusOK, "账号已恢复")
+}
+
+// restoreAccountByID 将回收站账号恢复为 active 并重新加入运行时池。
+func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
+	row, err := h.db.GetAccountByIDIncludingDeleted(ctx, id)
+	if err != nil {
+		return err
+	}
+	seed := tokenCredentialSeedFromAccountRow(row)
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
+
+	if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
+		if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
+			return err
+		} else if duplicateID > 0 {
+			return fmt.Errorf("%w: 已存在相同 OAuth 账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateOAuthIdentity, duplicateID)
+		}
+		if row.GetCredential("workspace_id") != seed.workspaceID {
+			if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"workspace_id": seed.workspaceID}); err != nil {
+				return err
+			}
+		}
+	}
+	if duplicateID, err := h.findCredentialWorkspaceRouteDuplicate(ctx, seed, id); err != nil {
+		return err
+	} else if duplicateID > 0 {
+		return fmt.Errorf("%w: 已存在相同凭证和目标工作区的账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateCredentialWorkspaceRoute, duplicateID)
+	}
+
+	if err := h.db.RestoreAccount(ctx, id); err != nil {
+		return err
+	}
+	if h.store != nil {
+		if err := h.store.LoadAccountByID(ctx, id); err != nil {
+			log.Printf("恢复账号 %d 后加载运行时失败: %v", id, err)
+			return fmt.Errorf("恢复账号后加载运行时失败: %w", err)
+		}
+	}
+	h.db.InsertAccountEventAsync(id, "restored", "recycle_bin")
+	return nil
+}
+
+func tokenCredentialSeedFromAccountRow(row *database.AccountRow) tokenCredentialSeed {
+	if row == nil {
+		return tokenCredentialSeed{}
+	}
+	return normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken:          row.GetCredential("refresh_token"),
+		sessionToken:          row.GetCredential("session_token"),
+		accessToken:           row.GetCredential("access_token"),
+		accessTokenType:       row.GetCredential("access_token_type"),
+		idToken:               row.GetCredential("id_token"),
+		accountID:             firstNonEmpty(row.GetCredential("account_id"), row.GetCredential("chatgpt_account_id")),
+		workspaceID:           row.GetCredential("workspace_id"),
+		customHeaders:         row.GetCredentialStringMap("custom_headers"),
+		email:                 row.GetCredential("email"),
+		planType:              row.GetCredential("plan_type"),
+		expiresAtRaw:          row.GetCredential("expires_at"),
+		codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
+		codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
+		codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
+		codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
+		codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
+		codexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
+	})
+}
+
+// PurgeAccount 从回收站彻底删除账号（物理删除）
+// DELETE /api/admin/accounts/:id/purge
+func (h *Handler) PurgeAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.db.PurgeAccount(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "彻底删除失败: "+err.Error())
+		return
+	}
+	h.store.RemoveAccount(id)
+	security.SecurityAuditLog("ACCOUNT_PURGED", fmt.Sprintf("account_id=%d ip=%s", id, c.ClientIP()))
+	writeMessage(c, http.StatusOK, "账号已彻底删除")
+}
+
+// emptyRecycleBinConfirmToken 清空回收站的确认令牌；调用方必须在请求体中
+// 显式携带，防止误调用或脚本一键清空导致账号被不可逆地物理删除。
+const emptyRecycleBinConfirmToken = "EMPTY-RECYCLE-BIN"
+
+// EmptyRecycleBin 清空回收站
+// DELETE /api/admin/accounts/recycle-bin
+// 请求体必须携带 {"confirm":"EMPTY-RECYCLE-BIN"}，否则拒绝执行。
+func (h *Handler) EmptyRecycleBin(c *gin.Context) {
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "请求格式错误")
+			return
+		}
+	}
+	if strings.TrimSpace(req.Confirm) != emptyRecycleBinConfirmToken {
+		writeError(c, http.StatusBadRequest, `清空回收站需要确认：请求体需携带 confirm="EMPTY-RECYCLE-BIN"`)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	purged, err := h.db.PurgeDeletedAccounts(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "清空回收站失败: "+err.Error())
+		return
+	}
+	security.SecurityAuditLog("RECYCLE_BIN_EMPTIED", fmt.Sprintf("purged=%d ip=%s", purged, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{"message": "回收站已清空", "purged": purged})
+}
+
+// BatchDeleteAccounts 批量删除账号；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-delete
+func (h *Handler) BatchDeleteAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要删除的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchDeleteAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个账号，失败 %d 个", success, fail),
+		"deleted": success,
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func uniqueAccountIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+func (h *Handler) streamBatchDeleteAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_delete", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_delete"})
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "batch_delete",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+	})
+}
+
+func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var success int64
+	var fail int64
+	deleted := make([]int64, 0, len(ids))
+
+	for i, id := range ids {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+
+		accountName, accountEmail := h.accountOperationIdentity(id)
+		err := h.deleteAccountByID(ctx, id)
+		event := batchOperationEvent{
+			Type:         "progress",
+			Action:       "batch_delete",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    id,
+			AccountName:  accountName,
+			AccountEmail: accountEmail,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+			if errors.Is(err, sql.ErrNoRows) {
+				event.Error = "账号不存在"
+			}
+		} else {
+			success++
+			deleted = append(deleted, id)
+			event.Deleted = success
+			event.Message = "账号已删除"
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	h.pruneAccountsFromSnapshotCaches(deleted)
+	return success, fail
+}
+
+// BatchUpdateAccounts 批量更新账号启用、锁定和调度元信息。
+// POST /api/admin/accounts/batch-update
+func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
+	var req batchUpdateAccountsReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要更新的账号 ID 列表")
+		return
+	}
+
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	enabled := optionalBoolFromPtr(req.Enabled)
+	locked := optionalBoolFromPtr(req.Locked)
+	if !enabled.Set && !locked.Set && !schedulerUpdate.hasChanges() {
+		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if schedulerUpdate.AllowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
+			return
+		}
+		if len(missingAPIKeyIDs) > 0 {
+			values := make([]string, 0, len(missingAPIKeyIDs))
+			for _, value := range missingAPIKeyIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+	if schedulerUpdate.GroupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, schedulerUpdate.GroupIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
+			return
+		}
+		if len(missingGroupIDs) > 0 {
+			values := make([]string, 0, len(missingGroupIDs))
+			for _, value := range missingGroupIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+		if len(schedulerUpdate.GroupIDs.Values) > 0 {
+			rows, err := h.db.ListActive(ctx)
+			if err != nil {
+				writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+				return
+			}
+			idSet := make(map[int64]bool, len(ids))
+			for _, id := range ids {
+				idSet[id] = true
+			}
+			targetRows := make([]*database.AccountRow, 0, len(ids))
+			for _, row := range rows {
+				if idSet[row.ID] {
+					targetRows = append(targetRows, row)
+				}
+			}
+			if err := h.validateGroupChannelForRows(ctx, targetRows, schedulerUpdate.GroupIDs.Values); err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	}
+
+	updatedIDs, err := h.db.BatchUpdateAccountMetadata(ctx, ids, database.BatchAccountMetadataUpdate{
+		Enabled:                 enabled,
+		Locked:                  locked,
+		ScoreBiasOverride:       schedulerUpdate.ScoreBiasOverride,
+		BaseConcurrencyOverride: schedulerUpdate.BaseConcurrencyOverride,
+		SkipWarmTier:            schedulerUpdate.SkipWarmTier,
+		AllowedAPIKeyIDs:        schedulerUpdate.AllowedAPIKeyIDs,
+		Tags:                    database.OptionalStringSlice{Set: schedulerUpdate.Tags.Set, Values: schedulerUpdate.Tags.Values},
+		GroupIDs:                schedulerUpdate.GroupIDs,
+		ProxyURL:                schedulerUpdate.ProxyURL,
+		CredentialUpdates:       schedulerUpdate.CredentialUpdates,
+	})
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "批量更新账号失败: "+err.Error())
+		return
+	}
+
+	if h.store != nil {
+		for _, id := range updatedIDs {
+			if enabled.Set {
+				if !h.store.ApplyAccountEnabled(id, enabled.Value) && enabled.Value {
+					if err := h.store.LoadAccountByID(ctx, id); err != nil {
+						log.Printf("批量启用账号 %d 后加载进调度池失败: %v", id, err)
+					}
+				}
+			}
+			if locked.Set {
+				if acc := h.store.FindByID(id); acc != nil {
+					if locked.Value {
+						atomic.StoreInt32(&acc.Locked, 1)
+					} else {
+						atomic.StoreInt32(&acc.Locked, 0)
+					}
+				}
+			}
+			h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
+		}
+	}
+
+	success := int64(len(updatedIDs))
+	failed := int64(len(ids)) - success
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已更新 %d 个账号，失败 %d 个", success, failed),
+		"success": success,
+		"failed":  failed,
+	})
+}
+
+// RefreshAccount 手动刷新账号 AT
+func (h *Handler) RefreshAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	if err := h.refreshAccountByID(c.Request.Context(), id); err != nil {
+		if strings.Contains(err.Error(), "不存在") {
+			writeError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "刷新失败: "+err.Error())
+		return
+	}
+
+	writeMessage(c, http.StatusOK, "账号刷新成功")
+}
+
+// BatchRefreshAccounts 批量刷新账号 AT；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-refresh
+func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	var ids []int64
+	if req.IDs != nil {
+		ids = uniqueAccountIDs(*req.IDs)
+	}
+	if req.Selector != nil {
+		selectorCtx, selectorCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		resolvedIDs, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		selectorCancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids = resolvedIDs
+	}
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要刷新的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchRefreshAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchRefreshAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已刷新 %d 个账号，失败 %d 个", success, fail),
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	return h.refreshAccountByIDWithProbe(ctx, id, true)
+}
+
+func (h *Handler) refreshAccountByIDWithProbe(ctx context.Context, id int64, probeAfterRefresh bool) error {
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	refreshFn := h.refreshAccount
+	if refreshFn == nil {
+		refreshFn = h.refreshSingleAccount
+	}
+	if err := refreshFn(refreshCtx, id); err != nil {
+		return err
+	}
+
+	// 刷新成功后顺带做一次零成本 wham 用量探针，从服务端权威数据同步订阅到期时间与用量。
+	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
+	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
+	// （issue #300）
+	if probeAfterRefresh {
+		probe := h.usageProbeFunc()
+		if probe == nil || h.store == nil {
+			return nil
+		}
+		if acc := h.store.FindByID(id); acc != nil {
+			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+			if err := probe(probeCtx, acc); err != nil {
+				log.Printf("[账号 %d] 刷新后用量/订阅到期探针失败（忽略）: %v", id, err)
+			}
+			probeCancel()
+		}
+	}
+	return nil
+}
+
+func (h *Handler) streamBatchRefreshAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_refresh", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_refresh"})
+		return
+	}
+
+	events := make(chan batchOperationEvent, len(ids)+1)
+	ctx := c.Request.Context()
+	go func() {
+		success, fail := h.runBatchRefreshAccounts(ctx, ids, func(event batchOperationEvent) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+			}
+		})
+		select {
+		case events <- batchOperationEvent{
+			Type:    "complete",
+			Action:  "batch_refresh",
+			Current: total,
+			Total:   total,
+			Success: success,
+			Failed:  fail,
+		}:
+		case <-ctx.Done():
+		}
+		close(events)
+	}()
+
+	for event := range events {
+		sendSSEJSON(c, event)
+	}
+}
+
+func (h *Handler) runBatchRefreshAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var (
+		success   int64
+		fail      int64
+		completed int64
+		wg        sync.WaitGroup
+		sem       = make(chan struct{}, accountRefreshBatchConcurrency)
+	)
+
+	for _, id := range ids {
+		id := id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			accountName, accountEmail := h.accountOperationIdentity(id)
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, "刷新已取消", true)
+				return
+			}
+			defer func() { <-sem }()
+
+			if err := h.refreshAccountByID(ctx, id); err != nil {
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, err.Error(), true)
+				return
+			}
+
+			atomic.AddInt64(&success, 1)
+			emitBatchRefreshProgress(onProgress, id, accountName, accountEmail, total, &completed, &success, &fail, "账号刷新成功", false)
+		}()
+	}
+
+	wg.Wait()
+	return atomic.LoadInt64(&success), atomic.LoadInt64(&fail)
+}
+
+func emitBatchRefreshProgress(
+	onProgress func(batchOperationEvent),
+	accountID int64,
+	accountName string,
+	accountEmail string,
+	total int,
+	completedCount *int64,
+	successCount *int64,
+	failedCount *int64,
+	message string,
+	failed bool,
+) {
+	if onProgress == nil {
+		return
+	}
+	current := int(atomic.AddInt64(completedCount, 1))
+	event := batchOperationEvent{
+		Type:         "progress",
+		Action:       "batch_refresh",
+		Status:       "success",
+		HTTPStatus:   http.StatusOK,
+		Current:      current,
+		Total:        total,
+		Success:      atomic.LoadInt64(successCount),
+		Failed:       atomic.LoadInt64(failedCount),
+		AccountID:    accountID,
+		AccountName:  accountName,
+		AccountEmail: accountEmail,
+		Message:      message,
+	}
+	if failed {
+		event.Status = "failed"
+		event.HTTPStatus = batchOperationHTTPStatus(event.Status, message)
+		event.Error = message
+	}
+	onProgress(event)
+}
+
+// ToggleAccountEnabled 切换账号是否参与调度选择
+func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Enabled *bool `json:"enabled" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.SetAccountEnabled(ctx, id, *req.Enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新启用状态失败: "+err.Error())
+		return
+	}
+
+	// 若启用一个尚未进入运行时池的账号（如自助门户提交的待审核账号），ApplyAccountEnabled
+	// 因找不到运行时对象返回 false；此时按需加载进调度池，使「批准」立即生效（issue #393）。
+	if !h.store.ApplyAccountEnabled(id, *req.Enabled) && *req.Enabled {
+		if err := h.store.LoadAccountByID(ctx, id); err != nil {
+			log.Printf("启用账号 %d 后加载进调度池失败: %v", id, err)
+		}
+	}
+
+	if *req.Enabled {
+		writeMessage(c, http.StatusOK, "账号已启用")
+	} else {
+		writeMessage(c, http.StatusOK, "账号已禁用")
+	}
+}
+
+// UpdateAccountNote 更新账号备注（通用标识字段）。
+func (h *Handler) UpdateAccountNote(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	note := security.SanitizeInput(strings.TrimSpace(req.Note))
+	if utf8.RuneCountInString(note) > 500 {
+		writeError(c, http.StatusBadRequest, "备注长度不能超过 500 字符")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	if err := h.db.UpdateAccountNote(ctx, id, note); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新备注失败: "+err.Error())
+		return
+	}
+	writeMessage(c, http.StatusOK, "备注已更新")
+}
+
+// ToggleAccountLock 切换账号的锁定状态
+func (h *Handler) ToggleAccountLock(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req struct {
+		Locked bool `json:"locked"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.db.SetAccountLocked(ctx, id, req.Locked); err != nil {
+		writeError(c, http.StatusInternalServerError, "更新锁定状态失败: "+err.Error())
+		return
+	}
+
+	// 同步更新内存中的状态
+	if acc := h.store.FindByID(id); acc != nil {
+		if req.Locked {
+			atomic.StoreInt32(&acc.Locked, 1)
+		} else {
+			atomic.StoreInt32(&acc.Locked, 0)
+		}
+	}
+
+	if req.Locked {
+		writeMessage(c, http.StatusOK, "账号已锁定")
+	} else {
+		writeMessage(c, http.StatusOK, "账号已解锁")
+	}
+}
+
+func accountIsOverloadPaused(acc *auth.Account) bool {
+	if acc == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(acc.GetCooldownReason()), "overload_paused") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(acc.RuntimeStatus()), "overload_paused")
+}
+
+// resetAccountRuntimeStatus 清冷却/模型冷却。过载暂停只恢复调度，不能清用量快照，
+// 否则 free 账号（只有 30d 窗、没有 5h）列表额度条会先变成 "-"，要等下次探针才回来。
+func (h *Handler) resetAccountRuntimeStatus(ctx context.Context, acc *auth.Account) {
+	keepUsage := accountIsOverloadPaused(acc)
+	h.store.ClearCooldown(acc)
+	h.store.ClearAllModelCooldowns(acc)
+	if keepUsage {
+		return
+	}
+	acc.ClearUsageCache()
+	h.syncAccountPlanAfterReset(ctx, acc)
+}
+
+// ResetAccountStatus 重置单个账号状态为正常
+func (h *Handler) ResetAccountStatus(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	h.resetAccountRuntimeStatus(c.Request.Context(), acc)
+	writeMessage(c, http.StatusOK, "账号状态已重置")
+}
+
+// BatchResetStatus 批量重置账号状态为正常
+func (h *Handler) BatchResetStatus(c *gin.Context) {
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要重置的账号 ID 列表")
+		return
+	}
+
+	success := 0
+	fail := 0
+	for _, id := range req.IDs {
+		acc := h.store.FindByID(id)
+		if acc == nil {
+			fail++
+			continue
+		}
+		h.resetAccountRuntimeStatus(c.Request.Context(), acc)
+		success++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已重置 %d 个账号状态", success),
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func (h *Handler) UpdateAccountModelCooldownPolicy(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+
+	var raw map[string]json.RawMessage
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	allowed := map[string]bool{
+		"mode": true, "seconds": true, "backoff_enabled": true,
+	}
+	for key := range raw {
+		if !allowed[key] {
+			writeError(c, http.StatusBadRequest, "未知字段: "+key)
+			return
+		}
+	}
+	if len(raw) == 0 {
+		writeError(c, http.StatusBadRequest, "至少提供一个策略字段")
+		return
+	}
+
+	currentMode, currentSeconds, currentBackoff := acc.GetModelCooldownPolicyOverride()
+	mode, seconds, backoff := currentMode, currentSeconds, currentBackoff
+	updates := make(map[string]interface{})
+	if value, ok := raw["mode"]; ok {
+		if string(value) == "null" {
+			mode = nil
+			updates["model_cooldown_mode_override"] = nil
+		} else {
+			var parsed string
+			if json.Unmarshal(value, &parsed) != nil || !database.IsValidModelCooldownMode(parsed) {
+				writeError(c, http.StatusBadRequest, "mode 必须是 off、fixed、adaptive 或 null")
+				return
+			}
+			parsed = database.NormalizeModelCooldownMode(parsed, database.ModelCooldownModeAdaptive)
+			mode = &parsed
+			updates["model_cooldown_mode_override"] = parsed
+		}
+	}
+	if value, ok := raw["seconds"]; ok {
+		if string(value) == "null" {
+			seconds = nil
+			updates["model_cooldown_seconds_override"] = nil
+		} else {
+			var parsed int
+			if json.Unmarshal(value, &parsed) != nil || parsed < 1 || parsed > database.MaxModelCooldownSeconds {
+				writeError(c, http.StatusBadRequest, fmt.Sprintf("seconds 必须在 1-%d 之间或为 null", database.MaxModelCooldownSeconds))
+				return
+			}
+			seconds = &parsed
+			updates["model_cooldown_seconds_override"] = parsed
+		}
+	}
+	if value, ok := raw["backoff_enabled"]; ok {
+		if string(value) == "null" {
+			backoff = nil
+			updates["model_cooldown_backoff_override"] = nil
+		} else {
+			var parsed bool
+			if json.Unmarshal(value, &parsed) != nil {
+				writeError(c, http.StatusBadRequest, "backoff_enabled 必须是布尔值或 null")
+				return
+			}
+			backoff = &parsed
+			updates["model_cooldown_backoff_override"] = parsed
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.db.UpdateCredentials(ctx, id, updates); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "保存模型冷却策略失败: "+err.Error())
+		return
+	}
+	h.store.ApplyAccountModelCooldownPolicyOverride(id, mode, seconds, backoff)
+	effective := h.store.ResolveModelCooldownPolicy(acc)
+	c.JSON(http.StatusOK, gin.H{
+		"message":                   "模型冷却策略已更新",
+		"mode_override":             mode,
+		"seconds_override":          seconds,
+		"backoff_enabled_override":  backoff,
+		"mode_effective":            effective.Mode,
+		"seconds_effective":         effective.Seconds,
+		"backoff_enabled_effective": effective.BackoffEnabled,
+	})
+}
+
+func (h *Handler) ClearAccountModelCooldown(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+	model := strings.TrimSpace(c.Param("model"))
+	if model == "" {
+		writeError(c, http.StatusBadRequest, "模型不能为空")
+		return
+	}
+	h.store.ClearModelCooldown(acc, model)
+	writeMessage(c, http.StatusOK, "模型冷却已清除")
+}
+
+func (h *Handler) ClearAllAccountModelCooldowns(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不存在")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "账号全部模型冷却已清除",
+		"cleared": h.store.ClearAllModelCooldowns(acc),
+	})
+}
+
+func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account) {
+	if h == nil || h.syncAccountPlanOnReset == nil || acc == nil {
+		return
+	}
+	h.startDBBackgroundTask(func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+		defer cancel()
+		if err := h.syncAccountPlanOnReset(ctx, acc); err != nil {
+			log.Printf("[账号 %d] 重置后同步 Codex plan type 失败: %v", acc.DBID, err)
+		}
+	})
+}
+
+func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
+	if h == nil || h.store == nil || acc == nil || acc.IsRelayStyle() || acc.GetAccessToken() == "" {
+		return nil
+	}
+	model, err := h.connectionTestModelForAccount(ctx, acc, "")
+	if err != nil {
+		return err
+	}
+	resp, err := proxy.ExecuteRequest(ctx, acc, buildConnectionTestPayload(h.store, model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	proxy.SyncCodexUsageState(h.store, acc, resp)
+	return nil
+}
+
+func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
+	if h == nil || h.store == nil {
+		return fmt.Errorf("账号池未初始化")
+	}
+	return h.store.RefreshSingle(ctx, id)
+}
+
+// ==================== Health ====================
+
+// GetHealth 系统健康检查（扩展版）
+func (h *Handler) GetHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, healthResponse{
+		Status:    "ok",
+		Available: h.store.AvailableCount(),
+		Total:     h.store.AccountCount(),
+	})
+}
+
+// ==================== Usage ====================
+
+// GetUsageStats 获取使用统计。
+// 支持可选 query 参数 start/end (RFC3339);未传时回落"今日"行为。
+func (h *Handler) GetUsageStats(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 区间卡片跟随用量页的账号/密钥/模型/端点/搜索等筛选(与 /usage/logs 同一套参数);
+	// 状态类参数(status/error_only 等)对统计无意义,解析后被忽略;累计字段始终全局。
+	dim, ok := parseUsageLogsFilter(c, rangeStart, rangeEnd)
+	if !ok {
+		return
+	}
+
+	var stats *database.UsageStats
+	if strings.EqualFold(strings.TrimSpace(c.Query("detail")), "summary") {
+		stats, err = h.getUsageStatsSummaryFilteredCached(ctx, rangeStart, rangeEnd, parseUsageChannel(c), dim)
+	} else {
+		stats, err = h.getUsageStatsFilteredCached(ctx, rangeStart, rangeEnd, parseUsageChannel(c), dim)
+	}
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
+// parseUsageStatsRange 解析 /usage/stats 的可选 start/end query。
+// 任一为空则当作零值由调用方决定回退行为(默认"今日");两者都填则要求均合法。
+func parseUsageStatsRange(startStr, endStr string) (time.Time, time.Time, error) {
+	startStr = strings.TrimSpace(startStr)
+	endStr = strings.TrimSpace(endStr)
+	var start, end time.Time
+	if startStr != "" {
+		t, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("start 参数格式错误，需要 RFC3339")
+		}
+		start = t
+	}
+	if endStr != "" {
+		t, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("end 参数格式错误，需要 RFC3339")
+		}
+		end = t
+	}
+	if !start.IsZero() && !end.IsZero() && !end.After(start) {
+		return time.Time{}, time.Time{}, fmt.Errorf("end 必须晚于 start")
+	}
+	return start, end, nil
+}
+
+// GetAPIKeyTokenStats 返回按 API Key 聚合的 token 用量列表（issue #162）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// 不分页/不限条数：前端做排序、搜索、分页。
+func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !rangeStart.IsZero() && !rangeEnd.IsZero() && rangeEnd.Sub(rangeStart) > 366*24*time.Hour {
+		writeError(c, http.StatusBadRequest, "时间范围不能超过 366 天")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	cacheKey := fmt.Sprintf("%d:%d", rangeStart.Unix()/30, rangeEnd.Unix()/30)
+	type cachedResponse struct {
+		Items []database.APIKeyTokenStat `json:"items"`
+	}
+	var response cachedResponse
+	if h.getRuntimeJSON(ctx, adminAPIKeyStatsNamespace, cacheKey, &response) {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	items, err := h.db.ListAPIKeyTokenStats(ctx, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyTokenStat{}
+	}
+	response.Items = items
+	h.setRuntimeJSON(ctx, adminAPIKeyStatsNamespace, cacheKey, response, adminUsageRangeCacheTTL)
+	c.JSON(http.StatusOK, response)
+}
+
+// GetAPIKeyAccountStats 返回单个 API Key 按上游账号拆分的用量（账号明细"按 Key 分解"的转置视图）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// GET /api/admin/usage/api-keys/:id/accounts
+func (h *Handler) GetAPIKeyAccountStats(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的 API Key ID")
+		return
+	}
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !rangeStart.IsZero() && !rangeEnd.IsZero() && rangeEnd.Sub(rangeStart) > 366*24*time.Hour {
+		writeError(c, http.StatusBadRequest, "时间范围不能超过 366 天")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	cacheKey := fmt.Sprintf("%d:%d:%d", id, rangeStart.Unix()/30, rangeEnd.Unix()/30)
+	type cachedResponse struct {
+		Items           []database.APIKeyAccountStat     `json:"items"`
+		Groups          []apiKeyAccountGroupUsage        `json:"groups"`
+		Summary         apiKeyAccountUsageSummary        `json:"summary"`
+		Reconciliation  apiKeyAccountUsageReconciliation `json:"reconciliation"`
+		MembershipBasis string                           `json:"membership_basis"`
+	}
+	var response cachedResponse
+	if h.getRuntimeJSON(ctx, adminAPIKeyAccountsNamespace, cacheKey, &response) {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	items, err := h.db.ListAPIKeyAccountStats(ctx, id, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyAccountStat{}
+	}
+	response.Items = items
+	response.Groups, response.Summary, response.Reconciliation = aggregateAPIKeyAccountGroups(items)
+	response.MembershipBasis = "current_and_deleted_last_membership"
+	h.setRuntimeJSON(ctx, adminAPIKeyAccountsNamespace, cacheKey, response, adminUsageRangeCacheTTL)
+	c.JSON(http.StatusOK, response)
+}
+
+type apiKeyAccountUsageSummary struct {
+	Accounts      int     `json:"accounts"`
+	Requests      int64   `json:"requests"`
+	TotalTokens   int64   `json:"total_tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
+}
+
+type apiKeyAccountGroupUsage struct {
+	ID            int64   `json:"id"`
+	Name          string  `json:"name"`
+	Color         string  `json:"color"`
+	Accounts      int     `json:"accounts"`
+	Requests      int64   `json:"requests"`
+	TotalTokens   int64   `json:"total_tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
+}
+
+type apiKeyAccountUsageReconciliation struct {
+	GroupedTotal          apiKeyAccountUsageSummary `json:"grouped_total"`
+	Ungrouped             apiKeyAccountUsageSummary `json:"ungrouped"`
+	Duplicate             apiKeyAccountUsageSummary `json:"duplicate"`
+	UniqueGroupedAccounts int                       `json:"unique_grouped_accounts"`
+	MultiGroupAccounts    int                       `json:"multi_group_accounts"`
+}
+
+// aggregateAPIKeyAccountGroups uses current memberships for active accounts and
+// the retained last membership for recycle-bin accounts. If an account belongs
+// to multiple groups, its usage is intentionally included in each group; the
+// overall summary remains de-duplicated.
+func aggregateAPIKeyAccountGroups(items []database.APIKeyAccountStat) ([]apiKeyAccountGroupUsage, apiKeyAccountUsageSummary, apiKeyAccountUsageReconciliation) {
+	groupMap := make(map[int64]*apiKeyAccountGroupUsage)
+	summary := apiKeyAccountUsageSummary{Accounts: len(items)}
+	reconciliation := apiKeyAccountUsageReconciliation{}
+	for _, item := range items {
+		summary.Requests += item.Requests
+		summary.TotalTokens += item.TotalTokens
+		summary.AccountBilled += item.AccountBilled
+		summary.UserBilled += item.UserBilled
+		groupCount := len(item.Groups)
+		if groupCount == 0 {
+			reconciliation.Ungrouped.Accounts++
+			reconciliation.Ungrouped.Requests += item.Requests
+			reconciliation.Ungrouped.TotalTokens += item.TotalTokens
+			reconciliation.Ungrouped.AccountBilled += item.AccountBilled
+			reconciliation.Ungrouped.UserBilled += item.UserBilled
+		} else {
+			reconciliation.UniqueGroupedAccounts++
+		}
+		if groupCount > 1 {
+			reconciliation.MultiGroupAccounts++
+			extraAssignments := int64(groupCount - 1)
+			reconciliation.Duplicate.Accounts += groupCount - 1
+			reconciliation.Duplicate.Requests += item.Requests * extraAssignments
+			reconciliation.Duplicate.TotalTokens += item.TotalTokens * extraAssignments
+			reconciliation.Duplicate.AccountBilled += item.AccountBilled * float64(extraAssignments)
+			reconciliation.Duplicate.UserBilled += item.UserBilled * float64(extraAssignments)
+		}
+		for _, group := range item.Groups {
+			total := groupMap[group.ID]
+			if total == nil {
+				total = &apiKeyAccountGroupUsage{ID: group.ID, Name: group.Name, Color: group.Color}
+				groupMap[group.ID] = total
+			}
+			total.Accounts++
+			total.Requests += item.Requests
+			total.TotalTokens += item.TotalTokens
+			total.AccountBilled += item.AccountBilled
+			total.UserBilled += item.UserBilled
+		}
+	}
+	groups := make([]apiKeyAccountGroupUsage, 0, len(groupMap))
+	for _, group := range groupMap {
+		groups = append(groups, *group)
+		reconciliation.GroupedTotal.Accounts += group.Accounts
+		reconciliation.GroupedTotal.Requests += group.Requests
+		reconciliation.GroupedTotal.TotalTokens += group.TotalTokens
+		reconciliation.GroupedTotal.AccountBilled += group.AccountBilled
+		reconciliation.GroupedTotal.UserBilled += group.UserBilled
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].UserBilled == groups[j].UserBilled {
+			return groups[i].TotalTokens > groups[j].TotalTokens
+		}
+		return groups[i].UserBilled > groups[j].UserBilled
+	})
+	return groups, summary, reconciliation
+}
+
+// GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
+func (h *Handler) GetChartData(c *gin.Context) {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	bucketStr := c.DefaultQuery("bucket_minutes", "5")
+
+	startTime, e1 := time.Parse(time.RFC3339, startStr)
+	endTime, e2 := time.Parse(time.RFC3339, endStr)
+	if e1 != nil || e2 != nil {
+		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		return
+	}
+	bucketMinutes, _ := strconv.Atoi(bucketStr)
+	if bucketMinutes < 1 {
+		bucketMinutes = 5
+	}
+
+	channel := parseUsageChannel(c)
+
+	// Canonicalize moving ranges so periodic refreshes reuse the same result.
+	// The bucket width itself is the natural cache window for chart data.
+	cacheWindow := int64(bucketMinutes * 60)
+	cacheKey := fmt.Sprintf("%d|%d|%d|%s", startTime.Unix()/cacheWindow, endTime.Unix()/cacheWindow, bucketMinutes, channel)
+	h.chartCacheMu.RLock()
+	if entry, ok := h.chartCacheData[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		h.chartCacheMu.RUnlock()
+		c.JSON(http.StatusOK, entry.data)
+		return
+	}
+	h.chartCacheMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	var cached database.ChartAggregation
+	if h.getRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, &cached) {
+		result := &cached
+		h.chartCacheMu.Lock()
+		h.chartCacheData[cacheKey] = &chartCacheEntry{
+			data:      result,
+			expiresAt: time.Now().Add(adminChartCacheTTL),
+		}
+		h.chartCacheMu.Unlock()
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
+	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes, channel)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.setRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, result, adminChartCacheTTL)
+
+	// 写入缓存
+	h.chartCacheMu.Lock()
+	h.chartCacheData[cacheKey] = &chartCacheEntry{
+		data:      result,
+		expiresAt: time.Now().Add(adminChartCacheTTL),
+	}
+	// 清理过期条目（延迟清理，避免内存泄漏）
+	for k, v := range h.chartCacheData {
+		if time.Now().After(v.expiresAt) {
+			delete(h.chartCacheData, k)
+		}
+	}
+	h.chartCacheMu.Unlock()
+
+	c.JSON(http.StatusOK, result)
+}
+
+func parseOpsErrorPositiveInt64(c *gin.Context, name string) (*int64, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return nil, true
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 参数无效，需要正整数", name))
+		return nil, false
+	}
+	return &parsed, true
+}
+
+func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogFilter, bool) {
+	endTime := time.Now()
+	startTime := endTime.Add(-1 * time.Hour)
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	if startStr != "" || endStr != "" {
+		if startStr == "" || endStr == "" {
+			writeError(c, http.StatusBadRequest, "start/end 参数需要同时提供")
+			return database.UsageLogFilter{}, false
+		}
+		parsedStart, e1 := time.Parse(time.RFC3339, startStr)
+		parsedEnd, e2 := time.Parse(time.RFC3339, endStr)
+		if e1 != nil || e2 != nil {
+			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+			return database.UsageLogFilter{}, false
+		}
+		startTime = parsedStart
+		endTime = parsedEnd
+	}
+
+	apiKeyID, ok := parseOpsErrorPositiveInt64(c, "api_key_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	accountID, ok := parseOpsErrorPositiveInt64(c, "account_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter := database.UsageLogFilter{
+		Start:           startTime,
+		End:             endTime,
+		Page:            1,
+		PageSize:        20,
+		Email:           strings.TrimSpace(c.Query("email")),
+		Model:           strings.TrimSpace(c.Query("model")),
+		Endpoint:        strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:        apiKeyID,
+		AccountID:       accountID,
+		ErrorOnly:       true,
+		IncludeCanceled: true,
+		ErrorKind:       strings.TrimSpace(c.Query("error_kind")),
+		Query:           strings.TrimSpace(c.Query("q")),
+		Channel:         parseUsageChannel(c),
+	}
+
+	status := strings.TrimSpace(c.Query("status"))
+	if status == "" {
+		status = strings.TrimSpace(c.Query("status_code"))
+	}
+	switch strings.ToLower(status) {
+	case "", "all":
+	case "4xx", "5xx":
+		filter.StatusFamily = strings.ToLower(status)
+	default:
+		statusCode, err := strconv.Atoi(status)
+		if err != nil || statusCode < 100 || statusCode > 599 {
+			writeError(c, http.StatusBadRequest, "status/status_code 参数无效")
+			return database.UsageLogFilter{}, false
+		}
+		filter.StatusCode = statusCode
+	}
+
+	if fastStr := c.Query("fast"); fastStr != "" {
+		v := fastStr == "true"
+		filter.FastOnly = &v
+	}
+	if streamStr := c.Query("stream"); streamStr != "" {
+		v := streamStr == "true"
+		filter.StreamOnly = &v
+	}
+
+	if withPaging {
+		if pageStr := c.Query("page"); pageStr != "" {
+			if page, err := strconv.Atoi(pageStr); err == nil && page > 0 {
+				filter.Page = page
+			}
+		}
+		if ps := c.Query("page_size"); ps != "" {
+			if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 500 {
+				filter.PageSize = n
+			}
+		}
+	}
+
+	return filter, true
+}
+
+type opsErrorExportFile struct {
+	Version           int                   `json:"version"`
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Range             opsErrorExportRange   `json:"range"`
+	Filters           opsErrorExportFilters `json:"filters"`
+	Options           opsErrorExportOptions `json:"options"`
+	TotalMatched      int                   `json:"total_matched"`
+	ExcludedCount     int                   `json:"excluded_count"`
+	ExportedCount     int                   `json:"exported_count"`
+	DuplicatesRemoved int                   `json:"duplicates_removed"`
+	Errors            []opsErrorExportEntry `json:"errors"`
+}
+
+type opsErrorExportRange struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+type opsErrorExportFilters struct {
+	Email        string `json:"email,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	APIKeyID     *int64 `json:"api_key_id,omitempty"`
+	AccountID    *int64 `json:"account_id,omitempty"`
+	FastOnly     *bool  `json:"fast_only,omitempty"`
+	StreamOnly   *bool  `json:"stream_only,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	StatusFamily string `json:"status_family,omitempty"`
+	ErrorKind    string `json:"error_kind,omitempty"`
+	Query        string `json:"query,omitempty"`
+}
+
+type opsErrorExportOptions struct {
+	Dedupe              bool  `json:"dedupe"`
+	ExcludedStatusCodes []int `json:"excluded_status_codes,omitempty"`
+}
+
+type opsErrorExportEntry struct {
+	Signature          string    `json:"signature"`
+	Occurrences        int       `json:"occurrences"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	SampleIDs          []int64   `json:"sample_ids"`
+	AffectedAccountIDs []int64   `json:"affected_account_ids,omitempty"`
+	AffectedAPIKeyIDs  []int64   `json:"affected_api_key_ids,omitempty"`
+	ID                 int64     `json:"id"`
+	CreatedAt          time.Time `json:"created_at"`
+	StatusCode         int       `json:"status_code"`
+	ErrorKind          string    `json:"error_kind"`
+	ErrorMessage       string    `json:"error_message"`
+	AccountID          int64     `json:"account_id"`
+	AccountName        string    `json:"account_name"`
+	AccountEmail       string    `json:"account_email"`
+	APIKeyID           int64     `json:"api_key_id"`
+	APIKeyName         string    `json:"api_key_name"`
+	APIKeyMasked       string    `json:"api_key_masked"`
+	Endpoint           string    `json:"endpoint"`
+	UpstreamEndpoint   string    `json:"upstream_endpoint"`
+	Model              string    `json:"model"`
+	EffectiveModel     string    `json:"effective_model"`
+	Stream             bool      `json:"stream"`
+	DurationMs         int       `json:"duration_ms"`
+	FirstTokenMs       int       `json:"first_token_ms"`
+	IsRetryAttempt     bool      `json:"is_retry_attempt"`
+	AttemptIndex       int       `json:"attempt_index"`
+}
+
+// GetOpsErrorLogs 获取运维错误日志
+func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, true)
+	if !ok {
+		return
+	}
+	result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ExportOpsErrorLogs 导出运维错误日志 JSON。
+func (h *Handler) ExportOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	dedupe := parseBoolQueryDefault(c, "dedupe", true)
+	excludedStatusCodes, excludedStatusSet, ok := parseExcludedStatusCodes(c.Query("exclude_status"))
+	if !ok {
+		writeError(c, http.StatusBadRequest, "exclude_status 参数无效")
+		return
+	}
+
+	logs, err := h.db.ListUsageLogsByFilter(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	exportFile := buildOpsErrorExportFile(logs, filter, dedupe, excludedStatusCodes, excludedStatusSet)
+	body, err := json.MarshalIndent(exportFile, "", "  ")
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	body = append(body, '\n')
+
+	filename := fmt.Sprintf("ops-errors-%s.json", time.Now().Format("20060102-150405"))
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+func parseBoolQueryDefault(c *gin.Context, name string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(c.Query(name)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func parseExcludedStatusCodes(raw string) ([]int, map[int]bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, map[int]bool{}, true
+	}
+	seen := map[int]bool{}
+	var statuses []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		code, err := strconv.Atoi(part)
+		if err != nil || code < 100 || code > 599 {
+			return nil, nil, false
+		}
+		if !seen[code] {
+			seen[code] = true
+			statuses = append(statuses, code)
+		}
+	}
+	sort.Ints(statuses)
+	return statuses, seen, true
+}
+
+func buildOpsErrorExportFile(logs []*database.UsageLog, filter database.UsageLogFilter, dedupe bool, excludedStatusCodes []int, excludedStatusSet map[int]bool) opsErrorExportFile {
+	exportFile := opsErrorExportFile{
+		Version:      1,
+		GeneratedAt:  time.Now(),
+		Range:        opsErrorExportRange{Start: filter.Start, End: filter.End},
+		Filters:      opsErrorExportFiltersFromUsageFilter(filter),
+		Options:      opsErrorExportOptions{Dedupe: dedupe, ExcludedStatusCodes: excludedStatusCodes},
+		TotalMatched: len(logs),
+		Errors:       []opsErrorExportEntry{},
+	}
+
+	filteredLogs := make([]*database.UsageLog, 0, len(logs))
+	for _, logRow := range logs {
+		if logRow == nil {
+			continue
+		}
+		if excludedStatusSet[logRow.StatusCode] {
+			exportFile.ExcludedCount++
+			continue
+		}
+		filteredLogs = append(filteredLogs, logRow)
+	}
+
+	if !dedupe {
+		for _, logRow := range filteredLogs {
+			entry := newOpsErrorExportEntry(logRow)
+			exportFile.Errors = append(exportFile.Errors, entry)
+		}
+		exportFile.ExportedCount = len(exportFile.Errors)
+		return exportFile
+	}
+
+	entryBySignature := make(map[string]int)
+	for _, logRow := range filteredLogs {
+		entry := newOpsErrorExportEntry(logRow)
+		if idx, exists := entryBySignature[entry.Signature]; exists {
+			exportFile.Errors[idx].merge(logRow)
+			continue
+		}
+		entryBySignature[entry.Signature] = len(exportFile.Errors)
+		exportFile.Errors = append(exportFile.Errors, entry)
+	}
+	sort.SliceStable(exportFile.Errors, func(i, j int) bool {
+		if exportFile.Errors[i].Occurrences != exportFile.Errors[j].Occurrences {
+			return exportFile.Errors[i].Occurrences > exportFile.Errors[j].Occurrences
+		}
+		return exportFile.Errors[i].LastSeen.After(exportFile.Errors[j].LastSeen)
+	})
+	exportFile.ExportedCount = len(exportFile.Errors)
+	exportFile.DuplicatesRemoved = len(filteredLogs) - len(exportFile.Errors)
+	return exportFile
+}
+
+func opsErrorExportFiltersFromUsageFilter(filter database.UsageLogFilter) opsErrorExportFilters {
+	return opsErrorExportFilters{
+		Email:        filter.Email,
+		Model:        filter.Model,
+		Endpoint:     filter.Endpoint,
+		APIKeyID:     filter.APIKeyID,
+		AccountID:    filter.AccountID,
+		FastOnly:     filter.FastOnly,
+		StreamOnly:   filter.StreamOnly,
+		StatusCode:   filter.StatusCode,
+		StatusFamily: filter.StatusFamily,
+		ErrorKind:    filter.ErrorKind,
+		Query:        filter.Query,
+	}
+}
+
+func newOpsErrorExportEntry(logRow *database.UsageLog) opsErrorExportEntry {
+	entry := opsErrorExportEntry{
+		Signature:          opsErrorSignature(logRow),
+		Occurrences:        1,
+		FirstSeen:          logRow.CreatedAt,
+		LastSeen:           logRow.CreatedAt,
+		SampleIDs:          []int64{logRow.ID},
+		AffectedAccountIDs: appendUniqueInt64(nil, logRow.AccountID, 50),
+		AffectedAPIKeyIDs:  appendUniqueInt64(nil, logRow.APIKeyID, 50),
+		ID:                 logRow.ID,
+		CreatedAt:          logRow.CreatedAt,
+		StatusCode:         logRow.StatusCode,
+		ErrorKind:          logRow.UpstreamErrorKind,
+		ErrorMessage:       logRow.ErrorMessage,
+		AccountID:          logRow.AccountID,
+		AccountName:        logRow.AccountName,
+		AccountEmail:       logRow.AccountEmail,
+		APIKeyID:           logRow.APIKeyID,
+		APIKeyName:         logRow.APIKeyName,
+		APIKeyMasked:       logRow.APIKeyMasked,
+		Endpoint:           firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		UpstreamEndpoint:   logRow.UpstreamEndpoint,
+		Model:              logRow.Model,
+		EffectiveModel:     logRow.EffectiveModel,
+		Stream:             logRow.Stream,
+		DurationMs:         logRow.DurationMs,
+		FirstTokenMs:       logRow.FirstTokenMs,
+		IsRetryAttempt:     logRow.IsRetryAttempt,
+		AttemptIndex:       logRow.AttemptIndex,
+	}
+	return entry
+}
+
+func (entry *opsErrorExportEntry) merge(logRow *database.UsageLog) {
+	entry.Occurrences++
+	if logRow.CreatedAt.Before(entry.FirstSeen) {
+		entry.FirstSeen = logRow.CreatedAt
+	}
+	if logRow.CreatedAt.After(entry.LastSeen) {
+		entry.LastSeen = logRow.CreatedAt
+	}
+	entry.SampleIDs = appendUniqueInt64(entry.SampleIDs, logRow.ID, 20)
+	entry.AffectedAccountIDs = appendUniqueInt64(entry.AffectedAccountIDs, logRow.AccountID, 50)
+	entry.AffectedAPIKeyIDs = appendUniqueInt64(entry.AffectedAPIKeyIDs, logRow.APIKeyID, 50)
+}
+
+func opsErrorSignature(logRow *database.UsageLog) string {
+	parts := []string{
+		strconv.Itoa(logRow.StatusCode),
+		strings.TrimSpace(logRow.UpstreamErrorKind),
+		strings.Join(strings.Fields(logRow.ErrorMessage), " "),
+		firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		strings.TrimSpace(logRow.UpstreamEndpoint),
+		strings.TrimSpace(logRow.Model),
+		strings.TrimSpace(logRow.EffectiveModel),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
+	return hex.EncodeToString(sum[:12])
+}
+
+func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
+	if value <= 0 || (limit > 0 && len(values) >= limit) {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func parseUsageLogBoolFilter(c *gin.Context, name string) (*bool, bool) {
+	raw, exists := c.GetQuery(name)
+	if !exists {
+		return nil, true
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		value := true
+		return &value, true
+	case "false":
+		value := false
+		return &value, true
+	default:
+		writeError(c, http.StatusBadRequest, name+" 参数无效，需要 true 或 false")
+		return nil, false
+	}
+}
+
+func parseUsageLogStatusFilter(c *gin.Context, filter *database.UsageLogFilter) bool {
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if status == "" {
+		status = strings.ToLower(strings.TrimSpace(c.Query("status_code")))
+	}
+	switch status {
+	case "", "all":
+		return true
+	case "2xx", "4xx", "5xx":
+		filter.StatusFamily = status
+		if status == "4xx" {
+			filter.IncludeCanceled = true
+		}
+		return true
+	default:
+		statusCode, err := strconv.Atoi(status)
+		if err != nil || statusCode < 100 || statusCode > 599 {
+			writeError(c, http.StatusBadRequest, "status/status_code 参数无效")
+			return false
+		}
+		filter.StatusCode = statusCode
+		if statusCode == 499 {
+			filter.IncludeCanceled = true
+		}
+		return true
+	}
+}
+
+func parseUsageLogsFilter(c *gin.Context, startTime, endTime time.Time) (database.UsageLogFilter, bool) {
+	apiKeyID, ok := parseOpsErrorPositiveInt64(c, "api_key_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	accountID, ok := parseOpsErrorPositiveInt64(c, "account_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter := database.UsageLogFilter{
+		RequestID:         strings.TrimSpace(c.Query("request_id")),
+		UpstreamRequestID: strings.TrimSpace(c.Query("upstream_request_id")),
+		Start:             startTime,
+		End:               endTime,
+		Page:              1,
+		PageSize:          20,
+		Email:             strings.TrimSpace(c.Query("email")),
+		Model:             strings.TrimSpace(c.Query("model")),
+		Endpoint:          strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:          apiKeyID,
+		AccountID:         accountID,
+		ErrorKind:         strings.TrimSpace(c.Query("error_kind")),
+		Query:             strings.TrimSpace(c.Query("q")),
+		Channel:           parseUsageChannel(c),
+	}
+
+	if pageStr := c.Query("page"); pageStr != "" {
+		if page, err := strconv.Atoi(pageStr); err == nil && page > 0 {
+			filter.Page = page
+		}
+	}
+	if pageSizeStr := c.Query("page_size"); pageSizeStr != "" {
+		if pageSize, err := strconv.Atoi(pageSizeStr); err == nil && pageSize > 0 && pageSize <= 500 {
+			filter.PageSize = pageSize
+		}
+	}
+
+	if fastStr := c.Query("fast"); fastStr != "" {
+		value := fastStr == "true"
+		filter.FastOnly = &value
+	}
+	if streamStr := c.Query("stream"); streamStr != "" {
+		value := streamStr == "true"
+		filter.StreamOnly = &value
+	}
+
+	filter.CompactOnly, ok = parseUsageLogBoolFilter(c, "compact")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.CompactionHistoryOnly, ok = parseUsageLogBoolFilter(c, "has_compaction_history")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.RetryOnly, ok = parseUsageLogBoolFilter(c, "retry")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.ViaWebsocketOnly, ok = parseUsageLogBoolFilter(c, "via_websocket")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	filter.UltraOnly, ok = parseUsageLogBoolFilter(c, "ultra")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	errorOnly, ok := parseUsageLogBoolFilter(c, "error_only")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	if errorOnly != nil {
+		filter.ErrorOnly = *errorOnly
+	}
+	includeCanceled, ok := parseUsageLogBoolFilter(c, "include_canceled")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	if includeCanceled != nil {
+		filter.IncludeCanceled = *includeCanceled
+	}
+	if filter.ErrorOnly {
+		filter.IncludeCanceled = true
+	}
+	if !parseUsageLogStatusFilter(c, &filter) {
+		return database.UsageLogFilter{}, false
+	}
+
+	return filter, true
+}
+
+// GetOpsErrorSummary 获取运维错误日志概览
+func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	result, err := h.db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageLogsErrorSummary 获取与请求记录筛选联动的错误摘要。
+func (h *Handler) GetUsageLogsErrorSummary(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	if startStr == "" || endStr == "" {
+		writeError(c, http.StatusBadRequest, "start/end 参数需要同时提供")
+		return
+	}
+	startTime, startErr := time.Parse(time.RFC3339, startStr)
+	endTime, endErr := time.Parse(time.RFC3339, endStr)
+	if startErr != nil || endErr != nil {
+		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		return
+	}
+
+	filter, ok := parseUsageLogsFilter(c, startTime, endTime)
+	if !ok {
+		return
+	}
+	result, err := h.db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetUsageLogs 获取使用日志
+func (h *Handler) GetUsageLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+
+	if startStr != "" && endStr != "" {
+		startTime, e1 := time.Parse(time.RFC3339, startStr)
+		endTime, e2 := time.Parse(time.RFC3339, endStr)
+		if e1 != nil || e2 != nil {
+			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+			return
+		}
+
+		// 有 page 参数 → 服务端分页（Usage 页面表格）
+		if c.Query("page") != "" {
+			filter, ok := parseUsageLogsFilter(c, startTime, endTime)
+			if !ok {
+				return
+			}
+
+			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
+			if err != nil {
+				writeInternalError(c, err)
+				return
+			}
+			c.JSON(http.StatusOK, result)
+			return
+		}
+
+		// 无 page 参数 → 返回全量（Dashboard 图表聚合）
+		logs, err := h.db.ListUsageLogsByTimeRange(ctx, startTime, endTime)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if logs == nil {
+			logs = []*database.UsageLog{}
+		}
+		c.JSON(http.StatusOK, usageLogsResponse{Logs: logs})
+		return
+	}
+
+	// 回退：limit 模式
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	logs, err := h.db.ListRecentUsageLogs(ctx, limit)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if logs == nil {
+		logs = []*database.UsageLog{}
+	}
+	c.JSON(http.StatusOK, usageLogsResponse{Logs: logs})
+}
+
+// ClearUsageLogs 清空所有使用日志
+func (h *Handler) ClearUsageLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if err := h.db.ClearUsageLogs(ctx); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.deleteRuntimeCache(ctx, adminUsageStatsCacheNamespace, "global")
+	h.chartCacheMu.Lock()
+	h.chartCacheData = make(map[string]*chartCacheEntry)
+	h.chartCacheMu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"message": "日志已清空"})
+}
+
+// ==================== API Keys ====================
+
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+func (h *Handler) ListAPIKeys(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	keys, err := h.db.ListAPIKeys(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	// 检查是否有任何 key 配置了窗口 cost limit
+	var need5h, need7d, need30d, needDaily bool
+	for _, k := range keys {
+		if k.Limits.CostLimit5h > 0 {
+			need5h = true
+		}
+		if k.Limits.CostLimit7d > 0 {
+			need7d = true
+		}
+		if k.Limits.CostLimit30d > 0 {
+			need30d = true
+		}
+		if k.Limits.CostLimitDaily > 0 {
+			needDaily = true
+		}
+	}
+
+	// 按需批量查询窗口用量
+	var cost5h, cost7d, cost30d, costToday map[int64]float64
+	if need5h {
+		cost5h, _ = h.db.GetAllAPIKeysWindowCost(ctx, 5*time.Hour)
+	}
+	if need7d {
+		cost7d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 7*24*time.Hour)
+	}
+	if need30d {
+		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
+	}
+	if needDaily {
+		costToday, _ = h.db.GetAllAPIKeysCostSince(ctx, database.StartOfDay(time.Now()))
+	}
+
+	// 最近使用时间：一次聚合，失败不阻断列表
+	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
+
+	// 转换为脱敏响应
+	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+	for _, k := range keys {
+		mk := NewMaskedAPIKeyRow(k)
+		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 || k.Limits.CostLimitDaily > 0 {
+			detail := &APIKeyWindowUsageDetail{}
+			if cost5h != nil {
+				detail.Cost5h = cost5h[k.ID]
+			}
+			if cost7d != nil {
+				detail.Cost7d = cost7d[k.ID]
+			}
+			if cost30d != nil {
+				detail.Cost30d = cost30d[k.ID]
+			}
+			if costToday != nil {
+				detail.CostToday = costToday[k.ID]
+			}
+			mk.WindowUsage = detail
+		}
+		if lastUsedByID != nil {
+			if lastUsed, ok := lastUsedByID[k.ID]; ok && !lastUsed.IsZero() {
+				formatted := lastUsed.Format(time.RFC3339)
+				mk.LastUsedAt = &formatted
+			}
+		}
+		maskedKeys = append(maskedKeys, mk)
+	}
+
+	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
+}
+
+type createKeyReq struct {
+	Name            string                 `json:"name"`
+	Key             string                 `json:"key"`
+	QuotaLimit      *float64               `json:"quota_limit"`
+	Quota           *float64               `json:"quota"`
+	ExpiresAt       string                 `json:"expires_at"`
+	ExpiresInDays   *int                   `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
+	Limits          *database.APIKeyLimits `json:"limits"`
+}
+
+// generateKey 生成随机 API Key
+func generateKey() string {
+	b := make([]byte, 24)
+	rand.Read(b)
+	return "sk-" + hex.EncodeToString(b)
+}
+
+// CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
+func (h *Handler) CreateAPIKey(c *gin.Context) {
+	var req createKeyReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Name = ""
+	}
+
+	// 输入验证和清理
+	req.Name = security.SanitizeInput(req.Name)
+	if req.Name == "" {
+		req.Name = "default"
+	}
+
+	// 验证名称长度
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	// 检查XSS
+	if security.ContainsXSS(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+
+	quotaLimit := 0.0
+	if req.Quota != nil {
+		quotaLimit = *req.Quota
+	}
+	if req.QuotaLimit != nil {
+		quotaLimit = *req.QuotaLimit
+	}
+	if quotaLimit < 0 {
+		writeError(c, http.StatusBadRequest, "额度限制不能小于 0")
+		return
+	}
+	if quotaLimit > 1000000000 {
+		writeError(c, http.StatusBadRequest, "额度限制过大")
+		return
+	}
+
+	expiresAt, err := parseAPIKeyExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	key := req.Key
+	if key == "" {
+		key = generateKey()
+	} else {
+		// 验证用户提供的key格式
+		key = security.SanitizeInput(key)
+		if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+			writeError(c, http.StatusBadRequest, "API Key格式无效")
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+
+	var limits database.APIKeyLimits
+	if req.Limits != nil {
+		limits = sanitizeAPIKeyLimits(*req.Limits)
+		limits.ModelRequestLimits, err = normalizeAdminAPIKeyModelRequestLimits(req.Limits.ModelRequestLimits, nil)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.validateAPIKeyGroupIDs(ctx, limits.NoAffinityGroupIDs, "limits.no_affinity_group_ids"); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.validateAPIKeyScopeLimits(ctx, limits.ScopeLimits); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:            req.Name,
+		Key:             key,
+		QuotaLimit:      quotaLimit,
+		ExpiresAt:       expiresAt,
+		AllowedGroupIDs: allowedGroupIDs.Values,
+		Limits:          limits,
+	})
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
+		return
+	}
+	if allowedGroupIDs.Set {
+		values := dedupeInt64(allowedGroupIDs.Values)
+		if h.store != nil {
+			h.store.SetAPIKeyAllowedGroups(id, values)
+		}
+	}
+	if h.store != nil {
+		h.store.SetAPIKeyNoAffinityGroups(id, limits.NoAffinityGroupIDs)
+		h.store.SetAPIKeyAllowedPlans(id, limits.PlanAllow)
+	}
+	// 新配的累计额度要立刻开始记账，不等落库侧的 60s 缓存过期。
+	h.db.InvalidateScopeQuotaKeyCache()
+	h.invalidateAPIKeyRuntimeCaches(ctx, key)
+
+	// 记录安全审计日志
+	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
+
+	var expiresAtResponse *string
+	if expiresAt.Valid {
+		formatted := expiresAt.Time.Format(time.RFC3339)
+		expiresAtResponse = &formatted
+	}
+	c.JSON(http.StatusOK, createAPIKeyResponse{
+		ID:              id,
+		Key:             key,
+		Name:            req.Name,
+		QuotaLimit:      quotaLimit,
+		QuotaUsed:       0,
+		ExpiresAt:       expiresAtResponse,
+		AllowedGroupIDs: dedupeInt64(allowedGroupIDs.Values),
+	})
+}
+
+type updateAPIKeyReq struct {
+	Name            *string                `json:"name"`
+	QuotaLimit      json.RawMessage        `json:"quota_limit"`
+	Quota           json.RawMessage        `json:"quota"`
+	ResetQuota      *bool                  `json:"reset_quota"`
+	ExpiresAt       json.RawMessage        `json:"expires_at"`
+	ExpiresInDays   *int                   `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
+	Limits          *database.APIKeyLimits `json:"limits"`
+	Enabled         *bool                  `json:"enabled"`
+}
+
+func (h *Handler) UpdateAPIKey(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+	var req updateAPIKeyReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	quotaLimit, quotaLimitSet, err := parseOptionalAPIKeyQuota(req.QuotaLimit, req.Quota)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	expiresAt, expiresAtSet, err := parseOptionalAPIKeyExpiration(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if req.Name != nil {
+		name := security.SanitizeInput(*req.Name)
+		if strings.TrimSpace(name) == "" {
+			writeError(c, http.StatusBadRequest, "名称不能为空")
+			return
+		}
+		if utf8.RuneCountInString(name) > 100 {
+			writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+			return
+		}
+		if security.ContainsXSS(name) {
+			writeError(c, http.StatusBadRequest, "名称包含非法字符")
+			return
+		}
+		req.Name = &name
+	}
+	if quotaLimitSet {
+		if quotaLimit > 1000000000 {
+			writeError(c, http.StatusBadRequest, "额度限制不能超过 1000000000")
+			return
+		}
+	}
+	var allowedGroupValues []int64
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+		allowedGroupValues = dedupeInt64(allowedGroupIDs.Values)
+	}
+	update := database.APIKeyUpdate{
+		QuotaLimit:         quotaLimit,
+		QuotaLimitSet:      quotaLimitSet,
+		ResetQuota:         req.ResetQuota != nil && *req.ResetQuota,
+		ExpiresAt:          expiresAt,
+		ExpiresAtSet:       expiresAtSet,
+		AllowedGroupIDs:    allowedGroupValues,
+		AllowedGroupIDsSet: allowedGroupIDs.Set,
+	}
+	if req.Name != nil {
+		update.Name = *req.Name
+		update.NameSet = true
+	}
+	if req.Enabled != nil {
+		update.Enabled = *req.Enabled
+		update.EnabledSet = true
+	}
+	if req.Limits != nil {
+		update.Limits = sanitizeAPIKeyLimits(*req.Limits)
+		update.Limits.ModelRequestLimits, err = normalizeAdminAPIKeyModelRequestLimits(req.Limits.ModelRequestLimits, row.Limits.ModelRequestLimits)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.validateAPIKeyGroupIDs(ctx, update.Limits.NoAffinityGroupIDs, "limits.no_affinity_group_ids"); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.validateAPIKeyScopeLimits(ctx, update.Limits.ScopeLimits); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		update.LimitsSet = true
+	}
+	if err := h.db.UpdateAPIKey(ctx, id, update); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if allowedGroupIDs.Set && h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
+	}
+	if update.LimitsSet && h.store != nil {
+		h.store.SetAPIKeyNoAffinityGroups(id, update.Limits.NoAffinityGroupIDs)
+		h.store.SetAPIKeyAllowedPlans(id, update.Limits.PlanAllow)
+	}
+	if update.LimitsSet {
+		h.db.InvalidateScopeQuotaKeyCache()
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+	savedLimits := row.Limits
+	if update.LimitsSet {
+		savedLimits = update.Limits
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "API Key 已更新", "limits": savedLimits})
+}
+
+// sanitizeAPIKeyLimits 把请求体里来的 limits 归一:负值置 0,空白模型名过滤,字符串小写。
+// 同时配置 ModelAllow + ModelDeny 时白名单优先(在 enforce 时已生效),这里不强制清空黑名单。
+func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
+	clean := func(items []string) []string {
+		if len(items) == 0 {
+			return nil
+		}
+		seen := make(map[string]struct{}, len(items))
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			lower := strings.ToLower(item)
+			if _, ok := seen[lower]; ok {
+				continue
+			}
+			seen[lower] = struct{}{}
+			out = append(out, item)
+		}
+		return out
+	}
+	out := database.APIKeyLimits{
+		ModelAllow:             clean(in.ModelAllow),
+		ModelDeny:              clean(in.ModelDeny),
+		PlanAllow:              cleanPlanAllow(in.PlanAllow),
+		NoAffinityGroupIDs:     dedupeInt64(in.NoAffinityGroupIDs),
+		RPM:                    maxInt(in.RPM, 0),
+		RPD:                    maxInt(in.RPD, 0),
+		MaxConcurrency:         maxInt(in.MaxConcurrency, 0),
+		CostLimit5h:            maxFloat(in.CostLimit5h, 0),
+		CostLimit7d:            maxFloat(in.CostLimit7d, 0),
+		CostLimit30d:           maxFloat(in.CostLimit30d, 0),
+		CostLimitDaily:         maxFloat(in.CostLimitDaily, 0),
+		TokenLimit5h:           maxInt64(in.TokenLimit5h, 0),
+		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
+		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
+		TokenLimitDaily:        maxInt64(in.TokenLimitDaily, 0),
+		DisableImageGeneration: in.DisableImageGeneration,
+		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
+		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		AllowLive:              in.AllowLive,
+		UpstreamChannel:        in.ResolveUpstreamChannel(),
+		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
+		ModelRequestLimits:     in.ModelRequestLimits,
+	}
+	// 归一后旧 bool 与新 policy 保持一致，避免两处配置漂移。
+	out.DisableImageGeneration = out.ImageGenerationPolicy == database.ImageGenerationPolicyBlock
+	if out.ImageGenerationPolicy == database.ImageGenerationPolicyAllow {
+		out.ImageGenerationPolicy = ""
+	}
+	return out
+}
+
+func (h *Handler) validateAPIKeyGroupIDs(ctx context.Context, groupIDs []int64, field string) error {
+	if len(groupIDs) == 0 {
+		return nil
+	}
+	missing, err := h.db.VerifyAccountGroupIDs(ctx, groupIDs)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s 包含不存在的分组 ID: %s", field, joinInt64s(missing))
+	}
+	return nil
+}
+
+// validateAPIKeyScopeLimits 校验分组 / 账号维度限额指向的 scope 真实存在（issue #439）。
+// 分组查 DB;账号查运行时账号池（回收站里的账号视为不存在）。指向错误的 ID 会让限额
+// 永远不触发，所以这里直接 400 而不是静默丢弃。
+func (h *Handler) validateAPIKeyScopeLimits(ctx context.Context, scopes []database.APIKeyScopeLimit) error {
+	if len(scopes) == 0 {
+		return nil
+	}
+	groupIDs := make([]int64, 0, len(scopes))
+	accountIDs := make([]int64, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope.ResolveScopeType() == database.APIKeyScopeTypeAccount {
+			accountIDs = append(accountIDs, scope.ScopeID)
+			continue
+		}
+		groupIDs = append(groupIDs, scope.ScopeID)
+	}
+	if len(groupIDs) > 0 {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, groupIDs)
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("limits.scope_limits 包含不存在的分组 ID: %s", joinInt64s(missing))
+		}
+	}
+	if len(accountIDs) > 0 && h.store != nil {
+		missing := make([]int64, 0)
+		for _, id := range accountIDs {
+			if h.store.FindByID(id) == nil {
+				missing = append(missing, id)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("limits.scope_limits 包含不存在的账号 ID: %s", joinInt64s(missing))
+		}
+	}
+	return nil
+}
+
+func joinInt64s(values []int64) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.FormatInt(value, 10))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// sanitizeImageGenerationPolicy 归一图片工具策略取值（allow/strip/block），并兼容旧的
+// DisableImageGeneration bool：显式 policy 优先，未设时 bool=true 视为 block。
+func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
+	switch strings.ToLower(strings.TrimSpace(in.ImageGenerationPolicy)) {
+	case database.ImageGenerationPolicyStrip:
+		return database.ImageGenerationPolicyStrip
+	case database.ImageGenerationPolicyBlock:
+		return database.ImageGenerationPolicyBlock
+	case database.ImageGenerationPolicyAllow:
+		return database.ImageGenerationPolicyAllow
+	}
+	if in.DisableImageGeneration {
+		return database.ImageGenerationPolicyBlock
+	}
+	return database.ImageGenerationPolicyAllow
+}
+
+// knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
+// Key 永远选不到账号。
+var knownAPIKeyPlanFilters = map[string]struct{}{
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	// Claude OAuth profile tiers. Keep these independent from Codex
+	// labels so a Claude-bound key's plan gate survives normalization.
+	"claude": {}, "max": {}, "max-5x": {}, "max-20x": {},
+	"enterprise": {}, "business": {},
+}
+
+// cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
+func cleanPlanAllow(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		plan := strings.ToLower(strings.TrimSpace(item))
+		if plan == "" {
+			continue
+		}
+		if _, ok := knownAPIKeyPlanFilters[plan]; !ok {
+			continue
+		}
+		if _, ok := seen[plan]; ok {
+			continue
+		}
+		seen[plan] = struct{}{}
+		out = append(out, plan)
+	}
+	return out
+}
+
+func maxInt(v, lo int) int {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
+func maxInt64(v, lo int64) int64 {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
+func maxFloat(v, lo float64) float64 {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
+func parseOptionalAPIKeyQuota(quotaLimitRaw, quotaRaw json.RawMessage) (float64, bool, error) {
+	raw := quotaLimitRaw
+	if len(raw) == 0 {
+		raw = quotaRaw
+	}
+	if len(raw) == 0 {
+		return 0, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, true, nil
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, true, fmt.Errorf("额度限制必须是数字")
+	}
+	if value < 0 {
+		return 0, true, fmt.Errorf("额度限制不能小于 0")
+	}
+	return value, true, nil
+}
+
+func parseOptionalAPIKeyExpiration(raw json.RawMessage, expiresInDays *int) (sql.NullTime, bool, error) {
+	if expiresInDays != nil {
+		expiresAt, err := parseAPIKeyExpiresAt("", expiresInDays)
+		return expiresAt, true, err
+	}
+	if len(raw) == 0 {
+		return sql.NullTime{}, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return sql.NullTime{}, true, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return sql.NullTime{}, true, fmt.Errorf("过期时间格式无效")
+	}
+	expiresAt, err := parseAPIKeyExpiresAt(value, nil)
+	return expiresAt, true, err
+}
+
+func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {
+	if expiresInDays != nil {
+		if *expiresInDays < 0 {
+			return sql.NullTime{}, fmt.Errorf("过期天数不能小于 0")
+		}
+		if *expiresInDays > 0 {
+			if *expiresInDays > 3650 {
+				return sql.NullTime{}, fmt.Errorf("过期天数不能超过 3650 天")
+			}
+			return sql.NullTime{Time: time.Now().AddDate(0, 0, *expiresInDays), Valid: true}, nil
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return sql.NullTime{}, nil
+	}
+	layouts := []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02"}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		if layout == time.RFC3339 {
+			parsed, err = time.Parse(layout, raw)
+		} else {
+			parsed, err = time.ParseInLocation(layout, raw, time.Local)
+		}
+		if err == nil {
+			if layout == "2006-01-02" {
+				parsed = parsed.Add(24*time.Hour - time.Nanosecond)
+			}
+			if !parsed.After(time.Now()) {
+				return sql.NullTime{}, fmt.Errorf("过期时间必须晚于当前时间")
+			}
+			return sql.NullTime{Time: parsed, Valid: true}, nil
+		}
+	}
+	return sql.NullTime{}, fmt.Errorf("过期时间格式无效")
+}
+
+// DeleteAPIKey 删除 API 密钥
+func (h *Handler) DeleteAPIKey(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	keyToInvalidate := ""
+	if row, err := h.db.GetAPIKeyByID(ctx, id); err == nil && row != nil {
+		keyToInvalidate = row.Key
+	}
+	if err := h.db.DeleteAPIKey(ctx, id); err != nil {
+		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
+		return
+	}
+	if h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, nil)
+		h.store.SetAPIKeyNoAffinityGroups(id, nil)
+		h.store.SetAPIKeyAllowedPlans(id, nil)
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
+	writeMessage(c, http.StatusOK, "已删除")
+}
+
+// ==================== Settings ====================
+
+type settingsResponse struct {
+	SiteName                            string `json:"site_name"`
+	SiteLogo                            string `json:"site_logo"`
+	BackgroundImage                     string `json:"background_image"`
+	BackgroundOpacity                   int    `json:"background_opacity"`
+	BackgroundBlur                      int    `json:"background_blur"`
+	BackgroundGlassOpacity              int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 int    `json:"background_glass_blur"`
+	MaxConcurrency                      int    `json:"max_concurrency"`
+	GlobalRPM                           int    `json:"global_rpm"`
+	TestModel                           string `json:"test_model"`
+	CodexImagesMainModel                string `json:"codex_images_main_model"`
+	CodexImagesDefaultMainModel         string `json:"codex_images_default_main_model"`
+	TestContent                         string `json:"test_content"`
+	TestConcurrency                     int    `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    int    `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               int    `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  bool   `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        int    `json:"recovery_probe_interval_minutes"`
+	LazyMode                            bool   `json:"lazy_mode"`
+	CodexOAuthKeepaliveEnabled          bool   `json:"codex_oauth_keepalive_enabled"`
+	ProxyURL                            string `json:"proxy_url"`
+	PgMaxConns                          int    `json:"pg_max_conns"`
+	RedisPoolSize                       int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized               bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                         string `json:"admin_secret"`
+	AdminAuthSource                     string `json:"admin_auth_source"`
+	AutoCleanFullUsage                  bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                      bool   `json:"auto_clean_error"`
+	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
+	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     string `json:"scheduler_engine"`
+	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
+	CodexRequestCompression             bool   `json:"codex_request_compression"`
+	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
+	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           bool   `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           bool   `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             int    `json:"codex_ws_silent_max_retries"`
+	CodexWSSizeRouterEnabled            bool   `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	GithubTokenConfigured               bool   `json:"github_token_configured"`
+	GithubProxyURL                      string `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       int    `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           int    `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          int    `json:"codex_overload_window_minutes"`
+	OverflowAutoCompactEnabled          bool   `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          bool   `json:"compact_via_responses_enabled"`
+	CodexPreflightSSEPassthroughEnabled bool   `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         bool   `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        bool   `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              int    `json:"codex_continue_max_rounds"`
+	UTLSShutdownTimeoutMinutes          int    `json:"utls_shutdown_timeout_minutes"`
+	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
+	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
+	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
+	CodexEffectiveCLIVersion          string   `json:"codex_effective_cli_version"`
+	SchedulerMode                     string   `json:"scheduler_mode"`
+	AffinityMode                      string   `json:"affinity_mode"`
+	SessionAffinitySpread             bool     `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled          bool     `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds          int      `json:"session_slot_buffer_seconds"`
+	MaxRetries                        int      `json:"max_retries"`
+	MaxRateLimitRetries               int      `json:"max_rate_limit_retries"`
+	RetryIntervalMS                   int      `json:"retry_interval_ms"`
+	TransportRetryPolicy              string   `json:"transport_retry_policy"`
+	ContinuousRetryEnabled            bool     `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll           bool     `json:"continuous_retry_catch_all"`
+	ContinuousRetryCategories         []string `json:"continuous_retry_categories"`
+	ContinuousRetryStatusCodes        []int    `json:"continuous_retry_status_codes"`
+	ContinuousRetryErrorCodes         []string `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds int      `json:"continuous_retry_max_duration_seconds"`
+	CodexFingerprintDefaultMode       string   `json:"codex_fingerprint_default_mode"`
+	AllowRemoteMigration              bool     `json:"allow_remote_migration"`
+	DatabaseDriver                    string   `json:"database_driver"`
+	DatabaseLabel                     string   `json:"database_label"`
+	CacheDriver                       string   `json:"cache_driver"`
+	CacheLabel                        string   `json:"cache_label"`
+	ExpiredCleaned                    int      `json:"expired_cleaned,omitempty"`
+	ModelMapping                      string   `json:"model_mapping"`
+	CodexModelMapping                 string   `json:"codex_model_mapping"`
+	PayloadRules                      string   `json:"payload_rules"`
+	ReasoningEffortModels             string   `json:"reasoning_effort_models"`
+	ResinURL                          string   `json:"resin_url"`
+	ResinPlatformName                 string   `json:"resin_platform_name"`
+	// CodexEgress 是后端权威的"Codex 渠道当前由谁承担出站"摘要:Resin 启用时代理池与
+	// proxy_url 对 Codex 不生效,界面据此标注,避免三套配置并存看不出谁在生效(issue #679)。
+	CodexEgress                      proxy.CodexEgressSummary `json:"codex_egress"`
+	ClientCompatMode                 string                   `json:"client_compat_mode"`
+	CodexMinCLIVersion               string                   `json:"codex_min_cli_version"`
+	CodexUserAgentConfig             string                   `json:"codex_user_agent_config"`
+	CodexTelemetryEnabled            bool                     `json:"codex_telemetry_enabled"`
+	CodexTelemetryTimingDebug        bool                     `json:"codex_telemetry_timing_debug"`
+	UsageLogMode                     string                   `json:"usage_log_mode"`
+	UsageLogBatchSize                int                      `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds     int                      `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                string                   `json:"stream_flush_policy"`
+	StreamFlushIntervalMS            int                      `json:"stream_flush_interval_ms"`
+	FirstTokenMode                   string                   `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds         int                      `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                string                   `json:"billing_tier_policy"`
+	ModelsListReadMaxBytes           int64                    `json:"models_list_read_max_bytes"`
+	ShowFullUsageNumbers             bool                     `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled        bool                     `json:"public_key_usage_page_enabled"`
+	PublicAccountPortalPageEnabled   bool                     `json:"public_account_portal_page_enabled"`
+	AutoPause5hThreshold             float64                  `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold             float64                  `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent      float64                  `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency      int                      `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled               bool                     `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency        int                      `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows               string                   `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus           bool                     `json:"ignore_usage_limit_status"`
+	ResponseCacheLocalMaxBytes       int64                    `json:"response_cache_local_max_bytes"`
+	ResponseCacheLocalMaxEntryBytes  int64                    `json:"response_cache_local_max_entry_bytes"`
+	ResponseCacheReconstructMaxBytes int64                    `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy         string                   `json:"response_cache_write_policy"`
+	ResponseCacheConfigGeneration    int64                    `json:"response_cache_config_generation"`
+	RelayModelCooldownMode           string                   `json:"relay_model_cooldown_mode"`
+	RelayModelCooldownSeconds        int                      `json:"relay_model_cooldown_seconds"`
+	RelayModelCooldownBackoffEnabled bool                     `json:"relay_model_cooldown_backoff_enabled"`
+	OAuthModelCooldownMode           string                   `json:"oauth_model_cooldown_mode"`
+	OAuthModelCooldownSeconds        int                      `json:"oauth_model_cooldown_seconds"`
+	OAuthModelCooldownBackoffEnabled bool                     `json:"oauth_model_cooldown_backoff_enabled"`
+}
+
+type rawJSON = json.RawMessage
+
+type updateSettingsReq struct {
+	SiteName                            *string   `json:"site_name"`
+	SiteLogo                            *string   `json:"site_logo"`
+	BackgroundImage                     *string   `json:"background_image"`
+	BackgroundOpacity                   *int      `json:"background_opacity"`
+	BackgroundBlur                      *int      `json:"background_blur"`
+	BackgroundGlassOpacity              *int      `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 *int      `json:"background_glass_blur"`
+	MaxConcurrency                      *int      `json:"max_concurrency"`
+	GlobalRPM                           *int      `json:"global_rpm"`
+	TestModel                           *string   `json:"test_model"`
+	CodexImagesMainModel                *string   `json:"codex_images_main_model"`
+	TestContent                         *string   `json:"test_content"`
+	TestConcurrency                     *int      `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    *int      `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             *int      `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               *int      `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  *bool     `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        *int      `json:"recovery_probe_interval_minutes"`
+	LazyMode                            *bool     `json:"lazy_mode"`
+	CodexOAuthKeepaliveEnabled          *bool     `json:"codex_oauth_keepalive_enabled"`
+	ProxyURL                            *string   `json:"proxy_url"`
+	PgMaxConns                          *int      `json:"pg_max_conns"`
+	RedisPoolSize                       *int      `json:"redis_pool_size"`
+	AutoCleanUnauthorized               *bool     `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                *bool     `json:"auto_clean_rate_limited"`
+	AdminSecret                         *string   `json:"admin_secret"`
+	AutoCleanFullUsage                  *bool     `json:"auto_clean_full_usage"`
+	AutoCleanError                      *bool     `json:"auto_clean_error"`
+	AutoCleanExpired                    *bool     `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             *bool     `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     *int      `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         *bool     `json:"auto_activate_5h_window_enabled"`
+	ProxyPoolEnabled                    *bool     `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                *bool     `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     *string   `json:"scheduler_engine"`
+	CodexForceWebsocket                 *bool     `json:"codex_force_websocket"`
+	CodexRequestCompression             *bool     `json:"codex_request_compression"`
+	CodexWSWeakNetworkMode              *bool     `json:"codex_ws_weak_network_mode"`
+	CodexWSKeepaliveEnabled             *bool     `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         *int      `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           *bool     `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           *bool     `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             *int      `json:"codex_ws_silent_max_retries"`
+	CodexWSSizeRouterEnabled            *bool     `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        *int      `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          *bool     `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              *int      `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               *int      `json:"codex_ws_stateless_slots"`
+	GithubToken                         *string   `json:"github_token"`
+	GithubProxyURL                      *string   `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           *bool     `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       *int      `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           *int      `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          *int      `json:"codex_overload_window_minutes"`
+	OverflowAutoCompactEnabled          *bool     `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          *bool     `json:"compact_via_responses_enabled"`
+	CodexPreflightSSEPassthroughEnabled *bool     `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         *bool     `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        *bool     `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              *int      `json:"codex_continue_max_rounds"`
+	UTLSShutdownTimeoutMinutes          *int      `json:"utls_shutdown_timeout_minutes"`
+	CodexCLIVersionSyncEnabled          *bool     `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    *int      `json:"codex_cli_version_sync_interval_hours"`
+	SchedulerMode                       *string   `json:"scheduler_mode"`
+	AffinityMode                        *string   `json:"affinity_mode"`
+	SessionAffinitySpread               *bool     `json:"session_affinity_spread"`
+	SessionSlotBufferEnabled            *bool     `json:"session_slot_buffer_enabled"`
+	SessionSlotBufferSeconds            *int      `json:"session_slot_buffer_seconds"`
+	MaxRetries                          *int      `json:"max_retries"`
+	MaxRateLimitRetries                 *int      `json:"max_rate_limit_retries"`
+	RetryIntervalMS                     *int      `json:"retry_interval_ms"`
+	TransportRetryPolicy                *string   `json:"transport_retry_policy"`
+	ContinuousRetryEnabled              *bool     `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll             *bool     `json:"continuous_retry_catch_all"`
+	ContinuousRetryCategories           *[]string `json:"continuous_retry_categories"`
+	ContinuousRetryStatusCodes          *[]int    `json:"continuous_retry_status_codes"`
+	ContinuousRetryErrorCodes           *[]string `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds   *int      `json:"continuous_retry_max_duration_seconds"`
+	CodexFingerprintDefaultMode         *string   `json:"codex_fingerprint_default_mode"`
+	AllowRemoteMigration                *bool     `json:"allow_remote_migration"`
+	ModelMapping                        *string   `json:"model_mapping"`
+	CodexModelMapping                   *string   `json:"codex_model_mapping"`
+	PayloadRules                        *string   `json:"payload_rules"`
+	ReasoningEffortModels               *string   `json:"reasoning_effort_models"`
+	ResinURL                            *string   `json:"resin_url"`
+	ResinPlatformName                   *string   `json:"resin_platform_name"`
+	ClientCompatMode                    *string   `json:"client_compat_mode"`
+	CodexMinCLIVersion                  *string   `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                *string   `json:"codex_user_agent_config"`
+	CodexTelemetryEnabled               *bool     `json:"codex_telemetry_enabled"`
+	CodexTelemetryTimingDebug           *bool     `json:"codex_telemetry_timing_debug"`
+	UsageLogMode                        *string   `json:"usage_log_mode"`
+	UsageLogBatchSize                   *int      `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds        *int      `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                   *string   `json:"stream_flush_policy"`
+	StreamFlushIntervalMS               *int      `json:"stream_flush_interval_ms"`
+	FirstTokenMode                      *string   `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds            *int      `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                   *string   `json:"billing_tier_policy"`
+	ModelsListReadMaxBytes              *int64    `json:"models_list_read_max_bytes"`
+	ShowFullUsageNumbers                *bool     `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled           *bool     `json:"public_key_usage_page_enabled"`
+	PublicAccountPortalPageEnabled      *bool     `json:"public_account_portal_page_enabled"`
+	AutoPause5hThreshold                *float64  `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                *float64  `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent         *float64  `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency         *int      `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                  *bool     `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency           *int      `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                  *string   `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus              *bool     `json:"ignore_usage_limit_status"`
+	ResponseCacheLocalMaxBytes          *int64    `json:"response_cache_local_max_bytes"`
+	ResponseCacheLocalMaxEntryBytes     *int64    `json:"response_cache_local_max_entry_bytes"`
+	ResponseCacheReconstructMaxBytes    *int64    `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheWritePolicy            *string   `json:"response_cache_write_policy"`
+	ResponseCacheConfigGeneration       rawJSON   `json:"response_cache_config_generation"`
+	RelayModelCooldownMode              *string   `json:"relay_model_cooldown_mode"`
+	RelayModelCooldownSeconds           *int      `json:"relay_model_cooldown_seconds"`
+	RelayModelCooldownBackoffEnabled    *bool     `json:"relay_model_cooldown_backoff_enabled"`
+	OAuthModelCooldownMode              *string   `json:"oauth_model_cooldown_mode"`
+	OAuthModelCooldownSeconds           *int      `json:"oauth_model_cooldown_seconds"`
+	OAuthModelCooldownBackoffEnabled    *bool     `json:"oauth_model_cooldown_backoff_enabled"`
+}
+
+type brandingResponse struct {
+	SiteName               string `json:"site_name"`
+	SiteLogo               string `json:"site_logo"`
+	BackgroundImage        string `json:"background_image"`
+	BackgroundOpacity      int    `json:"background_opacity"`
+	BackgroundBlur         int    `json:"background_blur"`
+	BackgroundGlassOpacity int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur    int    `json:"background_glass_blur"`
+}
+
+const maxSiteLogoBytes = 600 * 1024
+const maxBackgroundImageBytes = 2 * 1024 * 1024
+const maxBackgroundVideoBytes = 40 * 1024 * 1024
+const maxBackgroundImageAssetUploadBytes = 20 * 1024 * 1024
+const maxBackgroundVideoAssetUploadBytes = 40 * 1024 * 1024
+const maxBackgroundAssetUploadBytes = maxBackgroundVideoAssetUploadBytes
+const maxSiteLogoURLChars = 4096
+const maxBackgroundImageURLChars = 20000
+const defaultBackgroundOpacity = 18
+const maxBackgroundBlur = 24
+const defaultBackgroundGlassOpacity = 58
+const defaultBackgroundGlassBlur = 5
+const maxBackgroundGlassBlur = 20
+const defaultBackgroundAssetDir = "/data/backgrounds"
+const backgroundAssetURLPrefix = "/p/backgrounds/"
+
+type brandingBackgroundConfig struct {
+	Image        string `json:"image"`
+	Opacity      int    `json:"opacity"`
+	Blur         int    `json:"blur"`
+	GlassOpacity int    `json:"glass_opacity"`
+	GlassBlur    int    `json:"glass_blur"`
+}
+
+type backgroundAssetUploadResponse struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Bytes    int    `json:"bytes"`
+}
+
+func normalizeSiteLogo(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("网站图标 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("网站图标 base64 数据无效")
+		}
+		if len(decoded) > maxSiteLogoBytes {
+			return "", fmt.Errorf("网站图标不能超过 600KB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("网站图标仅支持 http(s) URL、站内路径或 data:image base64")
+	}
+}
+
+func normalizeBackgroundImage(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("背景图 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("背景图 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundImageBytes {
+			return "", fmt.Errorf("背景图不能超过 2MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "data:video/mp4") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("动态壁纸 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("动态壁纸 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundVideoBytes {
+			return "", fmt.Errorf("动态壁纸不能超过 40MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("背景仅支持 http(s) URL、站内路径、data:image base64 或 data:video/mp4 base64")
+	}
+}
+
+func backgroundAssetDir() string {
+	if dir := strings.TrimSpace(os.Getenv("BACKGROUND_ASSET_DIR")); dir != "" {
+		return dir
+	}
+	if dir := strings.TrimSpace(os.Getenv("IMAGE_ASSET_DIR")); dir != "" {
+		clean := filepath.Clean(dir)
+		parent := filepath.Dir(clean)
+		if parent != "." && parent != string(os.PathSeparator) {
+			return filepath.Join(parent, "backgrounds")
+		}
+		return filepath.Join(clean, "backgrounds")
+	}
+	if dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH")); dbPath != "" {
+		return filepath.Join(filepath.Dir(dbPath), "backgrounds")
+	}
+	return defaultBackgroundAssetDir
+}
+
+func backgroundAssetPath(filename string) (string, bool) {
+	name := filepath.Base(strings.TrimSpace(filename))
+	if name == "" || name == "." || name != strings.TrimSpace(filename) {
+		return "", false
+	}
+	dir, err := filepath.Abs(backgroundAssetDir())
+	if err != nil {
+		return "", false
+	}
+	full, err := filepath.Abs(filepath.Join(dir, name))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(dir, full)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return full, true
+}
+
+func backgroundAssetURL(filename string) string {
+	return backgroundAssetURLPrefix + filename
+}
+
+func validateConnectionTestContent(content string) (string, error) {
+	normalized := auth.NormalizeTestContent(content)
+	if len([]rune(normalized)) > auth.MaxTestContentRunes {
+		return "", fmt.Errorf("test_content 不能超过 %d 个字符", auth.MaxTestContentRunes)
+	}
+	return normalized, nil
+}
+
+func randomBackgroundAssetFilename(ext string) string {
+	ext = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(ext)), ".")
+	if ext == "" {
+		ext = "bin"
+	}
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d.%s", time.Now().UnixNano(), ext)
+	}
+	return fmt.Sprintf("%d-%s.%s", time.Now().UnixNano(), hex.EncodeToString(b), ext)
+}
+
+func declaredBackgroundMediaType(filename, contentType string) string {
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch contentType {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml", "video/mp4":
+		if contentType == "image/jpg" {
+			return "image/jpeg"
+		}
+		return contentType
+	}
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".mp4":
+		return "video/mp4"
+	default:
+		if byExt := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); byExt != "" {
+			return strings.ToLower(strings.TrimSpace(strings.Split(byExt, ";")[0]))
+		}
+		return ""
+	}
+}
+
+func looksLikeSVG(data []byte) bool {
+	sample := strings.ToLower(string(data))
+	return strings.Contains(sample, "<svg") && !strings.Contains(sample, "<script")
+}
+
+func looksLikeWebP(data []byte) bool {
+	return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+func looksLikeMP4(data []byte) bool {
+	return len(data) >= 12 && string(data[4:8]) == "ftyp"
+}
+
+func normalizeBackgroundUploadMedia(filename, contentType string, data []byte) (string, string, error) {
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("背景文件为空")
+	}
+	declared := declaredBackgroundMediaType(filename, contentType)
+	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+	switch detected {
+	case "image/png":
+		return "image/png", "png", nil
+	case "image/jpeg":
+		return "image/jpeg", "jpg", nil
+	case "image/webp":
+		return "image/webp", "webp", nil
+	}
+	switch declared {
+	case "image/webp":
+		if looksLikeWebP(data) {
+			return "image/webp", "webp", nil
+		}
+	case "image/svg+xml":
+		if looksLikeSVG(data) {
+			return "image/svg+xml", "svg", nil
+		}
+	case "video/mp4":
+		if looksLikeMP4(data) {
+			return "video/mp4", "mp4", nil
+		}
+	}
+	return "", "", fmt.Errorf("背景仅支持 PNG、JPG、WebP、SVG 或 MP4")
+}
+
+func backgroundUploadLimitBytes(mimeType string) int {
+	if mimeType == "video/mp4" {
+		return maxBackgroundVideoAssetUploadBytes
+	}
+	return maxBackgroundImageAssetUploadBytes
+}
+
+func backgroundUploadTooLargeMessage(mimeType string) string {
+	if mimeType == "video/mp4" {
+		return "MP4 动态壁纸不能超过 40MB"
+	}
+	return "背景图片不能超过 20MB"
+}
+
+func (h *Handler) UploadBackgroundAsset(c *gin.Context) {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "请选择背景文件")
+		return
+	}
+	if fh.Size <= 0 {
+		writeError(c, http.StatusBadRequest, "背景文件为空")
+		return
+	}
+	if fh.Size > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	file, err := fh.Open()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxBackgroundAssetUploadBytes+1))
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if len(data) > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	mimeType, ext, err := normalizeBackgroundUploadMedia(fh.Filename, fh.Header.Get("Content-Type"), data)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(data) > backgroundUploadLimitBytes(mimeType) {
+		writeError(c, http.StatusBadRequest, backgroundUploadTooLargeMessage(mimeType))
+		return
+	}
+
+	if err := os.MkdirAll(backgroundAssetDir(), 0o755); err != nil {
+		writeInternalError(c, fmt.Errorf("创建背景目录失败: %w", err))
+		return
+	}
+	filename := randomBackgroundAssetFilename(ext)
+	fullPath, ok := backgroundAssetPath(filename)
+	if !ok {
+		writeInternalError(c, fmt.Errorf("背景文件路径无效"))
+		return
+	}
+	if err := os.WriteFile(fullPath, data, 0o644); err != nil {
+		writeInternalError(c, fmt.Errorf("保存背景文件失败: %w", err))
+		return
+	}
+
+	c.JSON(http.StatusOK, backgroundAssetUploadResponse{
+		URL:      backgroundAssetURL(filename),
+		Filename: filename,
+		MimeType: mimeType,
+		Bytes:    len(data),
+	})
+}
+
+func (h *Handler) GetBackgroundAssetFile(c *gin.Context) {
+	fullPath, ok := backgroundAssetPath(c.Param("filename"))
+	if !ok {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.File(fullPath)
+}
+
+func normalizeBackgroundOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundBlur {
+		return maxBackgroundBlur
+	}
+	return value
+}
+
+func normalizeBackgroundGlassOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundGlassBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundGlassBlur {
+		return maxBackgroundGlassBlur
+	}
+	return value
+}
+
+func normalizeBackgroundConfig(cfg brandingBackgroundConfig) brandingBackgroundConfig {
+	image, err := normalizeBackgroundImage(cfg.Image)
+	if err != nil {
+		image = ""
+	}
+	opacity := normalizeBackgroundOpacity(cfg.Opacity)
+	if opacity == 0 && strings.TrimSpace(image) != "" && cfg.Opacity == 0 {
+		opacity = 0
+	}
+	return brandingBackgroundConfig{
+		Image:        image,
+		Opacity:      opacity,
+		Blur:         normalizeBackgroundBlur(cfg.Blur),
+		GlassOpacity: normalizeBackgroundGlassOpacity(cfg.GlassOpacity),
+		GlassBlur:    normalizeBackgroundGlassBlur(cfg.GlassBlur),
+	}
+}
+
+func defaultBackgroundConfig() brandingBackgroundConfig {
+	return brandingBackgroundConfig{
+		Opacity:      defaultBackgroundOpacity,
+		GlassOpacity: defaultBackgroundGlassOpacity,
+		GlassBlur:    defaultBackgroundGlassBlur,
+	}
+}
+
+func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
+	cfg := defaultBackgroundConfig()
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return cfg
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return defaultBackgroundConfig()
+	}
+	return normalizeBackgroundConfig(cfg)
+}
+
+func encodeBackgroundConfig(cfg brandingBackgroundConfig) string {
+	cfg = normalizeBackgroundConfig(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
+	resp := brandingResponse{SiteName: database.DefaultSiteName}
+	bg := defaultBackgroundConfig()
+	if settings == nil {
+		resp.BackgroundOpacity = bg.Opacity
+		resp.BackgroundGlassOpacity = bg.GlassOpacity
+		resp.BackgroundGlassBlur = bg.GlassBlur
+		return resp
+	}
+	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
+	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
+	bg = decodeBackgroundConfig(settings.BackgroundConfig)
+	resp.BackgroundImage = bg.Image
+	resp.BackgroundOpacity = bg.Opacity
+	resp.BackgroundBlur = bg.Blur
+	resp.BackgroundGlassOpacity = bg.GlassOpacity
+	resp.BackgroundGlassBlur = bg.GlassBlur
+	return resp
+}
+
+// GetBranding 获取公开站点品牌配置（无需管理密钥）。
+func (h *Handler) GetBranding(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	settings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		log.Printf("读取站点品牌配置失败: %v", err)
+		c.JSON(http.StatusOK, brandingFromSettings(nil))
+		return
+	}
+	c.JSON(http.StatusOK, brandingFromSettings(settings))
+}
+
+// GetSettings 获取当前系统设置
+// GetObservedInstructions 返回最近观测到的客户端透传 instructions 样本，
+// 供管理端在配置 payload 重写规则时查看客户端实际发来的系统提示词原文。
+func (h *Handler) GetObservedInstructions(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"samples": proxy.ObservedInstructions()})
+}
+
+func (h *Handler) GetSettings(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	cacheSettingsStore := h.cacheSettingsStore()
+	if cacheSettingsStore == nil {
+		writeError(c, http.StatusInternalServerError, "响应缓存设置存储不可用")
+		return
+	}
+	responseCacheSettings, err := cacheSettingsStore.GetResponseCacheSettings(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+err.Error())
+		return
+	}
+	dbSettings, _ := h.db.GetSystemSettings(ctx)
+	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
+	adminSecret := ""
+	var resinURL, resinPlatformName string
+	branding := brandingFromSettings(dbSettings)
+	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
+	publicAccountPortalPageEnabled := false
+	if dbSettings != nil && adminAuthSource != "env" {
+		adminSecret = dbSettings.AdminSecret
+	}
+	if dbSettings != nil {
+		resinURL = dbSettings.ResinURL
+		resinPlatformName = dbSettings.ResinPlatformName
+		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
+		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
+	}
+	runtimeCfg := proxy.CurrentRuntimeSettings()
+	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
+	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
+	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
+	if dbSettings != nil {
+		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
+		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
+		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
+	}
+	bgCfg := defaultBackgroundConfig()
+	if dbSettings != nil {
+		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
+	}
+	modelCooldownSettings := h.store.GetModelCooldownSettings()
+	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
+	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                            branding.SiteName,
+		SiteLogo:                            branding.SiteLogo,
+		BackgroundImage:                     bgCfg.Image,
+		BackgroundOpacity:                   bgCfg.Opacity,
+		BackgroundBlur:                      bgCfg.Blur,
+		BackgroundGlassOpacity:              bgCfg.GlassOpacity,
+		BackgroundGlassBlur:                 bgCfg.GlassBlur,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		CodexImagesMainModel:                runtimeCfg.CodexImagesMainModel,
+		CodexImagesDefaultMainModel:         proxy.ImagesDefaultMainModel(),
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
+		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
+		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
+		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
+		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
+		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
+		RelayModelCooldownBackoffEnabled:    modelCooldownSettings.RelayBackoffEnabled,
+		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
+		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
+		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         adminSecret,
+		AdminAuthSource:                     adminAuthSource,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		UTLSShutdownTimeoutMinutes:          utlsShutdownTimeoutMinutes,
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		ContinuousRetryEnabled:              continuousRetryPolicy.Enabled,
+		ContinuousRetryCatchAll:             continuousRetryPolicy.CatchAll,
+		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
+		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
+		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
+		ContinuousRetryMaxDurationSeconds:   continuousRetryPolicy.MaxDurationSeconds,
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                      h.databaseDriver,
+		DatabaseLabel:                       h.databaseLabel,
+		CacheDriver:                         h.cacheDriver,
+		CacheLabel:                          h.cacheLabel,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		CodexEgress:                         proxy.CurrentCodexEgressSummary(),
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		UsageLogMode:                        h.db.GetUsageLogMode(),
+		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
+		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
+	})
+}
+
+// UpdateSettings 更新系统设置（实时生效）
+func (h *Handler) UpdateSettings(c *gin.Context) {
+	var req updateSettingsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	if req.ResponseCacheConfigGeneration != nil {
+		writeError(c, http.StatusBadRequest, "response_cache_config_generation 为只读字段")
+		return
+	}
+	if req.CodexImagesMainModel != nil {
+		normalized, err := proxy.NormalizeImagesMainModel(*req.CodexImagesMainModel)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.CodexImagesMainModel = &normalized
+	}
+	modelCooldownUpdateRequested := req.RelayModelCooldownMode != nil ||
+		req.RelayModelCooldownSeconds != nil ||
+		req.RelayModelCooldownBackoffEnabled != nil ||
+		req.OAuthModelCooldownMode != nil ||
+		req.OAuthModelCooldownSeconds != nil ||
+		req.OAuthModelCooldownBackoffEnabled != nil
+	if req.RelayModelCooldownMode != nil && !database.IsValidModelCooldownMode(*req.RelayModelCooldownMode) {
+		writeError(c, http.StatusBadRequest, "relay_model_cooldown_mode 必须是 off、fixed 或 adaptive")
+		return
+	}
+	if req.OAuthModelCooldownMode != nil && !database.IsValidModelCooldownMode(*req.OAuthModelCooldownMode) {
+		writeError(c, http.StatusBadRequest, "oauth_model_cooldown_mode 必须是 off、fixed 或 adaptive")
+		return
+	}
+	for field, value := range map[string]*int{
+		"relay_model_cooldown_seconds": req.RelayModelCooldownSeconds,
+		"oauth_model_cooldown_seconds": req.OAuthModelCooldownSeconds,
+	} {
+		if value != nil && (*value < 1 || *value > database.MaxModelCooldownSeconds) {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 必须在 1-%d 之间", field, database.MaxModelCooldownSeconds))
+			return
+		}
+	}
+	if req.AutoPause5hThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.AutoPause7dThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_7d_threshold", *req.AutoPause7dThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	if req.AutoPause5hGuardBandPercent != nil {
+		if *req.AutoPause5hGuardBandPercent < 0 || *req.AutoPause5hGuardBandPercent > 100 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_band_percent 需在 0 到 100 之间")
+			return
+		}
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		if *req.AutoPause5hGuardConcurrency < 0 || *req.AutoPause5hGuardConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_concurrency 需在 0 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		if *req.SmartPacingMinConcurrency < 1 || *req.SmartPacingMinConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "smart_pacing_min_concurrency 需在 1 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingWindows != nil {
+		switch strings.ToLower(strings.TrimSpace(*req.SmartPacingWindows)) {
+		case "5h,7d", "7d,5h", "5h", "7d", "":
+		default:
+			writeError(c, http.StatusBadRequest, "smart_pacing_windows 仅支持 5h,7d / 5h / 7d")
+			return
+		}
+	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		if *req.AutoResetCreditsBeforeExpiryMin < 10 || *req.AutoResetCreditsBeforeExpiryMin > 10080 {
+			writeError(c, http.StatusBadRequest, "auto_reset_credits_before_expiry_min 需在 10 到 10080 分钟之间")
+			return
+		}
+	}
+
+	responseCacheUpdate := database.ResponseCacheSettingsUpdate{
+		LocalMaxBytes:       req.ResponseCacheLocalMaxBytes,
+		LocalMaxEntryBytes:  req.ResponseCacheLocalMaxEntryBytes,
+		ReconstructMaxBytes: req.ResponseCacheReconstructMaxBytes,
+		WritePolicy:         req.ResponseCacheWritePolicy,
+	}
+	responseCacheUpdateRequested := responseCacheUpdate.LocalMaxBytes != nil ||
+		responseCacheUpdate.LocalMaxEntryBytes != nil ||
+		responseCacheUpdate.ReconstructMaxBytes != nil ||
+		responseCacheUpdate.WritePolicy != nil
+	if err := validateResponseCacheSettingsUpdateRanges(responseCacheUpdate); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	cacheSettingsStore := h.cacheSettingsStore()
+	if cacheSettingsStore == nil {
+		writeError(c, http.StatusInternalServerError, "响应缓存设置存储不可用")
+		return
+	}
+	responseCacheSettings, err := cacheSettingsStore.GetResponseCacheSettings(c.Request.Context())
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+err.Error())
+		return
+	}
+	if responseCacheUpdate.LocalMaxBytes != nil {
+		responseCacheSettings.LocalMaxBytes = *responseCacheUpdate.LocalMaxBytes
+	}
+	if responseCacheUpdate.LocalMaxEntryBytes != nil {
+		responseCacheSettings.LocalMaxEntryBytes = *responseCacheUpdate.LocalMaxEntryBytes
+	}
+	if responseCacheUpdate.ReconstructMaxBytes != nil {
+		responseCacheSettings.ReconstructMaxBytes = *responseCacheUpdate.ReconstructMaxBytes
+	}
+	if err := database.ValidateResponseCacheSettings(responseCacheSettings); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	currentAdminSecret := ""
+	siteName := database.DefaultSiteName
+	siteLogo := ""
+	bgCfg := defaultBackgroundConfig()
+	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
+	publicAccountPortalPageEnabled := false
+	modelPricingOverrides := "{}"
+	modelPricingSyncURL := ""
+	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsBeforeExpiryMin := 60
+	persistedAutoActivate5hWindowEnabled := false
+	codexImagesMainModel := ""
+	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
+	modelsListReadMaxBytes := database.DefaultModelsListReadMaxBytes
+	sessionSlotBufferEnabled := h.store.SessionSlotBufferEnabled()
+	sessionSlotBufferSeconds := database.NormalizeSessionSlotBufferSeconds(int(h.store.GetSessionSlotBuffer() / time.Second))
+	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
+	if settingsErr != nil {
+		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
+		return
+	}
+	if existingSettings != nil {
+		currentAdminSecret = existingSettings.AdminSecret
+		siteName = database.NormalizeSiteName(existingSettings.SiteName)
+		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
+		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
+		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
+		publicAccountPortalPageEnabled = existingSettings.PublicAccountPortalPageEnabled
+		modelPricingOverrides = existingSettings.ModelPricingOverrides
+		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
+		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
+		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
+		codexImagesMainModel = existingSettings.CodexImagesMainModel
+		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
+		modelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(existingSettings.ModelsListReadMaxBytes)
+		sessionSlotBufferEnabled = existingSettings.SessionSlotBufferEnabled
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(existingSettings.SessionSlotBufferSeconds)
+	}
+	if req.SessionSlotBufferEnabled != nil {
+		sessionSlotBufferEnabled = *req.SessionSlotBufferEnabled
+	}
+	if req.CodexImagesMainModel != nil {
+		codexImagesMainModel = *req.CodexImagesMainModel
+	}
+	if req.SessionSlotBufferSeconds != nil {
+		sessionSlotBufferSeconds = database.NormalizeSessionSlotBufferSeconds(*req.SessionSlotBufferSeconds)
+	}
+	modelsListReadLimitChanged := false
+	if req.ModelsListReadMaxBytes != nil {
+		if err := database.ValidateModelsListReadMaxBytes(*req.ModelsListReadMaxBytes); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		modelsListReadLimitChanged = *req.ModelsListReadMaxBytes != modelsListReadMaxBytes
+	}
+	if req.AdminSecret != nil {
+		if h.adminSecretEnv == "" {
+			currentAdminSecret = *req.AdminSecret
+			log.Printf("设置已更新: admin_secret (长度=%d)", len(currentAdminSecret))
+		} else {
+			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
+		}
+	}
+	if req.SiteName != nil {
+		siteName = database.NormalizeSiteName(*req.SiteName)
+		log.Printf("设置已更新: site_name = %s", siteName)
+	}
+	if req.SiteLogo != nil {
+		normalized, err := normalizeSiteLogo(*req.SiteLogo)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		siteLogo = normalized
+		log.Printf("设置已更新: site_logo (长度=%d)", len(siteLogo))
+	}
+	if req.BackgroundImage != nil {
+		normalized, err := normalizeBackgroundImage(*req.BackgroundImage)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		bgCfg.Image = normalized
+		log.Printf("设置已更新: background_image (长度=%d)", len(bgCfg.Image))
+	}
+	if req.BackgroundOpacity != nil {
+		bgCfg.Opacity = normalizeBackgroundOpacity(*req.BackgroundOpacity)
+		log.Printf("设置已更新: background_opacity = %d", bgCfg.Opacity)
+	}
+	if req.BackgroundBlur != nil {
+		bgCfg.Blur = normalizeBackgroundBlur(*req.BackgroundBlur)
+		log.Printf("设置已更新: background_blur = %d", bgCfg.Blur)
+	}
+	if req.BackgroundGlassOpacity != nil {
+		bgCfg.GlassOpacity = normalizeBackgroundGlassOpacity(*req.BackgroundGlassOpacity)
+		log.Printf("设置已更新: background_glass_opacity = %d", bgCfg.GlassOpacity)
+	}
+	if req.BackgroundGlassBlur != nil {
+		bgCfg.GlassBlur = normalizeBackgroundGlassBlur(*req.BackgroundGlassBlur)
+		log.Printf("设置已更新: background_glass_blur = %d", bgCfg.GlassBlur)
+	}
+	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
+	runtimeCfg := proxy.CurrentRuntimeSettings()
+	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
+	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
+	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
+	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
+	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
+	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
+	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
+	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
+	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
+		Enabled:            req.ContinuousRetryEnabled,
+		CatchAll:           req.ContinuousRetryCatchAll,
+		Categories:         req.ContinuousRetryCategories,
+		StatusCodes:        req.ContinuousRetryStatusCodes,
+		ErrorCodes:         req.ContinuousRetryErrorCodes,
+		MaxDurationSeconds: req.ContinuousRetryMaxDurationSeconds,
+	}
+	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil || req.ContinuousRetryMaxDurationSeconds != nil
+	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
+	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
+	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
+	usageLogMode := h.db.GetUsageLogMode()
+	usageLogBatchSize := h.db.GetUsageLogBatchSize()
+	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
+
+	if req.MaxConcurrency != nil {
+		v := *req.MaxConcurrency
+		if v < 1 {
+			v = 1
+		}
+		// 不再设上限：由运营按机器与上游承载自行决定
+		h.store.SetMaxConcurrency(v)
+		log.Printf("设置已更新: max_concurrency = %d", v)
+	}
+
+	if req.GlobalRPM != nil {
+		v := *req.GlobalRPM
+		if v < 0 {
+			v = 0
+		}
+		h.rateLimiter.UpdateRPM(v)
+		log.Printf("设置已更新: global_rpm = %d", v)
+	}
+
+	if req.TestModel != nil && *req.TestModel != "" {
+		h.store.SetTestModel(*req.TestModel)
+		log.Printf("设置已更新: test_model = %s", *req.TestModel)
+	}
+
+	if req.TestContent != nil {
+		testContent, err := validateConnectionTestContent(*req.TestContent)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetTestContent(testContent)
+		log.Printf("设置已更新: test_content (长度=%d)", len([]rune(testContent)))
+	}
+
+	if req.TestConcurrency != nil {
+		v := *req.TestConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 200 {
+			v = 200
+		}
+		h.store.SetTestConcurrency(v)
+		log.Printf("设置已更新: test_concurrency = %d", v)
+	}
+
+	if req.BackgroundRefreshIntervalMinutes != nil {
+		v := *req.BackgroundRefreshIntervalMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 1440 {
+			v = 1440
+		}
+		h.store.SetBackgroundRefreshInterval(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: background_refresh_interval_minutes = %d", v)
+	}
+
+	if req.UsageProbeMaxAgeMinutes != nil {
+		v := *req.UsageProbeMaxAgeMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 10080 {
+			v = 10080
+		}
+		h.store.SetUsageProbeMaxAge(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: usage_probe_max_age_minutes = %d", v)
+	}
+
+	if req.UsageProbeConcurrency != nil {
+		v := *req.UsageProbeConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 128 {
+			v = 128
+		}
+		h.store.SetUsageProbeConcurrency(v)
+		log.Printf("设置已更新: usage_probe_concurrency = %d", v)
+	}
+
+	if req.UsageProbeResponsesFallbackEnabled != nil {
+		h.store.SetUsageProbeResponsesFallbackEnabled(*req.UsageProbeResponsesFallbackEnabled)
+		log.Printf("设置已更新: usage_probe_responses_fallback_enabled = %t", *req.UsageProbeResponsesFallbackEnabled)
+	}
+
+	if req.RecoveryProbeIntervalMinutes != nil {
+		v := *req.RecoveryProbeIntervalMinutes
+		if v < 1 {
+			v = 1
+		}
+		if v > 10080 {
+			v = 10080
+		}
+		h.store.SetRecoveryProbeInterval(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: recovery_probe_interval_minutes = %d", v)
+	}
+
+	if req.CodexOAuthKeepaliveEnabled != nil {
+		h.store.SetCodexOAuthKeepalive(*req.CodexOAuthKeepaliveEnabled)
+	}
+	if req.LazyMode != nil {
+		h.store.SetLazyMode(*req.LazyMode)
+		log.Printf("设置已更新: lazy_mode = %t", *req.LazyMode)
+	}
+
+	if req.ProxyURL != nil {
+		h.store.SetProxyURL(*req.ProxyURL)
+		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
+	}
+
+	if req.PgMaxConns != nil {
+		v := *req.PgMaxConns
+		if v < 5 {
+			v = 5
+		}
+		if v > 5000 {
+			v = 5000
+		}
+		h.db.SetMaxOpenConns(v)
+		h.pgMaxConns = v
+		log.Printf("设置已更新: pg_max_conns = %d", v)
+	}
+
+	if req.RedisPoolSize != nil {
+		v := *req.RedisPoolSize
+		if v < 5 {
+			v = 5
+		}
+		if v > 5000 {
+			v = 5000
+		}
+		h.cache.SetPoolSize(v)
+		h.redisPoolSize = v
+		log.Printf("设置已更新: redis_pool_size = %d", v)
+	}
+
+	if req.AutoCleanUnauthorized != nil {
+		h.store.SetAutoCleanUnauthorized(*req.AutoCleanUnauthorized)
+		log.Printf("设置已更新: auto_clean_unauthorized = %t", *req.AutoCleanUnauthorized)
+	}
+
+	if req.AutoCleanRateLimited != nil {
+		h.store.SetAutoCleanRateLimited(*req.AutoCleanRateLimited)
+		log.Printf("设置已更新: auto_clean_rate_limited = %t", *req.AutoCleanRateLimited)
+	}
+
+	if req.AutoCleanFullUsage != nil {
+		h.store.SetAutoCleanFullUsage(*req.AutoCleanFullUsage)
+		log.Printf("设置已更新: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
+	}
+
+	if req.AutoCleanError != nil {
+		h.store.SetAutoCleanError(*req.AutoCleanError)
+		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
+	}
+
+	var expiredCleaned int
+	if req.AutoCleanExpired != nil {
+		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
+		log.Printf("设置已更新: auto_clean_expired = %t", *req.AutoCleanExpired)
+		// 开启时立即同步执行一次清理
+		if *req.AutoCleanExpired {
+			expiredCleaned = h.store.CleanExpiredNow()
+		}
+	}
+
+	if req.ProxyPoolEnabled != nil {
+		if *req.ProxyPoolEnabled {
+			if err := h.store.ReloadProxyPool(); err != nil {
+				writeError(c, http.StatusInternalServerError, "代理池刷新失败: "+err.Error())
+				return
+			}
+		}
+		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
+		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
+	}
+
+	if req.SchedulerEngine != nil {
+		engine := strings.ToLower(strings.TrimSpace(*req.SchedulerEngine))
+		if engine != "legacy" && engine != "shadow" && engine != "indexed" {
+			writeError(c, http.StatusBadRequest, "scheduler_engine 必须是 legacy、shadow 或 indexed")
+			return
+		}
+		h.store.SetSchedulerEngine(engine)
+		log.Printf("设置已更新: scheduler_engine = %s", engine)
+	} else if req.FastSchedulerEnabled != nil {
+		h.store.SetFastSchedulerEnabled(*req.FastSchedulerEnabled)
+		log.Printf("设置已更新: fast_scheduler_enabled = %t", *req.FastSchedulerEnabled)
+	}
+
+	if req.CodexForceWebsocket != nil {
+		h.store.SetCodexForceWebsocket(*req.CodexForceWebsocket)
+		runtimeCfg.CodexForceWebsocket = *req.CodexForceWebsocket
+		log.Printf("设置已更新: codex_force_websocket = %t", *req.CodexForceWebsocket)
+	}
+	if req.CodexRequestCompression != nil {
+		h.store.SetCodexRequestCompression(*req.CodexRequestCompression)
+		runtimeCfg.CodexRequestCompression = *req.CodexRequestCompression
+		log.Printf("设置已更新: codex_request_compression = %t", *req.CodexRequestCompression)
+	}
+
+	if req.CodexWSWeakNetworkMode != nil {
+		runtimeCfg.CodexWSWeakNetworkMode = *req.CodexWSWeakNetworkMode
+		log.Printf("设置已更新: codex_ws_weak_network_mode = %t", *req.CodexWSWeakNetworkMode)
+	}
+
+	if req.CodexWSKeepaliveEnabled != nil {
+		h.store.SetCodexWSKeepaliveEnabled(*req.CodexWSKeepaliveEnabled)
+		log.Printf("设置已更新: codex_ws_keepalive_enabled = %t", *req.CodexWSKeepaliveEnabled)
+	}
+
+	if req.CodexWSKeepaliveIntervalSec != nil {
+		h.store.SetCodexWSKeepaliveIntervalSec(*req.CodexWSKeepaliveIntervalSec)
+		log.Printf("设置已更新: codex_ws_keepalive_interval_sec = %d", *req.CodexWSKeepaliveIntervalSec)
+	}
+
+	if req.CodexWSHideUpstreamErrors != nil {
+		h.store.SetCodexWSHideUpstreamErrors(*req.CodexWSHideUpstreamErrors)
+		runtimeCfg.CodexWSHideErrors = *req.CodexWSHideUpstreamErrors
+		log.Printf("设置已更新: codex_ws_hide_upstream_errors = %t", *req.CodexWSHideUpstreamErrors)
+	}
+
+	if req.CodexWSSilentRetryEnabled != nil {
+		h.store.SetCodexWSSilentRetryEnabled(*req.CodexWSSilentRetryEnabled)
+		runtimeCfg.CodexWSSilentRetry = *req.CodexWSSilentRetryEnabled
+		log.Printf("设置已更新: codex_ws_silent_retry_enabled = %t", *req.CodexWSSilentRetryEnabled)
+	}
+
+	if req.CodexWSSizeRouterEnabled != nil {
+		h.store.SetCodexWSSizeRouterEnabled(*req.CodexWSSizeRouterEnabled)
+		runtimeCfg.CodexWSSizeRouter = *req.CodexWSSizeRouterEnabled
+		log.Printf("设置已更新: codex_ws_size_router_enabled = %t", *req.CodexWSSizeRouterEnabled)
+	}
+
+	if req.CodexWSSilentMaxRetries != nil {
+		v := *req.CodexWSSilentMaxRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetCodexWSSilentMaxRetries(v)
+		runtimeCfg.CodexWSSilentRetries = v
+		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
+	}
+
+	if req.CodexWSBusyAcquireMaxWaitSec != nil {
+		v := database.NormalizeCodexWSBusyAcquireMaxWaitSec(*req.CodexWSBusyAcquireMaxWaitSec)
+		h.store.SetCodexWSBusyAcquireMaxWaitSec(v)
+		runtimeCfg.CodexWSBusyMaxWaitSec = v
+		log.Printf("设置已更新: codex_ws_busy_acquire_max_wait_sec = %d", v)
+	}
+
+	if req.CodexWSBusyOverflowEnabled != nil {
+		h.store.SetCodexWSBusyOverflowEnabled(*req.CodexWSBusyOverflowEnabled)
+		runtimeCfg.CodexWSBusyOverflow = *req.CodexWSBusyOverflowEnabled
+		log.Printf("设置已更新: codex_ws_busy_overflow_enabled = %t", *req.CodexWSBusyOverflowEnabled)
+	}
+
+	if req.CodexWSBusyPatienceSec != nil {
+		v := database.NormalizeCodexWSBusyPatienceSec(*req.CodexWSBusyPatienceSec)
+		h.store.SetCodexWSBusyPatienceSec(v)
+		runtimeCfg.CodexWSBusyPatienceSec = v
+		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
+	}
+
+	if req.CodexWSStatelessSlots != nil {
+		v := database.NormalizeCodexWSStatelessSlots(*req.CodexWSStatelessSlots)
+		h.store.SetCodexWSStatelessSlots(v)
+		runtimeCfg.CodexWSStatelessSlots = v
+		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
+	}
+
+	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
+	if req.GithubToken != nil {
+		v := strings.TrimSpace(*req.GithubToken)
+		h.store.SetGithubToken(v)
+		runtimeCfg.GithubToken = v
+		log.Printf("设置已更新: github_token configured=%t", v != "")
+	}
+	if req.GithubProxyURL != nil {
+		v := strings.TrimSpace(*req.GithubProxyURL)
+		h.store.SetGithubProxyURL(v)
+		runtimeCfg.GithubProxyURL = v
+		log.Printf("设置已更新: github_proxy_url = %s", v)
+	}
+
+	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
+	if req.CodexOverloadPauseEnabled != nil {
+		runtimeCfg.CodexOverloadPauseEnabled = *req.CodexOverloadPauseEnabled
+		log.Printf("设置已更新: codex_overload_pause_enabled = %t", *req.CodexOverloadPauseEnabled)
+	}
+	if req.CodexOverloadThresholdPercent != nil {
+		v := database.NormalizeCodexOverloadThresholdPercent(*req.CodexOverloadThresholdPercent)
+		runtimeCfg.CodexOverloadThresholdPercent = v
+		log.Printf("设置已更新: codex_overload_threshold_percent = %d", v)
+	}
+	if req.CodexOverloadPauseMinutes != nil {
+		v := database.NormalizeCodexOverloadPauseMinutes(*req.CodexOverloadPauseMinutes)
+		runtimeCfg.CodexOverloadPauseMinutes = v
+		log.Printf("设置已更新: codex_overload_pause_minutes = %d", v)
+	}
+	if req.CodexOverloadWindowMinutes != nil {
+		v := database.NormalizeCodexOverloadWindowMinutes(*req.CodexOverloadWindowMinutes)
+		runtimeCfg.CodexOverloadWindowMinutes = v
+		log.Printf("设置已更新: codex_overload_window_minutes = %d", v)
+	}
+
+	if req.OverflowAutoCompactEnabled != nil {
+		h.store.SetOverflowAutoCompactEnabled(*req.OverflowAutoCompactEnabled)
+		runtimeCfg.OverflowAutoCompact = *req.OverflowAutoCompactEnabled
+		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
+	}
+
+	if req.CompactViaResponsesEnabled != nil {
+		h.store.SetCompactViaResponsesEnabled(*req.CompactViaResponsesEnabled)
+		runtimeCfg.CompactViaResponses = *req.CompactViaResponsesEnabled
+		log.Printf("设置已更新: compact_via_responses_enabled = %t", *req.CompactViaResponsesEnabled)
+	}
+
+	if req.CodexPreflightSSEPassthroughEnabled != nil {
+		h.store.SetCodexPreflightSSEPassthroughEnabled(*req.CodexPreflightSSEPassthroughEnabled)
+		runtimeCfg.CodexPreflightSSEPassthrough = *req.CodexPreflightSSEPassthroughEnabled
+		log.Printf("设置已更新: codex_preflight_sse_passthrough_enabled = %t", *req.CodexPreflightSSEPassthroughEnabled)
+	}
+
+	if req.FirstTokenExcludesWsAcquire != nil {
+		h.store.SetFirstTokenExcludesWsAcquire(*req.FirstTokenExcludesWsAcquire)
+		runtimeCfg.FirstTokenExcludesWsAcquire = *req.FirstTokenExcludesWsAcquire
+		log.Printf("设置已更新: first_token_excludes_ws_acquire = %t", *req.FirstTokenExcludesWsAcquire)
+	}
+
+	if req.CodexContinueThinkingEnabled != nil {
+		h.store.SetCodexContinueThinkingEnabled(*req.CodexContinueThinkingEnabled)
+		runtimeCfg.CodexContinueThinking = *req.CodexContinueThinkingEnabled
+		log.Printf("设置已更新: codex_continue_thinking_enabled = %t", *req.CodexContinueThinkingEnabled)
+	}
+
+	if req.CodexContinueMaxRounds != nil {
+		v := database.NormalizeCodexContinueMaxRounds(*req.CodexContinueMaxRounds)
+		h.store.SetCodexContinueMaxRounds(v)
+		runtimeCfg.CodexContinueMaxRounds = v
+		log.Printf("设置已更新: codex_continue_max_rounds = %d", v)
+	}
+
+	if req.UTLSShutdownTimeoutMinutes != nil {
+		v := database.NormalizeUTLSShutdownTimeoutMinutes(*req.UTLSShutdownTimeoutMinutes)
+		runtimeCfg.UTLSShutdownTimeoutMin = v
+		utlsShutdownTimeoutMinutes = v
+		log.Printf("设置已更新: utls_shutdown_timeout_minutes = %d", v)
+	}
+
+	if req.CodexCLIVersionSyncEnabled != nil {
+		h.store.SetCodexCLIVersionSyncEnabled(*req.CodexCLIVersionSyncEnabled)
+		runtimeCfg.CodexCLIVersionSyncEnabled = *req.CodexCLIVersionSyncEnabled
+		log.Printf("设置已更新: codex_cli_version_sync_enabled = %t", *req.CodexCLIVersionSyncEnabled)
+	}
+
+	if req.CodexCLIVersionSyncIntervalHours != nil {
+		v := database.NormalizeCodexCLIVersionSyncIntervalHours(*req.CodexCLIVersionSyncIntervalHours)
+		h.store.SetCodexCLIVersionSyncIntervalHours(v)
+		runtimeCfg.CodexCLIVersionSyncIntervalHours = v
+		log.Printf("设置已更新: codex_cli_version_sync_interval_hours = %d", v)
+	}
+
+	if req.SchedulerMode != nil {
+		h.store.SetSchedulerMode(*req.SchedulerMode)
+		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
+	}
+
+	if req.AffinityMode != nil {
+		h.store.SetAffinityMode(*req.AffinityMode)
+		log.Printf("设置已更新: affinity_mode = %s", *req.AffinityMode)
+	}
+	if req.SessionAffinitySpread != nil {
+		h.store.SetSessionAffinitySpread(*req.SessionAffinitySpread)
+		log.Printf("设置已更新: session_affinity_spread = %t", *req.SessionAffinitySpread)
+	}
+	if req.MaxRetries != nil {
+		v := *req.MaxRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetMaxRetries(v)
+		log.Printf("设置已更新: max_retries = %d", v)
+	}
+
+	if req.MaxRateLimitRetries != nil {
+		v := *req.MaxRateLimitRetries
+		if v < 0 {
+			v = 0
+		}
+		if v > 10 {
+			v = 10
+		}
+		h.store.SetMaxRateLimitRetries(v)
+		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
+	}
+
+	if req.RetryIntervalMS != nil {
+		v := *req.RetryIntervalMS
+		if v < 0 {
+			v = 0
+		}
+		if v > 30000 {
+			v = 30000
+		}
+		h.store.SetRetryIntervalMS(v)
+		log.Printf("设置已更新: retry_interval_ms = %d", v)
+	}
+
+	if req.TransportRetryPolicy != nil {
+		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
+		h.store.SetTransportRetryPolicy(v)
+		log.Printf("设置已更新: transport_retry_policy = %s", v)
+	}
+
+	if req.CodexFingerprintDefaultMode != nil {
+		if err := validateCodexFingerprintMode(*req.CodexFingerprintDefaultMode); err != nil {
+			writeError(c, http.StatusBadRequest, "codex_fingerprint_default_mode "+err.Error())
+			return
+		}
+		v := auth.NormalizeCodexFingerprintMode(*req.CodexFingerprintDefaultMode)
+		h.store.SetCodexFingerprintDefaultMode(v)
+		log.Printf("设置已更新: codex_fingerprint_default_mode = %s", v)
+	}
+
+	if req.AllowRemoteMigration != nil {
+		if *req.AllowRemoteMigration && !hasAdminSecret {
+			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
+			return
+		}
+		h.store.SetAllowRemoteMigration(*req.AllowRemoteMigration)
+		log.Printf("设置已更新: allow_remote_migration = %t", *req.AllowRemoteMigration)
+	} else if !hasAdminSecret {
+		h.store.SetAllowRemoteMigration(false)
+	}
+
+	if req.ModelMapping != nil {
+		h.store.SetModelMapping(*req.ModelMapping)
+		log.Printf("设置已更新: model_mapping")
+	}
+	if req.CodexModelMapping != nil {
+		h.store.SetCodexModelMapping(*req.CodexModelMapping)
+		log.Printf("设置已更新: codex_model_mapping")
+	}
+	if req.PayloadRules != nil {
+		normalized, err := proxy.NormalizePayloadRulesJSON(*req.PayloadRules)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := proxy.SetPayloadRulesJSON(normalized); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetPayloadRules(normalized)
+		log.Printf("设置已更新: payload_rules")
+	}
+	if req.ReasoningEffortModels != nil {
+		normalized, err := proxy.NormalizeReasoningEffortModelsJSON(*req.ReasoningEffortModels, proxy.SupportedModelIDs(c.Request.Context(), h.db))
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetReasoningEffortModels(normalized)
+		log.Printf("设置已更新: reasoning_effort_models")
+	}
+
+	if req.ClientCompatMode != nil {
+		runtimeCfg.ClientCompatMode = proxy.NormalizeClientCompatMode(*req.ClientCompatMode)
+		log.Printf("设置已更新: client_compat_mode = %s", runtimeCfg.ClientCompatMode)
+	}
+	if req.CodexMinCLIVersion != nil {
+		runtimeCfg.CodexMinCLIVersion = strings.TrimSpace(*req.CodexMinCLIVersion)
+		log.Printf("设置已更新: codex_min_cli_version = %s", runtimeCfg.CodexMinCLIVersion)
+	}
+	if req.CodexUserAgentConfig != nil {
+		normalized, err := proxy.NormalizeCodexUserAgentConfigJSON(*req.CodexUserAgentConfig)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		runtimeCfg.CodexUserAgentConfig = normalized
+		log.Printf("设置已更新: codex_user_agent_config")
+	}
+	if req.CodexTelemetryEnabled != nil {
+		runtimeCfg.CodexTelemetryEnabled = *req.CodexTelemetryEnabled
+		log.Printf("设置已更新: codex_telemetry_enabled = %t", runtimeCfg.CodexTelemetryEnabled)
+	}
+	if req.CodexTelemetryTimingDebug != nil {
+		runtimeCfg.CodexTelemetryTimingDebug = *req.CodexTelemetryTimingDebug
+		log.Printf("设置已更新: codex_telemetry_timing_debug = %t", runtimeCfg.CodexTelemetryTimingDebug)
+	}
+	if req.StreamFlushPolicy != nil {
+		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
+		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
+	}
+	if req.StreamFlushIntervalMS != nil {
+		runtimeCfg.StreamFlushIntervalMS = *req.StreamFlushIntervalMS
+		log.Printf("设置已更新: stream_flush_interval_ms = %d", runtimeCfg.StreamFlushIntervalMS)
+	}
+	if req.FirstTokenMode != nil {
+		runtimeCfg.FirstTokenMode = proxy.NormalizeFirstTokenMode(*req.FirstTokenMode)
+		log.Printf("设置已更新: first_token_mode = %s", runtimeCfg.FirstTokenMode)
+	}
+	if req.FirstTokenTimeoutSeconds != nil {
+		runtimeCfg.FirstTokenTimeoutSec = *req.FirstTokenTimeoutSeconds
+		log.Printf("设置已更新: first_token_timeout_seconds = %d", runtimeCfg.FirstTokenTimeoutSec)
+	}
+	if req.BillingTierPolicy != nil {
+		runtimeCfg.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(*req.BillingTierPolicy)
+		log.Printf("设置已更新: billing_tier_policy = %s", runtimeCfg.BillingTierPolicy)
+	}
+	if req.ShowFullUsageNumbers != nil {
+		showFullUsageNumbers = *req.ShowFullUsageNumbers
+		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
+	if req.PublicKeyUsagePageEnabled != nil {
+		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
+		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
+	}
+	if req.PublicAccountPortalPageEnabled != nil {
+		publicAccountPortalPageEnabled = *req.PublicAccountPortalPageEnabled
+		log.Printf("设置已更新: public_account_portal_page_enabled = %t", publicAccountPortalPageEnabled)
+	}
+	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
+		t5h := h.store.GetGlobalAutoPause5hThreshold()
+		t7d := h.store.GetGlobalAutoPause7dThreshold()
+		if req.AutoPause5hThreshold != nil {
+			t5h = *req.AutoPause5hThreshold
+		}
+		if req.AutoPause7dThreshold != nil {
+			t7d = *req.AutoPause7dThreshold
+		}
+		h.store.SetGlobalAutoPauseThresholds(t5h, t7d)
+		log.Printf("设置已更新: auto_pause thresholds 5h=%.4f 7d=%.4f", t5h, t7d)
+	}
+	if req.AutoPause5hGuardBandPercent != nil {
+		h.store.SetAutoPause5hGuardBandPercent(*req.AutoPause5hGuardBandPercent)
+		log.Printf("设置已更新: auto_pause_5h_guard_band_percent = %.2f", *req.AutoPause5hGuardBandPercent)
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		h.store.SetAutoPause5hGuardConcurrency(*req.AutoPause5hGuardConcurrency)
+		log.Printf("设置已更新: auto_pause_5h_guard_concurrency = %d", *req.AutoPause5hGuardConcurrency)
+	}
+	if req.SmartPacingEnabled != nil {
+		h.store.SetSmartPacingEnabled(*req.SmartPacingEnabled)
+		log.Printf("设置已更新: smart_pacing_enabled = %t", *req.SmartPacingEnabled)
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		h.store.SetSmartPacingMinConcurrency(*req.SmartPacingMinConcurrency)
+		log.Printf("设置已更新: smart_pacing_min_concurrency = %d", *req.SmartPacingMinConcurrency)
+	}
+	if req.SmartPacingWindows != nil {
+		h.store.SetSmartPacingWindows(*req.SmartPacingWindows)
+		log.Printf("设置已更新: smart_pacing_windows = %s", h.store.GetSmartPacingWindows())
+	}
+	if req.IgnoreUsageLimitStatus != nil {
+		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
+		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
+	}
+	if req.AutoResetCreditsEnabled != nil {
+		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
+		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
+	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		runtimeCfg.AutoResetCreditsBeforeExpiryMin = *req.AutoResetCreditsBeforeExpiryMin
+		log.Printf("设置已更新: auto_reset_credits_before_expiry_min = %d", *req.AutoResetCreditsBeforeExpiryMin)
+	}
+	if req.AutoActivate5hWindowEnabled != nil {
+		runtimeCfg.AutoActivate5hWindowEnabled = *req.AutoActivate5hWindowEnabled
+		log.Printf("设置已更新: auto_activate_5h_window_enabled = %t", *req.AutoActivate5hWindowEnabled)
+	}
+	// 自动消费/自动开窗属于不可逆或有额度成本的操作。先归一化待保存值，但在数据库
+	// 确认保存成功前，运行态继续使用旧配置，避免持久化失败后后台任务仍然开始执行。
+	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
+	effectiveRuntimeCfg := runtimeCfg
+	if autoResetCreditsChanged {
+		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
+	}
+	if autoActivate5hChanged {
+		effectiveRuntimeCfg.AutoActivate5hWindowEnabled = previousAutoActivate5hWindowEnabled
+	}
+	effectiveRuntimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
+		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
+		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		return effectiveRuntimeCfg
+	})
+
+	usageLogChanged := false
+	if req.UsageLogMode != nil {
+		usageLogMode = database.NormalizeUsageLogMode(*req.UsageLogMode)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_mode = %s", usageLogMode)
+	}
+	if req.UsageLogBatchSize != nil {
+		usageLogBatchSize = database.NormalizeUsageLogBatchSize(*req.UsageLogBatchSize)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_batch_size = %d", usageLogBatchSize)
+	}
+	if req.UsageLogFlushIntervalSeconds != nil {
+		usageLogFlushIntervalSeconds = database.NormalizeUsageLogFlushIntervalSeconds(*req.UsageLogFlushIntervalSeconds)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_flush_interval_seconds = %d", usageLogFlushIntervalSeconds)
+	}
+	if usageLogChanged {
+		h.db.SetUsageLogConfig(usageLogMode, usageLogBatchSize, usageLogFlushIntervalSeconds)
+		usageLogMode = h.db.GetUsageLogMode()
+		usageLogBatchSize = h.db.GetUsageLogBatchSize()
+		usageLogFlushIntervalSeconds = h.db.GetUsageLogFlushIntervalSeconds()
+	}
+
+	// Resin 粘性代理池配置
+	resinURL := ""
+	resinPlatformName := ""
+	if existingSettings != nil {
+		resinURL = existingSettings.ResinURL
+		resinPlatformName = existingSettings.ResinPlatformName
+	}
+	if req.ResinURL != nil {
+		resinURL = *req.ResinURL
+		log.Printf("设置已更新: resin_url")
+	}
+	if req.ResinPlatformName != nil {
+		resinPlatformName = *req.ResinPlatformName
+		log.Printf("设置已更新: resin_platform_name")
+	}
+	if req.ResinURL != nil || req.ResinPlatformName != nil {
+		proxy.SetResinConfig(&proxy.ResinConfig{
+			BaseURL:      resinURL,
+			PlatformName: resinPlatformName,
+		})
+		if strings.TrimSpace(resinURL) != "" && strings.TrimSpace(resinPlatformName) != "" {
+			auth.ResinRequestDecorator = func(targetURL, accountID string) string {
+				return proxy.BuildReverseProxyURL(targetURL)
+			}
+		} else {
+			auth.ResinRequestDecorator = nil
+		}
+	}
+
+
+	// 持久化保存到数据库
+	err = h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+		SiteName:                            siteName,
+		SiteLogo:                            siteLogo,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		CodexImagesMainModel:                codexImagesMainModel,
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         currentAdminSecret,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubToken:                         h.store.GithubToken(),
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		UTLSShutdownTimeoutMinutes:          utlsShutdownTimeoutMinutes,
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            sessionSlotBufferEnabled,
+		SessionSlotBufferSeconds:            sessionSlotBufferSeconds,
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		ContinuousRetryPolicy:               database.EncodeContinuousRetryPolicy(h.store.GetContinuousRetryPolicy()),
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		UsageLogMode:                        usageLogMode,
+		UsageLogBatchSize:                   usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
+		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
+		ModelPricingOverrides:               modelPricingOverrides,
+		ModelPricingSyncURL:                 modelPricingSyncURL,
+	})
+	if err != nil {
+		log.Printf("无法持久化保存设置: %v", err)
+		if req.CodexImagesMainModel != nil {
+			writeError(c, http.StatusInternalServerError, "保存生图设置失败，文本驱动模型未生效")
+			return
+		}
+		if req.SessionSlotBufferEnabled != nil || req.SessionSlotBufferSeconds != nil {
+			writeError(c, http.StatusInternalServerError, "保存会话并发槽缓冲设置失败，设置未生效")
+			return
+		}
+		if modelCooldownUpdateRequested {
+			writeError(c, http.StatusInternalServerError, "保存模型冷却设置前无法持久化系统设置")
+			return
+		}
+		if responseCacheUpdateRequested {
+			writeError(c, http.StatusInternalServerError, "保存响应缓存设置前无法持久化系统设置")
+			return
+		}
+		if modelsListReadLimitChanged {
+			writeError(c, http.StatusInternalServerError, "保存模型列表读取上限前无法持久化系统设置")
+			return
+		}
+		if autoResetCreditsChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
+			return
+		}
+		if autoActivate5hChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存 5h 窗口自动激活设置失败，设置未生效")
+			return
+		}
+		if continuousRetryChanged {
+			writeError(c, http.StatusInternalServerError, "保存持续重试策略失败，设置未生效")
+			return
+		}
+	} else {
+		if req.SessionSlotBufferSeconds != nil {
+			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
+			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
+		}
+		runtimeCfg.CodexImagesMainModel = codexImagesMainModel
+		proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+			current.CodexImagesMainModel = codexImagesMainModel
+			return current
+		})
+		if req.SessionSlotBufferEnabled != nil {
+			h.store.SetSessionSlotBufferEnabled(sessionSlotBufferEnabled)
+			log.Printf("设置已更新: session_slot_buffer_enabled = %t", sessionSlotBufferEnabled)
+		}
+		if continuousRetryChanged {
+			committed, updateErr := h.db.UpdateContinuousRetryPolicy(c.Request.Context(), continuousRetryUpdate)
+			if updateErr != nil {
+				writeError(c, http.StatusInternalServerError, "保存持续重试策略失败")
+				return
+			}
+			continuousRetryPolicy = committed
+			h.store.SetContinuousRetryPolicy(continuousRetryPolicy)
+			proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				current.ContinuousRetryPolicy = continuousRetryPolicy
+				return current
+			})
+			log.Printf("设置已更新: continuous_retry enabled=%t catch_all=%t categories=%d status_codes=%d error_codes=%d", continuousRetryPolicy.Enabled, continuousRetryPolicy.CatchAll, len(continuousRetryPolicy.Categories), len(continuousRetryPolicy.StatusCodes), len(continuousRetryPolicy.ErrorCodes))
+		}
+		if autoResetCreditsChanged {
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				return runtimeCfg
+			})
+			h.triggerAutoResetCreditsScan()
+		}
+		if autoActivate5hChanged {
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				return runtimeCfg
+			})
+			h.triggerAutoActivate5hScan()
+		}
+		if modelsListReadLimitChanged {
+			if updateErr := h.db.UpdateModelsListReadMaxBytes(c.Request.Context(), *req.ModelsListReadMaxBytes); updateErr != nil {
+				writeError(c, http.StatusInternalServerError, "保存模型列表读取上限失败："+updateErr.Error())
+				return
+			}
+			modelsListReadMaxBytes = *req.ModelsListReadMaxBytes
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				current.ModelsListReadMaxBytes = modelsListReadMaxBytes
+				return current
+			})
+			log.Printf("设置已更新: models_list_read_max_bytes = %d", modelsListReadMaxBytes)
+		}
+	}
+
+	if modelCooldownUpdateRequested {
+		committed, updateErr := h.db.UpdateModelCooldownSettings(c.Request.Context(), database.ModelCooldownSettingsUpdate{
+			RelayMode:           req.RelayModelCooldownMode,
+			RelaySeconds:        req.RelayModelCooldownSeconds,
+			RelayBackoffEnabled: req.RelayModelCooldownBackoffEnabled,
+			OAuthMode:           req.OAuthModelCooldownMode,
+			OAuthSeconds:        req.OAuthModelCooldownSeconds,
+			OAuthBackoffEnabled: req.OAuthModelCooldownBackoffEnabled,
+		})
+		if updateErr != nil {
+			writeError(c, http.StatusInternalServerError, updateErr.Error())
+			return
+		}
+		h.store.SetModelCooldownSettings(committed)
+	}
+
+	if responseCacheUpdateRequested {
+		committed, updateErr := cacheSettingsStore.UpdateResponseCacheSettings(
+			c.Request.Context(),
+			responseCacheUpdate,
+		)
+		if updateErr != nil {
+			if errors.Is(updateErr, database.ErrInvalidResponseCacheSettings) {
+				writeError(c, http.StatusBadRequest, updateErr.Error())
+			} else {
+				writeError(c, http.StatusInternalServerError, "保存响应缓存设置失败："+updateErr.Error())
+			}
+			return
+		}
+		responseCacheSettings = committed
+		proxy.ApplyResponseCacheSettings(committed)
+	} else {
+		latest, readErr := cacheSettingsStore.GetResponseCacheSettings(c.Request.Context())
+		if readErr != nil {
+			writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+readErr.Error())
+			return
+		}
+		responseCacheSettings = latest
+	}
+
+	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
+		h.store.TriggerAutoCleanupAsync()
+	}
+
+	adminSecretForDisplay := currentAdminSecret
+	adminAuthSource := func() string {
+		_, source := h.resolveAdminSecret(c.Request.Context())
+		return source
+	}()
+	if adminAuthSource == "env" {
+		adminSecretForDisplay = ""
+	}
+	modelCooldownSettings := h.store.GetModelCooldownSettings()
+
+	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                            siteName,
+		SiteLogo:                            siteLogo,
+		BackgroundImage:                     bgCfg.Image,
+		BackgroundOpacity:                   bgCfg.Opacity,
+		BackgroundBlur:                      bgCfg.Blur,
+		BackgroundGlassOpacity:              bgCfg.GlassOpacity,
+		BackgroundGlassBlur:                 bgCfg.GlassBlur,
+		MaxConcurrency:                      h.store.GetMaxConcurrency(),
+		GlobalRPM:                           h.rateLimiter.GetRPM(),
+		TestModel:                           h.store.GetTestModel(),
+		CodexImagesMainModel:                runtimeCfg.CodexImagesMainModel,
+		CodexImagesDefaultMainModel:         proxy.ImagesDefaultMainModel(),
+		TestContent:                         h.store.GetTestContent(),
+		TestConcurrency:                     h.store.GetTestConcurrency(),
+		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
+		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
+		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheWritePolicy:            responseCacheSettings.WritePolicy,
+		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
+		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
+		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
+		RelayModelCooldownBackoffEnabled:    modelCooldownSettings.RelayBackoffEnabled,
+		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
+		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
+		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
+		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
+		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
+		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
+		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
+		ProxyURL:                            h.store.GetProxyURL(),
+		PgMaxConns:                          h.pgMaxConns,
+		RedisPoolSize:                       h.redisPoolSize,
+		AutoCleanUnauthorized:               h.store.GetAutoCleanUnauthorized(),
+		AutoCleanRateLimited:                h.store.GetAutoCleanRateLimited(),
+		AdminSecret:                         adminSecretForDisplay,
+		AdminAuthSource:                     adminAuthSource,
+		AutoCleanFullUsage:                  h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:                      h.store.GetAutoCleanError(),
+		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
+		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
+		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
+		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
+		SchedulerEngine:                     h.store.SchedulerEngine(),
+		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexRequestCompression:             h.store.CodexRequestCompression(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
+		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
+		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
+		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
+		CodexWSSilentRetryEnabled:           h.store.CodexWSSilentRetryEnabled(),
+		CodexWSSilentMaxRetries:             h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:            h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		GithubTokenConfigured:               h.store.GithubToken() != "",
+		GithubProxyURL:                      h.store.GithubProxyURL(),
+		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
+		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
+		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
+		CodexOverloadWindowMinutes:          runtimeCfg.CodexOverloadWindowMinutes,
+		OverflowAutoCompactEnabled:          h.store.OverflowAutoCompactEnabled(),
+		CompactViaResponsesEnabled:          h.store.CompactViaResponsesEnabled(),
+		CodexPreflightSSEPassthroughEnabled: h.store.CodexPreflightSSEPassthroughEnabled(),
+		FirstTokenExcludesWsAcquire:         h.store.FirstTokenExcludesWsAcquire(),
+		CodexContinueThinkingEnabled:        h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:              h.store.CodexContinueMaxRounds(),
+		UTLSShutdownTimeoutMinutes:          utlsShutdownTimeoutMinutes,
+		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
+		SchedulerMode:                       h.store.GetSchedulerMode(),
+		AffinityMode:                        h.store.GetAffinityMode(),
+		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
+		SessionSlotBufferEnabled:            h.store.SessionSlotBufferEnabled(),
+		SessionSlotBufferSeconds:            int(h.store.GetSessionSlotBuffer() / time.Second),
+		MaxRetries:                          h.store.GetMaxRetries(),
+		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:                h.store.GetTransportRetryPolicy(),
+		ContinuousRetryEnabled:              continuousRetryPolicy.Enabled,
+		ContinuousRetryCatchAll:             continuousRetryPolicy.CatchAll,
+		ContinuousRetryCategories:           continuousRetryPolicy.Categories,
+		ContinuousRetryStatusCodes:          continuousRetryPolicy.StatusCodes,
+		ContinuousRetryErrorCodes:           continuousRetryPolicy.ErrorCodes,
+		ContinuousRetryMaxDurationSeconds:   continuousRetryPolicy.MaxDurationSeconds,
+		CodexFingerprintDefaultMode:         h.store.GetCodexFingerprintDefaultMode(),
+		AllowRemoteMigration:                h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
+		DatabaseDriver:                      h.databaseDriver,
+		DatabaseLabel:                       h.databaseLabel,
+		CacheDriver:                         h.cacheDriver,
+		CacheLabel:                          h.cacheLabel,
+		ExpiredCleaned:                      expiredCleaned,
+		ModelMapping:                        h.store.GetModelMapping(),
+		CodexModelMapping:                   h.store.GetCodexModelMapping(),
+		PayloadRules:                        h.store.GetPayloadRules(),
+		ReasoningEffortModels:               h.store.GetReasoningEffortModels(),
+		ResinURL:                            resinURL,
+		ResinPlatformName:                   resinPlatformName,
+		CodexEgress:                         proxy.CurrentCodexEgressSummary(),
+		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		UsageLogMode:                        usageLogMode,
+		UsageLogBatchSize:                   usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                   runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:               runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                      runtimeCfg.FirstTokenMode,
+		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
+		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
+		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
+		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:         h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                  h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:           h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                  h.store.GetSmartPacingWindows(),
+		IgnoreUsageLimitStatus:              h.store.IgnoreUsageLimitStatus(),
+	})
+}
+
+// ==================== 导出 & 迁移 ====================
+
+type cpaExportEntry struct {
+	Type                  string `json:"type"`
+	Email                 string `json:"email"`
+	PlanType              string `json:"plan_type,omitempty"`
+	Codex7DUsedPercent    string `json:"codex_7d_used_percent,omitempty"`
+	Codex7DResetAt        string `json:"codex_7d_reset_at,omitempty"`
+	Codex5HUsedPercent    string `json:"codex_5h_used_percent,omitempty"`
+	Codex5HResetAt        string `json:"codex_5h_reset_at,omitempty"`
+	Codex5HUsageUpdatedAt string `json:"codex_5h_usage_updated_at,omitempty"`
+	CodexUsageUpdatedAt   string `json:"codex_usage_updated_at,omitempty"`
+	Expired               string `json:"expired"`
+	IDToken               string `json:"id_token"`
+	AccountID             string `json:"account_id"`
+	AccessToken           string `json:"access_token"`
+	LastRefresh           string `json:"last_refresh"`
+	RefreshToken          string `json:"refresh_token"`
+	// 代理三件套只在 include_proxy=1 时写出：代理 URL 常带明文用户名密码。
+	// ProxyEnabled 用指针区分"文件没带这个字段"（老文件，按启用处理）与
+	// "源端显式禁用"，bool 的零值会被 omitempty 一起吞掉。
+	ProxyURL     string `json:"proxy_url,omitempty"`
+	ProxyLabel   string `json:"proxy_label,omitempty"`
+	ProxyEnabled *bool  `json:"proxy_enabled,omitempty"`
+}
+
+// exportProxyResolver 决定导出条目是否携带账号绑定的代理。零值表示不携带——
+// 导出代理等于导出代理凭据，必须由调用方显式打开。
+type exportProxyResolver struct {
+	include bool
+	byURL   map[string]*database.ProxyRow
+}
+
+// newExportProxyResolver 在 include 为真时读一次代理表，用来给导出条目补上
+// label / enabled。账号绑的自定义代理（不在代理表里）只带 URL。
+func (h *Handler) newExportProxyResolver(ctx context.Context, include bool) exportProxyResolver {
+	if !include {
+		return exportProxyResolver{}
+	}
+	resolver := exportProxyResolver{include: true, byURL: make(map[string]*database.ProxyRow)}
+	proxies, err := h.db.ListProxies(ctx)
+	if err != nil {
+		// 代理表读失败不该让整次导出失败：URL 在账号行上，label/enabled 只是附注。
+		log.Printf("导出账号: 读取代理表失败，本次仅导出代理 URL: %v", err)
+		return resolver
+	}
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		resolver.byURL[strings.TrimSpace(proxy.URL)] = proxy
+	}
+	return resolver
+}
+
+// resolve 返回导出条目该写入的代理 URL / label / 启用状态。
+func (r exportProxyResolver) resolve(rawURL string) (string, string, *bool) {
+	if !r.include {
+		return "", "", nil
+	}
+	proxyURL := strings.TrimSpace(rawURL)
+	if proxyURL == "" {
+		return "", "", nil
+	}
+	row := r.byURL[proxyURL]
+	if row == nil {
+		return proxyURL, "", nil
+	}
+	enabled := row.Enabled
+	return proxyURL, row.Label, &enabled
+}
+
+// exportIncludeProxy 解析 include_proxy 查询参数；未显式传入时取渠道默认值。
+// 用 Query().Has 做存在性判断而不是空串比较：include_proxy=0 必须能压过
+// 默认开启的渠道。
+func exportIncludeProxy(c *gin.Context, defaultValue bool) bool {
+	if !c.Request.URL.Query().Has("include_proxy") {
+		return defaultValue
+	}
+	return parseBoolForm(c.Query("include_proxy"))
+}
+
+type accountAuthJSONTokens struct {
+	IDToken      string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	AccountID    string `json:"account_id"`
+}
+
+type accountAuthJSON struct {
+	AuthMode     string                `json:"auth_mode"`
+	OpenAIAPIKey *string               `json:"OPENAI_API_KEY"`
+	Tokens       accountAuthJSONTokens `json:"tokens"`
+	LastRefresh  string                `json:"last_refresh"`
+}
+
+// GetAccountAuthJSON 生成单账号可用于 Codex CLI 的 auth.json。
+func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+		return
+	}
+
+	refreshToken := row.GetCredential("refresh_token")
+	accessToken := row.GetCredential("access_token")
+	idToken := row.GetCredential("id_token")
+	accountID := row.GetCredential("account_id")
+	if refreshToken == "" {
+		writeError(c, http.StatusBadRequest, "该账号没有 refresh_token，无法生成 auth.json")
+		return
+	}
+	if accessToken == "" || idToken == "" {
+		writeError(c, http.StatusBadRequest, "账号缺少 access_token 或 id_token，请先刷新账号后再生成 auth.json")
+		return
+	}
+	if accountID == "" {
+		if info := auth.ParseIDToken(idToken); info != nil {
+			accountID = info.ChatGPTAccountID
+		}
+	}
+	if accountID == "" {
+		if info := auth.ParseAccessToken(accessToken); info != nil {
+			accountID = info.ChatGPTAccountID
+		}
+	}
+	if accountID == "" {
+		writeError(c, http.StatusBadRequest, "账号缺少 account_id，请先刷新账号后再生成 auth.json")
+		return
+	}
+
+	c.Header("Content-Disposition", `attachment; filename="auth.json"`)
+	c.JSON(http.StatusOK, accountAuthJSON{
+		AuthMode:     "chatgpt",
+		OpenAIAPIKey: nil,
+		Tokens: accountAuthJSONTokens{
+			IDToken:      idToken,
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			AccountID:    accountID,
+		},
+		LastRefresh: row.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// writeSecretResponseHeaders marks a response as secret-bearing so it is never
+// cached or content-sniffed. The CPA export endpoints return an inline JSON
+// array the frontend names itself — they need the cache guards without the
+// download disposition.
+func writeSecretResponseHeaders(c *gin.Context) {
+	c.Header("Cache-Control", "no-store, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("X-Content-Type-Options", "nosniff")
+}
+
+// accountRowToCPAExportEntry 将数据库账号行转为 CPA 导出条目；无凭证时返回 false。
+// proxies 决定是否连同账号绑定的代理一起导出（零值 = 不导出）。
+func accountRowToCPAExportEntry(row *database.AccountRow, proxies exportProxyResolver) (cpaExportEntry, bool) {
+	if row == nil {
+		return cpaExportEntry{}, false
+	}
+	rt := row.GetCredential("refresh_token")
+	at := row.GetCredential("access_token")
+	// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
+	// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
+	if rt == "" && at == "" {
+		return cpaExportEntry{}, false
+	}
+	// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
+	accountID := row.GetCredential("chatgpt_account_id")
+	if accountID == "" {
+		accountID = row.GetCredential("account_id")
+	}
+	proxyURL, proxyLabel, proxyEnabled := proxies.resolve(row.ProxyURL)
+	return cpaExportEntry{
+		Type:                  "codex",
+		Email:                 row.GetCredential("email"),
+		PlanType:              row.GetCredential("plan_type"),
+		Codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
+		Codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
+		Codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
+		Codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
+		Codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
+		CodexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
+		Expired:               row.GetCredential("expires_at"),
+		IDToken:               row.GetCredential("id_token"),
+		AccountID:             accountID,
+		AccessToken:           at,
+		LastRefresh:           row.UpdatedAt.Format(time.RFC3339),
+		RefreshToken:          rt,
+		ProxyURL:              proxyURL,
+		ProxyLabel:            proxyLabel,
+		ProxyEnabled:          proxyEnabled,
+	}, true
+}
+
+// accountRowToExportEntry 将数据库账号行转为通用导出条目；无凭证时返回 false。
+func accountRowToExportEntry(row *database.AccountRow, proxies exportProxyResolver) (any, bool) {
+	entry, ok := accountRowToCPAExportEntry(row, proxies)
+	if !ok {
+		return nil, false
+	}
+	return entry, true
+}
+
+func parseExportIDSet(idsParam string) map[int64]bool {
+	idsParam = strings.TrimSpace(idsParam)
+	if idsParam == "" {
+		return nil
+	}
+	idSet := make(map[int64]bool)
+	for _, s := range strings.Split(idsParam, ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+			idSet[id] = true
+		}
+	}
+	if len(idSet) == 0 {
+		return nil
+	}
+	return idSet
+}
+
+// ExportAccounts 导出账号（CPA JSON 格式）
+func (h *Handler) ExportAccounts(c *gin.Context) {
+	filter := c.DefaultQuery("filter", "healthy")
+	idsParam := c.Query("ids")
+	remote := c.Query("remote")
+	// channel=codex/claude 限定导出渠道:各渠道账号页导出传自己的渠道,避免把
+	// 其他渠道账号混进以渠道命名的导出文件。缺省仍导出全部,
+	// 远程迁移(remote=true)依赖全量语义。
+	channel := strings.ToLower(strings.TrimSpace(c.Query("channel")))
+
+	// 远程调用需检查 allow_remote_migration
+	if remote == "true" {
+		if !h.hasConfiguredAdminSecret(c.Request.Context()) {
+			writeError(c, http.StatusForbidden, "请先设置管理密钥，再启用远程迁移")
+			return
+		}
+		if !h.store.GetAllowRemoteMigration() {
+			writeError(c, http.StatusForbidden, "远程迁移未启用，请在系统设置中开启")
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListActiveByChannel(ctx, channel)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "查询账号失败: "+err.Error())
+		return
+	}
+
+	// 远程迁移同样默认不带代理：目标机未必连得上源机的代理网段，静默继承会让
+	// 整批账号绑上不可达出口。需要时由调用方显式传 include_proxy=1。
+	proxies := h.newExportProxyResolver(ctx, exportIncludeProxy(c, false))
+	idSet := parseExportIDSet(idsParam)
+
+	// 构建运行时状态映射（用于健康过滤）
+	runtimeMap := make(map[int64]*auth.Account)
+	if filter == "healthy" {
+		for _, acc := range h.store.Accounts() {
+			runtimeMap[acc.DBID] = acc
+		}
+	}
+
+	entries := make([]any, 0, len(rows))
+	for _, row := range rows {
+		if idSet != nil && !idSet[row.ID] {
+			continue
+		}
+		if filter == "healthy" {
+			acc, ok := runtimeMap[row.ID]
+			if !ok || acc.RuntimeStatus() != "active" {
+				continue
+			}
+		}
+		entry, ok := accountRowToExportEntry(row, proxies)
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	writeSecretResponseHeaders(c)
+	c.JSON(http.StatusOK, entries)
+}
+
+// ExportRecycleBinAccounts 导出回收站账号（CPA JSON 格式）。
+// GET /api/admin/accounts/recycle-bin/export?ids=1,2,3
+// ids 可选：不传则导出回收站全部；传了则只导出指定 ID（须在回收站中）。
+func (h *Handler) ExportRecycleBinAccounts(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListDeleted(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "查询回收站失败: "+err.Error())
+		return
+	}
+
+	proxies := h.newExportProxyResolver(ctx, exportIncludeProxy(c, false))
+	idSet := parseExportIDSet(c.Query("ids"))
+	entries := make([]any, 0, len(rows))
+	for _, row := range rows {
+		if idSet != nil && !idSet[row.ID] {
+			continue
+		}
+		entry, ok := accountRowToExportEntry(row, proxies)
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	writeSecretResponseHeaders(c)
+	c.JSON(http.StatusOK, entries)
+}
+
+type migrateReq struct {
+	URL      string `json:"url"`
+	AdminKey string `json:"admin_key"`
+}
+
+// MigrateAccounts 从远程 codex2api 实例迁移健康账号（SSE 流式进度）
+func (h *Handler) MigrateAccounts(c *gin.Context) {
+	if !h.hasConfiguredAdminSecret(c.Request.Context()) {
+		writeError(c, http.StatusForbidden, "请先设置管理密钥，再使用远程迁移")
+		return
+	}
+
+	var req migrateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.URL == "" || req.AdminKey == "" {
+		writeError(c, http.StatusBadRequest, "url 和 admin_key 是必填字段")
+		return
+	}
+	parsedURL, err := url.Parse(strings.TrimSpace(req.URL))
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		writeError(c, http.StatusBadRequest, "url 必须是完整的 http/https 地址")
+		return
+	}
+
+	remoteURL := strings.TrimRight(parsedURL.String(), "/")
+	exportURL := remoteURL + "/api/admin/accounts/export?filter=healthy&remote=true"
+
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer fetchCancel()
+
+	httpReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, exportURL, nil)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "构建请求失败: "+err.Error())
+		return
+	}
+	httpReq.Header.Set("X-Admin-Key", req.AdminKey)
+
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(httpReq)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "连接远程实例失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("远程实例返回错误 (%d): %s", resp.StatusCode, string(body)))
+		return
+	}
+
+	var remoteAccounts []cpaExportEntry
+	if err := json.NewDecoder(resp.Body).Decode(&remoteAccounts); err != nil {
+		writeError(c, http.StatusBadGateway, "解析远程数据失败: "+err.Error())
+		return
+	}
+
+	if len(remoteAccounts) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "远程实例没有可迁移的健康账号", "total": 0, "imported": 0, "duplicate": 0, "failed": 0})
+		return
+	}
+
+	// 转换为 importToken 格式，复用 importAccountsCommon (原生支持 AT-only 混合导入)
+	var tokens []importToken
+	for _, entry := range remoteAccounts {
+		rt := strings.TrimSpace(entry.RefreshToken)
+		at := strings.TrimSpace(entry.AccessToken)
+		// 至少需要一种凭证;两者都为空表示账号根本没有可用凭证。
+		if rt == "" && at == "" {
+			continue
+		}
+		name := entry.Email
+		if name == "" {
+			name = "migrate"
+		}
+		tokens = append(tokens, importToken{
+			refreshToken:          rt,
+			accessToken:           at,
+			name:                  name,
+			email:                 strings.TrimSpace(entry.Email),
+			idToken:               strings.TrimSpace(entry.IDToken),
+			accountID:             strings.TrimSpace(entry.AccountID),
+			planType:              strings.TrimSpace(entry.PlanType),
+			expiresAt:             strings.TrimSpace(entry.Expired),
+			codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent),
+			codex7DResetAt:        strings.TrimSpace(entry.Codex7DResetAt),
+			codex5HUsedPercent:    strings.TrimSpace(entry.Codex5HUsedPercent),
+			codex5HResetAt:        strings.TrimSpace(entry.Codex5HResetAt),
+			codex5HUsageUpdatedAt: strings.TrimSpace(entry.Codex5HUsageUpdatedAt),
+			codexUsageUpdatedAt:   strings.TrimSpace(entry.CodexUsageUpdatedAt),
+		})
+	}
+
+	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
+	h.importAccountsCommon(c, tokens, importSettings{})
+}
+
+// ==================== Models ====================
+
+// ListModels 返回支持的模型列表（供前端设置页使用）
+func (h *Handler) ListModels(c *gin.Context) {
+	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	c.JSON(http.StatusOK, catalog)
+}
+
+// SyncModels 从官方 Codex 模型页同步模型注册表。
+func (h *Handler) SyncModels(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncOfficialCodexModels(ctx, h.db, proxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ==================== Codex User-Agent 形态目录与预览 ====================
+
+// GetCodexUserAgentCatalog 返回 Codex 客户端形态目录(形态、平台、终端、末尾标记名、
+// CLI 版本→构建号配对与默认号池配比),供设置页做搭配选择。
+func (h *Handler) GetCodexUserAgentCatalog(c *gin.Context) {
+	c.JSON(http.StatusOK, proxy.CodexUserAgentCatalog())
+}
+
+type codexUserAgentPreviewRequest struct {
+	Config             string `json:"config"`
+	ClientCompatMode   string `json:"client_compat_mode"`
+	CodexMinCLIVersion string `json:"codex_min_cli_version"`
+}
+
+// PreviewCodexUserAgent 按表单里尚未保存的 UA 配置算出真实出站身份(User-Agent /
+// Originator / Version),与执行链路同一套规则;号池模式下对前几个 Codex 账号逐个抽样。
+// 兼容模式与最低 CLI 版本可随请求传入(表单值),缺省用当前生效设置。
+func (h *Handler) PreviewCodexUserAgent(c *gin.Context) {
+	var req codexUserAgentPreviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	settings := proxy.CurrentRuntimeSettings()
+	compatMode := strings.TrimSpace(req.ClientCompatMode)
+	if compatMode == "" {
+		compatMode = settings.ClientCompatMode
+	}
+	minVersion := strings.TrimSpace(req.CodexMinCLIVersion)
+	if minVersion == "" {
+		minVersion = settings.CodexMinCLIVersion
+	}
+	versionFloor := ""
+	if compatMode == proxy.ClientCompatModeAuto {
+		versionFloor = minVersion
+	}
+	var sampleIDs []int64
+	if h.store != nil {
+		for _, acc := range h.store.Accounts() {
+			if acc == nil || acc.IsRelayStyle() || acc.IsOpenAIResponsesAPI() {
+				continue
+			}
+			sampleIDs = append(sampleIDs, acc.ID())
+			if len(sampleIDs) >= 6 {
+				break
+			}
+		}
+	}
+	preview, err := proxy.PreviewCodexUserAgentConfig(req.Config, versionFloor, sampleIDs)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, preview)
+}
+
+// ==================== 账号趋势 ====================
+
+// GetAccountEventTrend 获取账号增删趋势聚合数据
+func (h *Handler) GetAccountEventTrend(c *gin.Context) {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	if startStr == "" || endStr == "" {
+		writeError(c, http.StatusBadRequest, "start 和 end 参数为必填")
+		return
+	}
+
+	start, err := time.Parse(time.RFC3339, startStr)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "start 时间格式无效（需 RFC3339）")
+		return
+	}
+	end, err := time.Parse(time.RFC3339, endStr)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "end 时间格式无效（需 RFC3339）")
+		return
+	}
+
+	bucketMinutes := 60
+	if bStr := c.Query("bucket_minutes"); bStr != "" {
+		if b, err := strconv.Atoi(bStr); err == nil && b > 0 {
+			bucketMinutes = b
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	trend, err := h.db.GetAccountEventTrend(ctx, start, end, bucketMinutes)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"trend": trend})
+}
+
+// ==================== 清理 ====================
+
+// CleanBanned 清理封禁（unauthorized）账号
+func (h *Handler) CleanBanned(c *gin.Context) {
+	h.cleanByStatus(c, "unauthorized")
+}
+
+// CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
+func (h *Handler) CleanRateLimited(c *gin.Context) {
+	h.cleanAccountTargets(c, h.store.CollectRateLimitedManualTargets(), "manual_clean")
+}
+
+// CleanError 清理错误（error）账号
+func (h *Handler) CleanError(c *gin.Context) {
+	h.cleanByStatus(c, "error")
+}
+
+
+// cleanByStatus 按运行时状态清理账号
+func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, nil), "auto_clean")
+}
+
+func (h *Handler) cleanAccountTargets(c *gin.Context, targets []*auth.Account, eventReason string) {
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamCleanAccounts(c, targets, eventReason)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	success, _ := h.runCleanAccounts(ctx, targets, eventReason, nil)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", success), "cleaned": success})
+}
+
+func (h *Handler) streamCleanAccounts(c *gin.Context, targets []*auth.Account, eventReason string) {
+	setupSSE(c)
+	total := len(targets)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "clean", Total: total})
+	success, fail := h.runCleanAccounts(c.Request.Context(), targets, eventReason, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "clean",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+		Message: fmt.Sprintf("已清理 %d 个账号", success),
+	})
+}
+
+func (h *Handler) runCleanAccounts(ctx context.Context, targets []*auth.Account, eventReason string, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(targets)
+	var success int64
+	var fail int64
+	deleted := make([]int64, 0, len(targets))
+
+	for i, acc := range targets {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+		if acc == nil {
+			fail++
+			if onProgress != nil {
+				onProgress(batchOperationEvent{
+					Type:    "progress",
+					Action:  "clean",
+					Current: i + 1,
+					Total:   total,
+					Success: success,
+					Failed:  fail,
+					Error:   "账号不存在",
+				})
+			}
+			continue
+		}
+
+		name, email := runtimeAccountOperationIdentity(acc)
+		err := h.store.SoftDeleteForClean(ctx, acc, eventReason)
+		event := batchOperationEvent{
+			Type:         "progress",
+			Action:       "clean",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    acc.DBID,
+			AccountName:  name,
+			AccountEmail: email,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+		} else {
+			success++
+			deleted = append(deleted, acc.DBID)
+			event.Deleted = success
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	h.pruneAccountsFromSnapshotCaches(deleted)
+	return success, fail
+}
+
+// ==================== Proxies ====================
+
+func normalizeManagedProxyURL(raw string) (string, error) {
+	normalized := strings.TrimSpace(raw)
+	if err := security.ValidateProxyURL(normalized); err != nil {
+		return "", err
+	}
+	if _, err := security.ParseProxyURL(normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
+// ListProxies 获取代理列表
+func (h *Handler) ListProxies(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	proxies, err := h.db.ListProxies(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "获取代理列表失败")
+		return
+	}
+	if proxies == nil {
+		proxies = []*database.ProxyRow{}
+	}
+	// 绑定数服务端聚合;失败不阻断列表(前端把 0 当"无绑定"展示)。
+	if boundCounts, err := h.db.CountAccountsByProxyURL(ctx); err == nil {
+		for _, p := range proxies {
+			p.BoundCount = boundCounts[strings.TrimSpace(p.URL)]
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"proxies": proxies})
+}
+
+// AddProxies 添加代理（支持批量）
+func (h *Handler) AddProxies(c *gin.Context) {
+	var req struct {
+		URLs  []string `json:"urls"`
+		URL   string   `json:"url"`
+		Label string   `json:"label"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	// 合并单条和批量
+	urls := req.URLs
+	if req.URL != "" {
+		urls = append(urls, req.URL)
+	}
+	if len(urls) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供至少一个代理 URL")
+		return
+	}
+
+	// 过滤空行
+	cleaned := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if strings.TrimSpace(u) != "" {
+			normalizedURL, err := normalizeManagedProxyURL(u)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+				return
+			}
+			cleaned = append(cleaned, normalizedURL)
+		}
+	}
+	if len(cleaned) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供至少一个有效的代理 URL")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "添加代理失败: "+err.Error())
+		return
+	}
+
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已添加，但代理池刷新失败: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  fmt.Sprintf("成功添加 %d 个代理", inserted),
+		"inserted": inserted,
+		"total":    len(cleaned),
+	})
+}
+
+// DeleteProxy 删除单个代理，并立即解绑仍引用该 URL 的账号。
+func (h *Handler) DeleteProxy(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的代理 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	result, err := h.db.RetireProxiesByIDs(ctx, []int64{id})
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "删除代理失败")
+		return
+	}
+	if result.Deleted == 0 {
+		writeError(c, http.StatusNotFound, "代理不存在")
+		return
+	}
+
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "代理已删除",
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
+}
+
+// UpdateProxy 更新代理（启用/禁用/改标签/改 URL）
+func (h *Handler) UpdateProxy(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的代理 ID")
+		return
+	}
+
+	var req struct {
+		URL     *string `json:"url"`
+		Label   *string `json:"label"`
+		Enabled *bool   `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.URL != nil {
+		normalizedURL, err := normalizeManagedProxyURL(*req.URL)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+			return
+		}
+		req.URL = &normalizedURL
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	existing, err := h.db.GetProxy(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+		return
+	}
+	oldURL := strings.TrimSpace(existing.URL)
+
+	if err := h.db.UpdateProxy(ctx, id, req.URL, req.Label, req.Enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新代理失败")
+		return
+	}
+
+	newURL := oldURL
+	if req.URL != nil {
+		newURL = strings.TrimSpace(*req.URL)
+	}
+	if newURL != "" && newURL != oldURL {
+		reboundIDs, rebindErr := h.db.RebindAccountProxyURLs(ctx, oldURL, newURL)
+		if rebindErr != nil {
+			writeError(c, http.StatusInternalServerError, "更新代理绑定失败")
+			return
+		}
+		if h.store != nil {
+			for _, accountID := range reboundIDs {
+				h.store.ApplyAccountProxyURL(accountID, newURL)
+			}
+		}
+		h.removeProxyURLsFromRuntime([]string{oldURL})
+	}
+	if req.Enabled != nil && !*req.Enabled {
+		h.removeProxyURLsFromRuntime([]string{newURL})
+	}
+
+	if err := h.reloadProxyPool(); err != nil {
+		log.Printf("代理已更新，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "代理已更新，但代理池刷新失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
+}
+
+// BatchDeleteProxies 批量删除代理
+func (h *Handler) BatchDeleteProxies(c *gin.Context) {
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要删除的代理 ID 列表")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	result, err := h.db.RetireProxiesByIDs(ctx, req.IDs)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "批量删除失败")
+		return
+	}
+
+	if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+		log.Printf("代理已批量删除，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "代理已删除，但代理池刷新失败",
+			"deleted": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个代理", result.Deleted),
+		"deleted": result.Deleted,
+		"unbound": result.Unbound,
+	})
+}
+
+// CleanErrorProxies 一键清理测试错误的代理，并解绑引用这些代理的账号。
+func (h *Handler) CleanErrorProxies(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	result, err := h.db.CleanErrorProxies(ctx)
+	if err != nil {
+		log.Printf("清理错误代理失败: %v", err)
+		writeError(c, http.StatusInternalServerError, "清理错误代理失败")
+		return
+	}
+
+	if h.store != nil {
+		if err := h.applyRetiredProxiesToRuntime(result.DeletedProxyURLs, result.UnboundAccountIDs); err != nil {
+			log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "错误代理已清理，但代理池刷新失败",
+				"cleaned": result.Deleted,
+				"unbound": result.Unbound,
+			})
+			return
+		}
+	} else if err := h.reloadProxyPool(); err != nil {
+		log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "错误代理已清理，但代理池刷新失败",
+			"cleaned": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已清理 %d 个错误代理并解绑 %d 个账号", result.Deleted, result.Unbound),
+		"cleaned": result.Deleted,
+		"unbound": result.Unbound,
+	})
+}
+
+func (h *Handler) persistProxyTestResult(ctx context.Context, id int64, expectedURL, status, ip, location string, latencyMs int) error {
+	if id <= 0 {
+		return nil
+	}
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.db.UpdateProxyTestResult(saveCtx, id, expectedURL, status, ip, location, latencyMs); err != nil {
+		return err
+	}
+	if status == database.ProxyTestStatusError {
+		h.removeProxyURLsFromRuntime([]string{expectedURL})
+	}
+	if err := h.reloadProxyPool(); err != nil {
+		return fmt.Errorf("代理测试状态已保存，但代理池刷新失败: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) reloadProxyPool() error {
+	if h.store == nil {
+		return nil
+	}
+	return h.store.ReloadProxyPool()
+}
+
+func (h *Handler) removeProxyURLsFromRuntime(proxyURLs []string) {
+	if h.store != nil {
+		h.store.RemoveProxyURLs(proxyURLs)
+	}
+}
+
+func (h *Handler) applyRetiredProxiesToRuntime(proxyURLs []string, unboundAccountIDs []int64) error {
+	if h.store != nil {
+		for _, accountID := range unboundAccountIDs {
+			h.store.ClearAccountProxyURLIfMatches(accountID, proxyURLs)
+		}
+		h.removeProxyURLsFromRuntime(proxyURLs)
+	}
+	return h.reloadProxyPool()
+}
+
+type proxyProbeResult struct {
+	Success    bool   `json:"success"`
+	Conclusive bool   `json:"conclusive"`
+	IP         string `json:"ip,omitempty"`
+	Country    string `json:"country,omitempty"`
+	Region     string `json:"region,omitempty"`
+	City       string `json:"city,omitempty"`
+	ISP        string `json:"isp,omitempty"`
+	LatencyMs  int    `json:"latency_ms,omitempty"`
+	Location   string `json:"location,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type proxyProbeConnectionState struct {
+	ConnectedToProxyEndpoint  bool
+	StartedSOCKSTargetConnect bool
+	GotTransportConnection    bool
+}
+
+const (
+	proxyProbeMaxBody     = 1 << 20
+	proxyProbeIPAPIFields = "status,message,country,regionName,city,isp,query"
+)
+
+var (
+	proxyProbeIPv4URLFn      = defaultProxyProbeIPv4URL
+	proxyProbeIPv6EchoURLsFn = defaultProxyProbeIPv6EchoURLs
+	proxyProbeLookupGeoFn    = lookupProxyExitGeo
+	proxyProbeGeoHTTPClient  = &http.Client{Timeout: 5 * time.Second}
+)
+
+// runProxyProbe 执行一次代理连通性探测（通用基础设施，渠道无关）。
+func (h *Handler) runProxyProbe(ctx context.Context, proxyURL, lang string) proxyProbeResult {
+	return probeProxy(ctx, proxyURL, lang)
+}
+
+func probeProxy(ctx context.Context, proxyURL, lang string) proxyProbeResult {
+	return probeProxyWithTimeout(ctx, proxyURL, lang, 15*time.Second)
+}
+
+func probeProxyWithTimeout(
+	ctx context.Context,
+	proxyURL string,
+	lang string,
+	clientTimeout time.Duration,
+) proxyProbeResult {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return proxyProbeResult{
+			Conclusive: true,
+			Error:      "代理 URL 不能为空",
+		}
+	}
+	proxyScheme := ""
+	if separator := strings.Index(proxyURL, "://"); separator > 0 {
+		proxyScheme = strings.ToLower(strings.TrimSpace(proxyURL[:separator]))
+	}
+	transport := &http.Transport{DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	var connectedToProxyEndpoint atomic.Bool
+	var startedSOCKSTargetConnect atomic.Bool
+	if err := auth.ConfigureTransportProxyWithObserver(
+		transport,
+		proxyURL,
+		baseDialer,
+		auth.ProxyTransportObserver{
+			OnProxyConnect: func() {
+				connectedToProxyEndpoint.Store(true)
+			},
+			OnSOCKSTargetConnectStart: func() {
+				startedSOCKSTargetConnect.Store(true)
+			},
+		},
+	); err != nil {
+		return proxyProbeResult{
+			Conclusive: true,
+			Error:      fmt.Sprintf("代理 URL 格式错误: %v", err),
+		}
+	}
+
+	lang = boundedProxyProbeField(lang, 16)
+	if lang == "" {
+		lang = "en"
+	}
+
+	client := &http.Client{Transport: transport, Timeout: clientTimeout}
+	var gotTransportConnection atomic.Bool
+	connectionState := func() proxyProbeConnectionState {
+		return proxyProbeConnectionState{
+			ConnectedToProxyEndpoint:  connectedToProxyEndpoint.Load(),
+			StartedSOCKSTargetConnect: startedSOCKSTargetConnect.Load(),
+			GotTransportConnection:    gotTransportConnection.Load(),
+		}
+	}
+	primary := doProxyProbeRequest(
+		ctx,
+		client,
+		&gotTransportConnection,
+		proxyScheme,
+		connectionState,
+		proxyProbeIPv4URLFn(lang),
+		parseIPAPIProbeBody,
+	)
+	if primary.Success || ctx.Err() != nil || !shouldFallbackToIPv6Probe(primary) {
+		return primary
+	}
+
+	var ipv6Result proxyProbeResult
+	for _, echoURL := range proxyProbeIPv6EchoURLsFn() {
+		if ctx.Err() != nil {
+			return primary
+		}
+		ipv6Result = doProxyProbeRequest(
+			ctx,
+			client,
+			&gotTransportConnection,
+			proxyScheme,
+			connectionState,
+			echoURL,
+			parseProxyProbeEchoBody,
+		)
+		if ipv6Result.Success {
+			break
+		}
+	}
+	if !ipv6Result.Success {
+		if primary.Error != "" {
+			primary.Error += "；IPv4/IPv6 检测目标都不可达"
+		}
+		return primary
+	}
+
+	country, region, city, isp := proxyProbeLookupGeoFn(ctx, ipv6Result.IP, lang)
+	ipv6Result.Country = country
+	ipv6Result.Region = region
+	ipv6Result.City = city
+	ipv6Result.ISP = isp
+	ipv6Result.Location = joinProxyProbeLocation(country, region, city)
+	return ipv6Result
+}
+
+func defaultProxyProbeIPv4URL(lang string) string {
+	return fmt.Sprintf(
+		"http://ip-api.com/json/?lang=%s&fields=%s",
+		url.QueryEscape(lang),
+		proxyProbeIPAPIFields,
+	)
+}
+
+func defaultProxyProbeIPv6EchoURLs() []string {
+	return []string{
+		"https://api6.ipify.org?format=json",
+		"https://ipv6.icanhazip.com",
+	}
+}
+
+func doProxyProbeRequest(
+	ctx context.Context,
+	client *http.Client,
+	gotTransportConnection *atomic.Bool,
+	proxyScheme string,
+	connectionState func() proxyProbeConnectionState,
+	probeURL string,
+	parseBody func([]byte, int) proxyProbeResult,
+) proxyProbeResult {
+	gotTransportConnection.Store(false)
+	trace := &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) {
+			gotTransportConnection.Store(true)
+		},
+	}
+	req, err := http.NewRequestWithContext(
+		httptrace.WithClientTrace(ctx, trace),
+		http.MethodGet,
+		probeURL,
+		nil,
+	)
+	if err != nil {
+		return proxyProbeResult{Error: fmt.Sprintf("创建代理检测请求失败: %v", err)}
+	}
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	latencyMs := int(time.Since(start).Milliseconds())
+	if err != nil {
+		return proxyProbeResult{
+			Conclusive: proxyProbeErrorIsConclusive(ctx, err, connectionState(), proxyScheme),
+			LatencyMs:  latencyMs,
+			Error:      fmt.Sprintf("连接失败: %v", err),
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return proxyProbeResult{
+			Conclusive: true,
+			LatencyMs:  latencyMs,
+			Error:      "代理认证失败 (HTTP 407)",
+		}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     fmt.Sprintf("代理检测服务暂时不可用 (HTTP %d)", resp.StatusCode),
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, proxyProbeMaxBody+1))
+	if err != nil {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     fmt.Sprintf("读取代理检测服务响应失败: %v", err),
+		}
+	}
+	if len(body) > proxyProbeMaxBody {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     "代理检测服务响应过大",
+		}
+	}
+	return parseBody(body, latencyMs)
+}
+
+func parseIPAPIProbeBody(body []byte, latencyMs int) proxyProbeResult {
+	if !gjson.ValidBytes(body) {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     "代理检测服务返回了无效响应",
+		}
+	}
+	result := gjson.ParseBytes(body)
+	if result.Get("status").String() != "success" {
+		message := boundedProxyProbeField(result.Get("message").String(), 256)
+		if message == "" {
+			message = "代理检测服务暂时不可用，请稍后重试"
+		} else {
+			message = "代理检测服务未能完成检测: " + message
+		}
+		return proxyProbeResult{LatencyMs: latencyMs, Error: message}
+	}
+	ip := strings.TrimSpace(result.Get("query").String())
+	if net.ParseIP(ip) == nil {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     "代理检测服务响应缺少有效的出口 IP",
+		}
+	}
+	country, region, city, isp := parseIPAPIGeoFields(result)
+	return proxyProbeResult{
+		Success:    true,
+		Conclusive: true,
+		IP:         ip,
+		Country:    country,
+		Region:     region,
+		City:       city,
+		ISP:        isp,
+		LatencyMs:  latencyMs,
+		Location:   joinProxyProbeLocation(country, region, city),
+	}
+}
+
+func parseProxyProbeEchoBody(body []byte, latencyMs int) proxyProbeResult {
+	ip, err := parseProxyProbeExitIP(body)
+	if err != nil {
+		return proxyProbeResult{
+			LatencyMs: latencyMs,
+			Error:     "代理检测服务响应缺少有效的出口 IP",
+		}
+	}
+	return proxyProbeResult{
+		Success:    true,
+		Conclusive: true,
+		IP:         ip,
+		LatencyMs:  latencyMs,
+	}
+}
+
+func parseProxyProbeExitIP(body []byte) (string, error) {
+	if gjson.ValidBytes(body) {
+		parsed := gjson.ParseBytes(body)
+		for _, key := range []string{"ip", "query"} {
+			ip := strings.TrimSpace(parsed.Get(key).String())
+			if net.ParseIP(ip) != nil {
+				return ip, nil
+			}
+		}
+	}
+	text := strings.TrimSpace(string(body))
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "ip="); ok {
+			ip := strings.TrimSpace(after)
+			if net.ParseIP(ip) != nil {
+				return ip, nil
+			}
+		}
+	}
+	if ip := net.ParseIP(text); ip != nil {
+		return ip.String(), nil
+	}
+	return "", errors.New("missing exit ip")
+}
+
+func parseIPAPIGeoFields(result gjson.Result) (country, region, city, isp string) {
+	return boundedProxyProbeField(result.Get("country").String(), 80),
+		boundedProxyProbeField(result.Get("regionName").String(), 80),
+		boundedProxyProbeField(result.Get("city").String(), 80),
+		boundedProxyProbeField(result.Get("isp").String(), 160)
+}
+
+func parseIPWhoisGeoFields(result gjson.Result) (country, region, city, isp string) {
+	return boundedProxyProbeField(result.Get("country").String(), 80),
+		boundedProxyProbeField(result.Get("region").String(), 80),
+		boundedProxyProbeField(result.Get("city").String(), 80),
+		boundedProxyProbeField(result.Get("connection.isp").String(), 160)
+}
+
+func joinProxyProbeLocation(country, region, city string) string {
+	if country == "" && region == "" && city == "" {
+		return ""
+	}
+	return country + "·" + region + "·" + city
+}
+
+func shouldFallbackToIPv6Probe(result proxyProbeResult) bool {
+	if result.Success || result.Conclusive {
+		return false
+	}
+	return proxyProbeErrorLooksLikeTargetUnreachable(result.Error)
+}
+
+func proxyProbeErrorLooksLikeTargetUnreachable(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"unknown error network unreachable",
+		"unknown error host unreachable",
+		"connect: network is unreachable",
+		"connect: host unreachable",
+		"no route to host",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func lookupProxyExitGeo(ctx context.Context, ip, lang string) (country, region, city, isp string) {
+	if net.ParseIP(ip) == nil {
+		return "", "", "", ""
+	}
+	if country, region, city, isp, ok := fetchIPAPIGeo(ctx, ip, lang); ok {
+		return country, region, city, isp
+	}
+	return fetchIPWhoisGeo(ctx, ip)
+}
+
+func fetchIPAPIGeo(ctx context.Context, ip, lang string) (country, region, city, isp string, ok bool) {
+	probeURL := fmt.Sprintf(
+		"http://ip-api.com/json/%s?lang=%s&fields=%s",
+		url.PathEscape(ip),
+		url.QueryEscape(lang),
+		proxyProbeIPAPIFields,
+	)
+	body, err := fetchProxyProbeGeoBody(ctx, probeURL)
+	if err != nil || !gjson.ValidBytes(body) {
+		return "", "", "", "", false
+	}
+	result := gjson.ParseBytes(body)
+	if result.Get("status").String() != "success" {
+		return "", "", "", "", false
+	}
+	country, region, city, isp = parseIPAPIGeoFields(result)
+	return country, region, city, isp, true
+}
+
+func fetchIPWhoisGeo(ctx context.Context, ip string) (country, region, city, isp string) {
+	probeURL := "https://ipwho.is/" + url.PathEscape(ip)
+	body, err := fetchProxyProbeGeoBody(ctx, probeURL)
+	if err != nil || !gjson.ValidBytes(body) {
+		return "", "", "", ""
+	}
+	result := gjson.ParseBytes(body)
+	if !result.Get("success").Bool() {
+		return "", "", "", ""
+	}
+	return parseIPWhoisGeoFields(result)
+}
+
+func fetchProxyProbeGeoBody(ctx context.Context, probeURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := proxyProbeGeoHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("geo lookup HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, proxyProbeMaxBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > proxyProbeMaxBody {
+		return nil, errors.New("geo lookup response too large")
+	}
+	return body, nil
+}
+
+func boundedProxyProbeField(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return value
+}
+
+func proxyProbeErrorIsConclusive(
+	ctx context.Context,
+	err error,
+	state proxyProbeConnectionState,
+	proxyScheme string,
+) bool {
+	if ctx.Err() != nil || state.GotTransportConnection {
+		return false
+	}
+	if !state.ConnectedToProxyEndpoint {
+		return true
+	}
+	if proxyScheme == "socks5" || proxyScheme == "socks5h" {
+		if !state.StartedSOCKSTargetConnect {
+			return true
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return false
+		}
+		message := strings.ToLower(err.Error())
+		for _, targetFailure := range []string{
+			"unknown error network unreachable",
+			"unknown error host unreachable",
+			"unknown error connection refused",
+			"unknown error ttl expired",
+		} {
+			if strings.Contains(message, targetFailure) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func respondProxyTestSaveError(c *gin.Context, err error, probeMessage string) {
+	if errors.Is(err, database.ErrProxyTestTargetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "代理在测试期间已被修改，请重新测试"})
+		return
+	}
+	if strings.TrimSpace(probeMessage) == "" {
+		probeMessage = "代理测试已完成"
+	}
+	log.Printf("同步代理测试结果失败: probe_error=%q err=%v", probeMessage, err)
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": fmt.Sprintf("%s；保存测试结果或刷新代理池失败: %v", probeMessage, err),
+	})
+}
+
+// TestProxy 测试代理连通性与出口 IP 位置
+func (h *Handler) TestProxy(c *gin.Context) {
+	var req struct {
+		URL  string `json:"url"`
+		ID   int64  `json:"id"`
+		Lang string `json:"lang"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请提供代理 URL")
+		return
+	}
+	proxyURL := strings.TrimSpace(req.URL)
+	if proxyURL == "" {
+		writeError(c, http.StatusBadRequest, "请提供代理 URL")
+		return
+	}
+	expectedURL := proxyURL
+	if req.ID > 0 {
+		row, err := h.db.GetProxy(c.Request.Context(), req.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "代理不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+			return
+		}
+		storedURL := row.URL
+		if strings.TrimSpace(storedURL) != proxyURL {
+			c.JSON(http.StatusConflict, gin.H{"error": "代理已被修改，请刷新后重新测试"})
+			return
+		}
+		expectedURL = storedURL
+		proxyURL = strings.TrimSpace(storedURL)
+	}
+
+	result := h.runProxyProbe(c.Request.Context(), proxyURL, req.Lang)
+	if result.Conclusive {
+		status := database.ProxyTestStatusError
+		if result.Success {
+			status = database.ProxyTestStatusSuccess
+		}
+		if err := h.persistProxyTestResult(
+			c.Request.Context(),
+			req.ID,
+			expectedURL,
+			status,
+			result.IP,
+			result.Location,
+			result.LatencyMs,
+		); err != nil {
+			respondProxyTestSaveError(c, err, result.Error)
+			return
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}

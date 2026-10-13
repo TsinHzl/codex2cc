@@ -1,0 +1,587 @@
+package admin
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/codex2cc/auth"
+	"github.com/codex2cc/proxy"
+)
+
+func TestShouldMarkBatchTestAccountError(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		want       bool
+	}{
+		{
+			name:       "forbidden is account scoped",
+			statusCode: http.StatusForbidden,
+			body:       []byte(`{"error":{"code":"unsupported_country_region_territory"}}`),
+			want:       true,
+		},
+		{
+			name:       "payment required deactivated workspace is account scoped",
+			statusCode: http.StatusPaymentRequired,
+			body:       []byte(`{"detail":{"code":"deactivated_workspace"}}`),
+			want:       true,
+		},
+		{
+			name:       "bare payment required is account scoped",
+			statusCode: http.StatusPaymentRequired,
+			body:       []byte(`{"detail":"Payment Required"}`),
+			want:       true,
+		},
+		{
+			name:       "invalid grant bad request is account scoped",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":"invalid_grant"}`),
+			want:       true,
+		},
+		{
+			name:       "model version bad request is global",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"detail":"The 'gpt-5.5' model requires a newer version of Codex"}`),
+			want:       false,
+		},
+		{
+			name:       "server error is not marked as account error",
+			statusCode: http.StatusBadGateway,
+			body:       []byte(`bad gateway`),
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldMarkBatchTestAccountError(tt.statusCode, tt.body); got != tt.want {
+				t.Fatalf("shouldMarkBatchTestAccountError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBatchOperationHTTPStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  string
+		message string
+		want    int
+	}{
+		{name: "success", status: "success", message: "测试通过", want: http.StatusOK},
+		{name: "upstream chinese", status: "failed", message: "上游返回 402: workspace deactivated", want: http.StatusPaymentRequired},
+		{name: "http prefix", status: "failed", message: "HTTP 500: upstream failed", want: http.StatusInternalServerError},
+		{name: "embedded status", status: "failed", message: "token endpoint returned status 401", want: http.StatusUnauthorized},
+		{name: "status code", status: "failed", message: "token endpoint returned status code 403", want: http.StatusForbidden},
+		{name: "status equals", status: "failed", message: "OAuth refresh failed (status=429)", want: http.StatusTooManyRequests},
+		{name: "application error", status: "failed", message: "response.failed: model unavailable", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := batchOperationHTTPStatus(tt.status, tt.message); got != tt.want {
+				t.Fatalf("batchOperationHTTPStatus(%q, %q) = %d, want %d", tt.status, tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEmitBatchTestProgressIncludesStructuredResult(t *testing.T) {
+	var completed, success, failed, banned, rateLimited int64
+	atomic.StoreInt64(&failed, 1)
+	atomic.StoreInt64(&rateLimited, 1)
+
+	var got batchOperationEvent
+	handler := &Handler{}
+	handler.emitBatchTestProgress(
+		func(event batchOperationEvent) {
+			got = event
+		},
+		42,
+		3,
+		&completed,
+		&success,
+		&failed,
+		&banned,
+		&rateLimited,
+		"rate_limited",
+		"上游返回 429: 账号触发限流",
+	)
+
+	if got.Type != "progress" || got.Action != "batch_test" {
+		t.Fatalf("event type/action = %q/%q, want progress/batch_test", got.Type, got.Action)
+	}
+	if got.AccountID != 42 || got.Status != "rate_limited" || got.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("event account/status/http = %d/%q/%d, want 42/rate_limited/429", got.AccountID, got.Status, got.HTTPStatus)
+	}
+	if got.Current != 1 || got.Total != 3 || got.Failed != 1 || got.RateLimited != 1 {
+		t.Fatalf("event counters = current:%d total:%d failed:%d rate_limited:%d", got.Current, got.Total, got.Failed, got.RateLimited)
+	}
+}
+
+func TestResolveBatchTestAccountsDefaultsToAllAccounts(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "token-2", Status: auth.StatusReady})
+
+	accounts, missing := resolveBatchTestAccounts(store, nil)
+	if missing != 0 {
+		t.Fatalf("missing = %d, want 0", missing)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("len(accounts) = %d, want 2", len(accounts))
+	}
+}
+
+func TestResolveBatchTestAccountsUsesSelectedIDs(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "token-2", Status: auth.StatusReady})
+
+	ids := []int64{2, 99, 2, 1}
+	accounts, missing := resolveBatchTestAccounts(store, &ids)
+	if missing != 1 {
+		t.Fatalf("missing = %d, want 1", missing)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("len(accounts) = %d, want 2", len(accounts))
+	}
+	if accounts[0].DBID != 2 || accounts[1].DBID != 1 {
+		t.Fatalf("account order = [%d, %d], want [2, 1]", accounts[0].DBID, accounts[1].DBID)
+	}
+}
+
+func TestRunSingleBatchTestTimesOutSlowStreamingBody(t *testing.T) {
+	previousTimeout := batchTestAccountTimeout
+	batchTestAccountTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		batchTestAccountTimeout = previousTimeout
+	})
+
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		time.Sleep(50 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	start := time.Now()
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	elapsed := time.Since(start)
+
+	if status != "failed" {
+		t.Fatalf("status = %q, want failed", status)
+	}
+	if !strings.Contains(msg, "测试超时") {
+		t.Fatalf("message = %q, want timeout message", msg)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("batch test took %s, want bounded timeout", elapsed)
+	}
+	if account.Status == auth.StatusError {
+		t.Fatal("timeout should not mark account as permanent error")
+	}
+	if account.LastTimeoutAt.IsZero() {
+		t.Fatal("timeout should be recorded in scheduler health")
+	}
+}
+
+func TestRunSingleBatchTestSuccessRecoversBannedAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"hello"}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:               1,
+		UpstreamType:       auth.UpstreamOpenAIResponses,
+		BaseURL:            server.URL,
+		APIKey:             "test-key",
+		Models:             []string{"gpt-4o-mini"},
+		Status:             auth.StatusCooldown,
+		CooldownUtil:       time.Now().Add(time.Hour),
+		CooldownReason:     "unauthorized",
+		HealthTier:         auth.HealthTierBanned,
+		FailureStreak:      3,
+		LastFailureAt:      time.Now().Add(-time.Minute),
+		LastUnauthorizedAt: time.Now().Add(-time.Minute),
+	}
+	atomic.StoreInt32(&account.Disabled, 1)
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "success" {
+		t.Fatalf("status = %q, message = %q, want success", status, msg)
+	}
+
+	account.Mu().RLock()
+	accountStatus := account.Status
+	healthTier := account.HealthTier
+	cooldownUntil := account.CooldownUtil
+	cooldownReason := account.CooldownReason
+	failureStreak := account.FailureStreak
+	successStreak := account.SuccessStreak
+	lastSuccessAt := account.LastSuccessAt
+	account.Mu().RUnlock()
+
+	if atomic.LoadInt32(&account.Disabled) != 0 {
+		t.Fatal("successful batch test should clear disabled flag")
+	}
+	if accountStatus != auth.StatusReady {
+		t.Fatalf("Status = %v, want ready", accountStatus)
+	}
+	if healthTier == auth.HealthTierBanned {
+		t.Fatal("successful batch test should recover banned health tier")
+	}
+	if !cooldownUntil.IsZero() || cooldownReason != "" {
+		t.Fatalf("cooldown = (%s, %q), want cleared", cooldownUntil, cooldownReason)
+	}
+	if failureStreak != 0 {
+		t.Fatalf("FailureStreak = %d, want 0", failureStreak)
+	}
+	if successStreak == 0 || lastSuccessAt.IsZero() {
+		t.Fatal("successful batch test should record scheduler success")
+	}
+}
+
+func TestRunSingleBatchTestResponseFailedDoesNotRecoverCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"error":{"message":"model unavailable","code":"model_not_available"}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:           1,
+		UpstreamType:   auth.UpstreamOpenAIResponses,
+		BaseURL:        server.URL,
+		APIKey:         "test-key",
+		Models:         []string{"gpt-4o-mini"},
+		Status:         auth.StatusCooldown,
+		CooldownUtil:   time.Now().Add(time.Hour),
+		CooldownReason: "rate_limited",
+		HealthTier:     auth.HealthTierRisky,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status == "success" {
+		t.Fatalf("status = success, want failure for response.failed; message=%q", msg)
+	}
+	if !strings.Contains(msg, "model unavailable") {
+		t.Fatalf("message = %q, want upstream failure detail", msg)
+	}
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	}
+}
+
+func TestRunSingleBatchTestResponseFailedMarksReadyAccountError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"error":{"message":"model unavailable","code":"model_not_available"}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status == "success" {
+		t.Fatalf("status = success, want failure for response.failed; message=%q", msg)
+	}
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "model unavailable") {
+		t.Fatalf("ErrorMsg = %q, want model unavailable", errorMsg)
+	}
+}
+
+func TestRunSingleBatchTestRelayUsageLimitDoesNotPersistAccountCooldown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":3600}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "rate_limited" {
+		t.Fatalf("status = %q, message = %q, want rate_limited", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active for direct API upstream", got)
+	}
+}
+
+func TestApplyUsageLimitedTestStateMarks7dRateLimited(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:        1,
+		AccessToken: "token",
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	account.SetUsagePercent7d(100)
+	account.SetReset7dAt(time.Now().Add(time.Hour))
+	store.AddAccount(account)
+
+	applyUsageLimitedTestState(store, account, proxy.CodexUsageSyncResult{
+		HasUsage7d: true,
+		UsagePct7d: 100,
+	})
+
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	}
+	reason, until := account.GetCooldownSnapshot()
+	if reason != "rate_limited" || until.IsZero() {
+		t.Fatalf("cooldown = (%q, %s), want active rate_limited cooldown", reason, until)
+	}
+}
+
+func TestApplyUsageLimitedTestStatePreservesBannedAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:       1,
+		PlanType:   "team",
+		Status:     auth.StatusReady,
+		HealthTier: auth.HealthTierBanned,
+	}
+	account.SetUsagePercent7d(100)
+	account.SetReset7dAt(time.Now().Add(time.Hour))
+	store.AddAccount(account)
+
+	applyUsageLimitedTestState(store, account, proxy.CodexUsageSyncResult{
+		HasUsage7d: true,
+		UsagePct7d: 100,
+	})
+
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+}
+
+func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"token_invalidated","message":"token invalidated"},"status":401}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "banned" {
+		t.Fatalf("status = %q, message = %q, want banned", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "token_invalidated") {
+		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+}
+
+func TestRunSingleBatchTestSkipsDeactivatedWorkspaceHandshake(t *testing.T) {
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	trigger := &auth.Account{
+		DBID:        1,
+		AccessToken: "at-trigger",
+		AccountID:   "org-ws",
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat := &auth.Account{
+		DBID:        2,
+		AccessToken: "at-k12",
+		AccountID:   "seat-k12",
+		PlanType:    "k12",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat.CustomHeaders = map[string]string{"Chatgpt-Account-Id": "org-ws"}
+	store.AddAccount(trigger)
+	store.AddAccount(k12Seat)
+	store.MarkDeactivatedWorkspace(trigger, "WHAM 用量探针返回 402: deactivated_workspace")
+
+	handler := &Handler{store: store}
+	status, msg := handler.runSingleBatchTest(context.Background(), k12Seat)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if !strings.Contains(msg, "工作区联动") {
+		t.Fatalf("message = %q, want linked workspace skip", msg)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("deactivated workspace sibling still probed upstream %d times", hits.Load())
+	}
+	if k12Seat.RuntimeStatus() != "error" {
+		t.Fatalf("k12 status = %q, want error", k12Seat.RuntimeStatus())
+	}
+}
+
+func TestRunSingleBatchTestPaymentRequiredMarksError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":"Payment Required"}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "402") {
+		t.Fatalf("ErrorMsg = %q, want 402", errorMsg)
+	}
+}
+
+// TestRunSingleBatchTestDeletedAgentRuntimeMarksBanned 验证批量测试会将 runtime 已删除的账号标记为封禁。
+func TestRunSingleBatchTestDeletedAgentRuntimeMarksBanned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "banned" {
+		t.Fatalf("status = %q, message = %q, want banned", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	_, cooldownUntil := account.GetCooldownSnapshot()
+	if remaining := time.Until(cooldownUntil); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("cooldown remaining = %s, want approximately 24h", remaining)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "Agent runtime has been deleted") {
+		t.Fatalf("ErrorMsg = %q, want deleted runtime message", errorMsg)
+	}
+}

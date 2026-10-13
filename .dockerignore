@@ -1,0 +1,14 @@
+.git
+.env
+*.db
+*.db-journal
+*.log
+logs/
+data/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+/tmp
+.dac
+openspec
+*.md

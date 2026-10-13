@@ -1,0 +1,18 @@
+schema: spec-driven
+
+context: |
+  项目：codex2cc —— 从 codex2api 抽离的 [CC] CLI → Codex/ChatGPT 上游代理网关。
+  Go 1.26 + Gin；sqlite/postgres 双驱动；React 19 + Vite + Tailwind 4 管理台（go:embed）。
+  下游协议：Anthropic Messages（/v1/messages）；上游：Codex/ChatGPT OAuth + relay 账号池。
+  裁剪原则：只移除渠道与功能代码，保留原有架构、命名与样式，不重写不改设计。
+
+rules:
+  specs:
+    - spec 只描述抽离后的可观察行为（路由、协议、鉴权、样式页面），不描述裁剪过程
+    - 每条 Requirement 至少一个 Scenario，使用 WHEN/THEN 格式
+  tasks:
+    - 任务按「包为单位」组织（database → cache/config → auth → proxy → admin → frontend → main/构建）
+    - 每个任务的验证方式是可执行命令（go build / go test / npm run build）
+    - import path 改写（github.com/codex2api → github.com/codex2cc）作为独立任务
+  design:
+    - 关键决策点：裁剪边界（保留/删除文件清单）、handler.go 与 store.go 的渠道代码剔除策略、测试同步策略

@@ -1,0 +1,227 @@
+/* Frosted Glass — material taken from the cinematic theme switcher:
+ * milky track, inset highlight, soft dual shadows, pill thumb. */
+
+@layer base {
+  :root.theme-glass {
+    --color-background: hsl(210 33% 96%);
+    --color-foreground: hsl(222 32% 16%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(222 32% 16%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(222 32% 16%);
+    --color-primary: hsl(32 92% 48%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(214 22% 90%);
+    --color-secondary-foreground: hsl(222 24% 24%);
+    --color-muted: hsl(214 22% 91%);
+    --color-muted-foreground: hsl(215 14% 40%);
+    --color-accent: hsl(36 86% 90%);
+    --color-accent-foreground: hsl(28 50% 22%);
+    --color-border: hsl(214 20% 84%);
+    --color-input: hsl(214 20% 84%);
+    --color-ring: hsl(32 92% 48%);
+    --sidebar-background: 210 40% 98%;
+    --website-nav-foreground: hsl(28 50% 22%);
+    --website-nav-background: hsl(36 86% 90%);
+    --website-link: hsl(32 80% 38%);
+    --website-card-radius: 22px;
+    --website-button-radius: 999px;
+    --website-field-radius: 14px;
+    --website-nav-radius: 999px;
+    --website-card-shadow: var(--glass-drop);
+    --website-button-weight: 600;
+    --website-nav-weight: 550;
+    --website-nav-size: 13px;
+    --glass-highlight: inset 1px 1px 0 hsl(0 0% 100% / 0.82), inset 0 1px 8px hsl(0 0% 100% / 0.35);
+    --glass-inset: inset 4px 4px 10px hsl(215 20% 62% / 0.16), inset -4px -4px 10px hsl(0 0% 100% / 0.88);
+    --glass-drop: 0 1px 1px hsl(0 0% 100% / 0.7), 0 8px 24px hsl(222 30% 16% / 0.08), 0 18px 40px hsl(222 30% 16% / 0.05);
+    --glass-card-opacity: 78%;
+    --glass-sidebar-opacity: 72%;
+    --glass-control-opacity: 62%;
+    --glass-blur: blur(16px) saturate(1.18);
+    --glass-control-blur: blur(10px) saturate(1.08);
+  }
+
+  :root.dark.theme-glass {
+    --color-background: hsl(222 47% 6%);
+    --color-foreground: hsl(210 28% 92%);
+    --color-card: hsl(217 33% 14%);
+    --color-card-foreground: hsl(210 28% 92%);
+    --color-popover: hsl(217 33% 14%);
+    --color-popover-foreground: hsl(210 28% 92%);
+    --color-primary: hsl(43 96% 76%);
+    --color-primary-foreground: hsl(222 40% 10%);
+    --color-secondary: hsl(215 19% 27%);
+    --color-secondary-foreground: hsl(210 20% 86%);
+    --color-muted: hsl(215 19% 22%);
+    --color-muted-foreground: hsl(214 14% 68%);
+    --color-accent: hsl(215 24% 22%);
+    --color-accent-foreground: hsl(43 96% 80%);
+    --color-border: hsl(215 18% 28%);
+    --color-input: hsl(215 18% 28%);
+    --color-ring: hsl(43 96% 76%);
+    --sidebar-background: 222 41% 8%;
+    --website-nav-foreground: hsl(43 96% 80%);
+    --website-nav-background: hsl(215 24% 22%);
+    --website-link: hsl(43 90% 72%);
+    --glass-highlight: inset 1px 1px 0 hsl(210 20% 88% / 0.12), inset 0 1px 10px hsl(214 20% 70% / 0.06);
+    --glass-inset: inset 5px 5px 12px hsl(222 40% 4% / 0.55), inset -4px -4px 10px hsl(215 20% 50% / 0.12);
+    --glass-drop: 0 1px 1px hsl(210 20% 90% / 0.04), 0 10px 28px hsl(222 50% 2% / 0.38), 0 22px 48px hsl(222 50% 2% / 0.22);
+    --glass-card-opacity: 58%;
+    --glass-sidebar-opacity: 54%;
+    --glass-control-opacity: 46%;
+  }
+}
+
+@layer components {
+  :root.theme-glass {
+    --glass-fill: color-mix(in oklab, var(--color-card) var(--glass-card-opacity), transparent);
+    --glass-sidebar-fill: color-mix(in oklab, hsl(var(--sidebar-background)) var(--glass-sidebar-opacity), transparent);
+    --glass-control-fill: color-mix(in oklab, var(--color-background) var(--glass-control-opacity), transparent);
+  }
+
+  :root.theme-glass body {
+    background:
+      radial-gradient(ellipse at top left, hsl(0 0% 100%) 0%, hsl(210 40% 96%) 42%, hsl(214 24% 90%) 100%);
+  }
+
+  :root.dark.theme-glass body {
+    background:
+      radial-gradient(ellipse at top left, hsl(217 33% 17%) 0%, hsl(222 47% 8%) 42%, hsl(222 55% 4%) 100%);
+  }
+
+  :root.theme-glass :is(
+    [data-slot='card'],
+    [data-slot='dialog-content'],
+    [data-slot='sheet-content'],
+    .data-table-shell,
+    .toolbar-surface,
+    .appearance-workspace,
+    .appearance-preview-window,
+    .appearance-theme-card
+  ) {
+    border-radius: var(--website-card-radius);
+    background-color: var(--glass-fill) !important;
+    border-color: color-mix(in oklab, var(--color-border) 70%, transparent) !important;
+    box-shadow: var(--glass-highlight), var(--glass-inset), var(--glass-drop);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+
+  :root.theme-glass :is(
+    [data-slot='admin-sidebar'],
+    [data-slot='admin-mobile-topbar'],
+    [data-slot='admin-mobile-nav']
+  ) {
+    background-color: var(--glass-sidebar-fill) !important;
+    border-color: color-mix(in oklab, var(--color-border) 65%, transparent) !important;
+    box-shadow: var(--glass-highlight), var(--glass-drop);
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+  }
+
+  :root.theme-glass [data-slot='button']:not([data-variant='link']) {
+    border-radius: var(--website-button-radius);
+    font-weight: var(--website-button-weight);
+  }
+
+  :root.theme-glass [data-slot='button'][data-variant='default'] {
+    box-shadow:
+      inset 0 1px 0 hsl(0 0% 100% / 0.35),
+      0 8px 18px color-mix(in oklab, var(--color-primary) 28%, transparent);
+  }
+
+  :root.theme-glass :is(
+    [data-slot='input'],
+    [data-slot='select-trigger'],
+    [data-slot='button'][data-variant='outline'],
+    .appearance-search
+  ) {
+    border-radius: var(--website-field-radius);
+    background-color: var(--glass-control-fill) !important;
+    -webkit-backdrop-filter: var(--glass-control-blur);
+    backdrop-filter: var(--glass-control-blur);
+    box-shadow: var(--glass-highlight), var(--glass-inset);
+  }
+
+  :root.theme-glass [data-slot='admin-sidebar'] nav a {
+    border-radius: var(--website-nav-radius);
+    font-size: var(--website-nav-size);
+    font-weight: var(--website-nav-weight);
+  }
+
+  :root.theme-glass [data-slot='admin-sidebar'] nav a[aria-current='page'] {
+    background: var(--website-nav-background);
+    border-color: transparent;
+    color: var(--website-nav-foreground);
+    box-shadow: var(--glass-highlight);
+  }
+
+  :root.theme-glass [data-slot='admin-sidebar'] nav a[aria-current='page'] > span[aria-hidden='true'] {
+    background: var(--website-nav-foreground);
+  }
+
+  :root.theme-glass .appearance-demo-nav { border-radius: 999px; }
+  :root.theme-glass .appearance-demo-nav.is-active {
+    color: var(--website-nav-foreground);
+    background: var(--website-nav-background);
+  }
+
+  :root.theme-glass .appearance-theme-art {
+    border-radius: max(8px, calc(var(--website-card-radius) - 8px));
+  }
+
+  :root.theme-glass :is(.appearance-demo-metrics > div, .appearance-demo-chart, .appearance-demo-request, .appearance-demo-notice) {
+    border-radius: 14px;
+    background-color: var(--glass-fill);
+    box-shadow: var(--glass-highlight);
+  }
+
+  :root.theme-glass :is(.appearance-demo-action, .appearance-demo-outline) {
+    border-radius: 999px;
+    font-weight: 600;
+  }
+
+  :root.theme-glass .theme-settings-page .appearance-demo-action {
+    background: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+
+  :root.theme-glass .appearance-preview-stage {
+    background-image:
+      radial-gradient(ellipse at top left, color-mix(in srgb, var(--color-primary) 16%, transparent), transparent 58%),
+      radial-gradient(color-mix(in srgb, var(--appearance-muted-ink) 14%, transparent) 0.7px, transparent 0.7px);
+    background-size: auto, 14px 14px;
+  }
+
+  .appearance-thumbnail[data-ui='glass'] {
+    --website-card-radius: 22px;
+    --website-button-radius: 999px;
+    --website-nav-radius: 999px;
+    --website-card-shadow: 0 10px 24px #12203314;
+  }
+
+  .appearance-thumbnail[data-ui='glass'] .appearance-thumb-window {
+    background: color-mix(in srgb, var(--thumb-surface) 78%, transparent);
+    box-shadow: inset 0 1px 0 #fff9, 0 10px 20px #12203312;
+  }
+
+  .appearance-thumbnail[data-ui='glass'] .appearance-thumb-sidebar {
+    background: color-mix(in srgb, var(--thumb-sidebar) 70%, transparent);
+  }
+
+  .appearance-thumbnail[data-ui='glass'] .appearance-thumb-heading > i:last-child,
+  .appearance-thumbnail[data-ui='glass'] .appearance-thumb-sidebar > i:first-of-type {
+    border-radius: 999px;
+  }
+
+  @media (prefers-reduced-transparency: reduce) {
+    :root.theme-glass {
+      --glass-card-opacity: 100%;
+      --glass-sidebar-opacity: 100%;
+      --glass-control-opacity: 100%;
+      --glass-blur: none;
+      --glass-control-blur: none;
+    }
+  }
+}
