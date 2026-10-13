@@ -13,7 +13,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /codex2cc .
+# modernc.org/sqlite 为纯 Go 驱动，无需 CGO；禁用后交叉构建不依赖 gcc
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /codex2cc .
 
 # ---- 运行阶段 ----
 FROM alpine:3.20
