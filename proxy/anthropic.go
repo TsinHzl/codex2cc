@@ -375,12 +375,11 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 
 	// 注意：不设置 max_output_tokens，上游 Codex 不支持该字段
 
-	// reasoning: Codex 固定 summary=auto。
+	// reasoning: summary=detailed 请求完整思考摘要（auto 只回简短标题）。
 	effort := resolveReasoningEffort(req.OutputConfig, codexModel)
-	summary := "auto"
 	out["reasoning"] = map[string]any{
 		"effort":  effort,
-		"summary": summary,
+		"summary": "detailed",
 	}
 
 	if shouldUseCodexPriorityForAnthropicSpeed(req.Speed) {
@@ -847,6 +846,14 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 
 	case "response.output_text.delta":
 		return t.handleTextDelta(eventData)
+
+	case "response.reasoning_summary_part.added":
+		// 多段 summary 各占一行：段间补换行，避免上一段残余文本与
+		// 下一段标题挤在同一行渲染（截图中的连排问题）。
+		if t.thinkingAsText && t.thinkingTextOpen {
+			return t.contentBlockDelta(anthropicDelta{Type: "text_delta", Text: "\n"})
+		}
+		return nil
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return t.handleThinkingDelta(eventData)

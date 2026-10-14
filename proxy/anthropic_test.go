@@ -168,8 +168,8 @@ func TestTranslateAnthropicToCodex_OutputConfigEffortTakesPrecedence(t *testing.
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "xhigh" {
 		t.Fatalf("reasoning.effort = %q, want xhigh; body=%s", effort, got)
 	}
-	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "auto" {
-		t.Fatalf("reasoning.summary = %q, want auto; body=%s", summary, got)
+	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "detailed" {
+		t.Fatalf("reasoning.summary = %q, want detailed; body=%s", summary, got)
 	}
 }
 
@@ -228,8 +228,8 @@ func TestTranslateAnthropicToCodex_DefaultsReasoningHighWithSummary(t *testing.T
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort = %q, want high; body=%s", effort, got)
 	}
-	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "auto" {
-		t.Fatalf("reasoning.summary = %q, want auto; body=%s", summary, got)
+	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "detailed" {
+		t.Fatalf("reasoning.summary = %q, want detailed; body=%s", summary, got)
 	}
 	if tier := gjson.GetBytes(got, "service_tier"); tier.Exists() {
 		t.Fatalf("service_tier should be omitted when speed is absent; body=%s", got)
