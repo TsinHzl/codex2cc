@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2cc/auth"
 	"github.com/codex2cc/database"
@@ -22,6 +24,35 @@ import (
 // ==================== Anthropic 错误格式 ====================
 
 const upstreamErrorBodyReadMaxBytes = 1 << 20
+
+// debugSSEEvents 由 CODEX2CC_DEBUG_SSE=1 开启：打印 /v1/messages 上游原始
+// SSE 事件类型（reasoning/thinking 相关事件额外带截断后的原始 payload），
+// 仅用于排查上游是否下发 reasoning summary delta。
+var debugSSEEvents = os.Getenv("CODEX2CC_DEBUG_SSE") == "1"
+
+const debugSSEDataMaxBytes = 512
+
+// debugSSERedactKeys 打码的上游事件字段：密文与签名原样落日志无排障价值，
+// 且扩大泄露面（正文文本仅经临时调试门控打印，排障结束即移除）。
+var debugSSERedactKeys = []string{"encrypted_content", "signature", "summary_index", "obfuscated_content"}
+
+func truncateDebugSSEData(data []byte) string {
+	if len(data) > debugSSEDataMaxBytes {
+		// 回退到最近的合法 rune 边界，避免拦腰切断多字节字符
+		cut := debugSSEDataMaxBytes
+		for cut > 0 && !utf8.RuneStart(data[cut]) {
+			cut--
+		}
+		data = append(data[:cut:cut], []byte("...(truncated)")...)
+	}
+	s := string(data)
+	for _, key := range debugSSERedactKeys {
+		if idx := strings.Index(s, `"`+key+`"`); idx >= 0 {
+			s = s[:idx] + `"` + key + `":"<redacted>"...`
+		}
+	}
+	return s
+}
 
 // syncAnthropicUsageStateForAccount keeps the Anthropic Messages execution
 // path on the Codex usage-header semantics shared by Codex OAuth and relay
@@ -685,6 +716,13 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				if debugSSEEvents {
+					if strings.Contains(eventType, "reasoning") || strings.Contains(eventType, "thinking") {
+						log.Printf("[debug-sse] /v1/messages 上游事件: type=%s raw=%s", eventType, truncateDebugSSEData(data))
+					} else {
+						log.Printf("[debug-sse] /v1/messages 上游事件: type=%s", eventType)
+					}
+				}
 
 				// TTFT 跟踪
 				ttftGuard.MarkProgress(eventType)
