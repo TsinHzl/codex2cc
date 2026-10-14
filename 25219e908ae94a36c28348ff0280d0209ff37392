@@ -1,0 +1,31 @@
+Dockerfile
+  7932b62d110431aa 10-12,19-21
+.github/workflows/docker-build.yaml
+  7932b62d110431aa 13-16
+proxy/anthropic_test.go
+  7932b62d110431aa 8,1109-1110,1135,1137,1139-1140,1157,1178,1183-1233
+proxy/thinking_text.go
+  7932b62d110431aa 36-45
+proxy/anthropic.go
+  7932b62d110431aa 833-864,883-888,890,986-990,994-996,1044-1045,1111,1190-1196,1200,1209-1210,1212-1216,1237-1241,1294-1296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "25219e908ae94a36c28348ff0280d0209ff37392",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 160,
+      "total_deletions": 65,
+      "accepted_lines": 153,
+      "overriden_lines": 0
+    }
+  }
+}
