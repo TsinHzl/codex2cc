@@ -216,6 +216,16 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 
+	// Claude Code UA：剥离历史中由本代理渲染出的 thinking 文案块，并把本次
+	// 流式响应的 thinking 渲染为 dim 文本（💭 Thinking）。剥离发生在 ingress
+	// 不可变约束之后——仅修改转发给上游的请求体，不影响 NewAPI 签名校验。
+	thinkingAsText := isClaudeCodeUserAgent(c.Request.UserAgent())
+	if thinkingAsText {
+		rawBody = stripThinkingTextHistory(rawBody)
+	}
+	// thinking 渲染时长的锚点：请求到达时刻
+	requestStart := time.Now()
+
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
@@ -651,7 +661,13 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 
-			translator := newAnthropicStreamTranslator(originalModel)
+			// 渲染模式下时长锚点取请求到达时刻（网关缓冲也算入真实思考耗时）
+			var translator *anthropicStreamTranslator
+			if thinkingAsText {
+				translator = newAnthropicStreamTranslatorWithThinkingText(originalModel, requestStart)
+			} else {
+				translator = newAnthropicStreamTranslator(originalModel)
+			}
 			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
 			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -789,6 +790,13 @@ type anthropicStreamTranslator struct {
 	thinkingTokens            *anthropicOutputTokensDetails
 	pingAfterStartSent        bool
 	deltasSincePing           int
+	// thinkingAsText 为 true 时把 thinking 块渲染为 dim 文本块（仅 Claude Code UA）。
+	thinkingAsText       bool
+	thinkingTextPending  strings.Builder // 尚未凑成完整行的 reasoning delta
+	thinkingTextFirst    bool            // 渲染块是否尚未发出任何 text_delta（决定 header 行）
+	thinkingTextOpen     bool            // 渲染 text 块是否已发过 content_block_start
+	thinkingTextHasLines bool            // 是否已产出过至少一行（决定 stop 时是否补 duration）
+	thinkingTextStartAt  time.Time       // 时长锚点：请求到达时刻
 }
 
 // newAnthropicStreamTranslator 创建流式翻译器
@@ -797,6 +805,30 @@ func newAnthropicStreamTranslator(model string) *anthropicStreamTranslator {
 		model:      model,
 		responseID: "msg_" + uuid.New().String()[:24],
 	}
+}
+
+// newAnthropicStreamTranslatorWithThinkingText 创建渲染模式的流式翻译器：
+// thinking 块输出为 dim 文本（💭 Thinking 头行 + 逐行 dim + Thought for Xs），
+// 供 Claude Code 终端展示。时长锚点取请求到达时刻，网关侧缓冲也算入真实
+// 思考耗时（对齐 cc-proxy 的 startedAtMs 约定）。
+func newAnthropicStreamTranslatorWithThinkingText(model string, startedAt time.Time) *anthropicStreamTranslator {
+	t := newAnthropicStreamTranslator(model)
+	t.thinkingAsText = true
+	t.thinkingTextFirst = true
+	t.thinkingTextStartAt = startedAt
+	return t
+}
+
+// beginThinkingTextBlock 懒开渲染 text 块（首个完整行到达时才调用）。
+func (t *anthropicStreamTranslator) beginThinkingTextBlock() []anthropicStreamEvent {
+	events := t.closeCurrentBlock()
+	t.currentBlockType = "text"
+	events = append(events, t.startContentBlock(anthropicContentBlock{
+		Type: "text",
+		Text: "",
+	})...)
+	t.thinkingTextOpen = true
+	return events
 }
 
 // translateEvent 将单个 Codex SSE 事件翻译为零或多个 Anthropic SSE 事件
@@ -910,8 +942,16 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 
 	switch itemType {
 	case "reasoning":
-		// 关闭当前块
+		// 关闭当前块。渲染模式下不开 thinking 块，等首个 delta 懒开 text 块。
 		events = append(events, t.closeCurrentBlock()...)
+		if t.thinkingAsText {
+			t.currentBlockType = "text"
+			t.thinkingTextPending.Reset()
+			t.thinkingTextFirst = true
+			t.thinkingTextOpen = false
+			t.thinkingTextHasLines = false
+			return events
+		}
 		t.currentBlockType = "thinking"
 		events = append(events, t.startContentBlock(anthropicContentBlock{
 			Type:     "thinking",
@@ -950,7 +990,13 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		}
 
 	case "message":
-		// text block 延迟到第一个 delta 时打开
+		// text block 延迟到第一个 delta 时打开；渲染模式下若 thinking 渲染块
+		// 已开（reasoning 先行），必须先收尾（补 duration 行）再关闭，否则
+		// 回答文本会因懒开条件不触发而追加进 thinking 渲染块之后。
+		if t.thinkingAsText && t.thinkingTextOpen {
+			events = append(t.finishThinkingTextBlock(), t.closeCurrentBlock()...)
+			t.thinkingTextOpen = false
+		}
 	}
 
 	return events
@@ -999,6 +1045,43 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 		events = append(events, t.handleCreated()...)
 	}
 
+	// 渲染模式：攒行后逐行 flush 为 text_delta，约定 newline 引导下一行
+	//（块尾不带 '\n'）、空行滤除，逐字节对齐 cc-proxy transformThinkingAsTextEvents。
+	if t.thinkingAsText {
+		t.thinkingTextPending.WriteString(delta)
+		pending := t.thinkingTextPending.String()
+		for {
+			newline := strings.IndexByte(pending, '\n')
+			if newline < 0 {
+				break
+			}
+			line := strings.TrimSuffix(pending[:newline], "\r")
+			pending = pending[newline+1:]
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if !t.thinkingTextOpen {
+				events = append(events, t.beginThinkingTextBlock()...)
+			}
+			if t.thinkingTextFirst {
+				t.thinkingTextFirst = false
+				events = append(events, t.contentBlockDelta(anthropicDelta{
+					Type: "text_delta",
+					Text: thinkingTextHeaderLine,
+				})...)
+			}
+			t.thinkingTextHasLines = true
+			events = append(events, t.contentBlockDelta(anthropicDelta{
+				Type: "text_delta",
+				Text: "\n" + ansiDim + line + ansiReset,
+			})...)
+		}
+		t.thinkingTextPending.Reset()
+		t.thinkingTextPending.WriteString(pending)
+		return events
+	}
+
 	// 确保 thinking block 已打开
 	if !t.contentBlockOpen || t.currentBlockType != "thinking" {
 		events = append(events, t.closeCurrentBlock()...)
@@ -1042,6 +1125,11 @@ func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
 	if t.contentBlockOpen && t.currentBlockType == "thinking" {
 		return nil
 	}
+	// 渲染模式下 reasoning 的 *_text.done 同样不关块：渲染 text 块要等
+	// output_item.done 收尾（补 duration 行），提前关块会截断后续 delta。
+	if t.thinkingAsText && t.thinkingTextOpen {
+		return nil
+	}
 	return t.closeCurrentBlock()
 }
 
@@ -1066,7 +1154,48 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 			return append(events, t.closeCurrentBlock()...)
 		}
 	}
+	// 渲染模式收尾：仅对 reasoning item 生效（补 duration 行 + 关块），
+	// 避免 message / function_call 等其他 item 重复触发收尾或污染工具块。
+	if t.thinkingAsText && t.thinkingTextOpen &&
+		gjson.GetBytes(data, "item.type").String() == "reasoning" {
+		events := append(t.finishThinkingTextBlock(), t.closeCurrentBlock()...)
+		t.thinkingTextOpen = false
+		return events
+	}
 	return t.closeCurrentBlock()
+}
+
+// finishThinkingTextBlock 在渲染块的收尾补齐残余行 + duration 行。
+// newline 仍引导（`\n` + duration 行），块尾不带 '\n'；块从未产出任何行时
+// 不补任何内容（避免发出空 text 块的孤儿 stop 事件）。
+func (t *anthropicStreamTranslator) finishThinkingTextBlock() []anthropicStreamEvent {
+	var events []anthropicStreamEvent
+	if !t.thinkingAsText || !t.thinkingTextOpen {
+		return events
+	}
+	if lastLine := strings.TrimSpace(t.thinkingTextPending.String()); lastLine != "" {
+		var tail string
+		if t.thinkingTextFirst {
+			tail = thinkingTextHeaderLine
+			t.thinkingTextFirst = false
+		}
+		tail += "\n" + ansiDim + lastLine + ansiReset
+		t.thinkingTextHasLines = true
+		events = append(events, t.contentBlockDelta(anthropicDelta{
+			Type: "text_delta",
+			Text: tail,
+		})...)
+	}
+	t.thinkingTextPending.Reset()
+	if t.thinkingTextHasLines {
+		elapsed := time.Since(t.thinkingTextStartAt)
+		events = append(events, t.contentBlockDelta(anthropicDelta{
+			Type: "text_delta",
+			Text: "\n" + formatThinkingDurationLine(elapsed),
+		})...)
+	}
+	t.thinkingTextOpen = false
+	return events
 }
 
 // handleCompleted 处理 response.completed → message_delta + message_stop
