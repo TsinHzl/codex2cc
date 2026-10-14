@@ -1154,11 +1154,17 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 			return append(events, t.closeCurrentBlock()...)
 		}
 	}
-	// 渲染模式收尾：仅对 reasoning item 生效（补 duration 行 + 关块），
-	// 避免 message / function_call 等其他 item 重复触发收尾或污染工具块。
-	if t.thinkingAsText && t.thinkingTextOpen &&
+	// 渲染模式收尾：单段 summary 可能没有换行，因而只停留在 pending
+	// 且尚未打开块；reasoning item 完成时也必须懒开块并输出残余文本。
+	if t.thinkingAsText &&
+		(t.thinkingTextOpen || strings.TrimSpace(t.thinkingTextPending.String()) != "") &&
 		gjson.GetBytes(data, "item.type").String() == "reasoning" {
-		events := append(t.finishThinkingTextBlock(), t.closeCurrentBlock()...)
+		var events []anthropicStreamEvent
+		if !t.thinkingTextOpen {
+			events = append(events, t.beginThinkingTextBlock()...)
+		}
+		events = append(events, t.finishThinkingTextBlock()...)
+		events = append(events, t.closeCurrentBlock()...)
 		t.thinkingTextOpen = false
 		return events
 	}
