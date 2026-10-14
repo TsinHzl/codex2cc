@@ -7,14 +7,18 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Go 构建阶段 ----
-FROM golang:1.26-alpine AS go-builder
+# 在 BUILDPLATFORM 原生运行构建器，按 TARGETARCH 交叉编译，
+# 避免 buildx 在 arm64 目标上用 QEMU 模拟 x86 Go 编译（耗时主要来源）。
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS go-builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 # modernc.org/sqlite 为纯 Go 驱动，无需 CGO；禁用后交叉构建不依赖 gcc
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /codex2cc .
+ARG TARGETARCH
+# TARGETARCH 由 buildx 自动注入；直接 docker build 时可能为空，兜底 amd64。
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -ldflags="-s -w" -o /codex2cc .
 
 # ---- 运行阶段 ----
 FROM alpine:3.20

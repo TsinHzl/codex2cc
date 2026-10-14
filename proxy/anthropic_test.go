@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -1102,3 +1103,133 @@ func TestResolveMessagesRoutingBodySkipsFullTranslation(t *testing.T) {
 // TestNativeClaudeRoutingResolvesClaudeAliasBeforePassthrough
 // 随 claude 原生上游一起从 codex2cc 裁剪：hasNativeClaudeAccount*、
 // modelSupportedByAccountMapping、modelValidator 均已不存在。
+
+// TestAnthropicThinkingTextMultiPartSeparatesLines 覆盖上游实测形态：
+// 每个 reasoning summary part 恰好一个 delta，整段下发且不含 '\n'。
+// 段边界必须先把 pending 落成一行，否则多段标题会拼进同一行；
+// 渲染为 dim 文本时 `**` 粗体标记应被剥离。
+func TestAnthropicThinkingTextMultiPartSeparatesLines(t *testing.T) {
+	tr := newAnthropicStreamTranslatorWithThinkingText("gpt-5.6-sol", time.Now())
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**Alpha**"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.reasoning_summary_part.done"}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":1}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**Beta**"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.reasoning_summary_part.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+	var joined strings.Builder
+	for _, evt := range all {
+		if evt.Type == "content_block_delta" && evt.Delta != nil && evt.Delta.Type == "text_delta" {
+			joined.WriteString(evt.Delta.Text)
+		}
+	}
+	want := ansiDim + "Alpha" + ansiReset + "\n" + ansiDim + "Beta" + ansiReset
+	if !strings.Contains(joined.String(), want) {
+		t.Fatalf("多段 summary 应各占一行且剥离粗体标记；got %q", joined.String())
+	}
+	if strings.Contains(joined.String(), "**") {
+		t.Fatalf("渲染文本不应残留 ** 标记；got %q", joined.String())
+	}
+}
+
+// TestAnthropicThinkingTextSinglePartNoNewline 覆盖单段无换行场景：
+// 文本滞留 pending，收尾时仍须懒开块并输出 header + 该行 + duration。
+func TestAnthropicThinkingTextSinglePartNoNewline(t *testing.T) {
+	tr := newAnthropicStreamTranslatorWithThinkingText("gpt-5.6-sol", time.Now())
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**Solo**"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.reasoning_summary_part.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+	var joined strings.Builder
+	var sawStart, sawStop bool
+	for _, evt := range all {
+		switch evt.Type {
+		case "content_block_start":
+			sawStart = true
+		case "content_block_stop":
+			sawStop = true
+		case "content_block_delta":
+			if evt.Delta != nil && evt.Delta.Type == "text_delta" {
+				joined.WriteString(evt.Delta.Text)
+			}
+		}
+	}
+	if !sawStart || !sawStop {
+		t.Fatalf("渲染块应正常开闭：start=%v stop=%v", sawStart, sawStop)
+	}
+	if !strings.Contains(joined.String(), ansiDim+"Solo"+ansiReset) {
+		t.Fatalf("单段文案应渲染为 dim 行；got %q", joined.String())
+	}
+	if !strings.Contains(joined.String(), "💭 Thought for") {
+		t.Fatalf("收尾应补 duration 行；got %q", joined.String())
+	}
+}
+
+// TestAnthropicThinkingTextConsecutiveItemsMergeBlock 覆盖实测多 reasoning
+// item 形态：连续 output_item.added/done(reasoning) 应合并共享同一个渲染
+// text 块与一个 duration 收尾，不再每个 item 独立开块。
+func TestAnthropicThinkingTextConsecutiveItemsMergeBlock(t *testing.T) {
+	tr := newAnthropicStreamTranslatorWithThinkingText("gpt-5.6-sol", time.Now())
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**One**"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**Two**"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+		`{"type":"response.output_item.added","item":{"type":"message"}}`,
+		`{"type":"response.output_text.delta","delta":"hi"}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+	var joined strings.Builder
+	startCount, stopCount := 0, 0
+	for _, evt := range all {
+		switch evt.Type {
+		case "content_block_start":
+			startCount++
+		case "content_block_stop":
+			stopCount++
+		case "content_block_delta":
+			if evt.Delta != nil && evt.Delta.Type == "text_delta" {
+				joined.WriteString(evt.Delta.Text)
+			}
+		}
+	}
+	if strings.Count(joined.String(), "💭 Thinking") != 1 {
+		t.Fatalf("连续 reasoning item 应共享一个 header；got %q", joined.String())
+	}
+	if strings.Count(joined.String(), "💭 Thought for") != 1 {
+		t.Fatalf("连续 reasoning item 应只有一个 duration 收尾；got %q", joined.String())
+	}
+	if !strings.Contains(joined.String(), ansiDim+"One"+ansiReset+"\n"+ansiDim+"Two"+ansiReset) {
+		t.Fatalf("两个 item 的文案应合并进同一块且各占一行；got %q", joined.String())
+	}
+	// text 渲染块 1 个 + message 回答块 1 个
+	if startCount != 2 || stopCount != 2 {
+		t.Fatalf("content block 数应为 2（渲染块+回答块）：start=%d stop=%d", startCount, stopCount)
+	}
+}

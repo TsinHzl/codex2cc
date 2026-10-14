@@ -830,6 +830,38 @@ func (t *anthropicStreamTranslator) beginThinkingTextBlock() []anthropicStreamEv
 	return events
 }
 
+// emitThinkingTextLine 把一行渲染进渲染块：懒开块、首行补 header、newline
+// 引导本行（块尾不带 '\n'）、逐行独立 dim 包裹。
+func (t *anthropicStreamTranslator) emitThinkingTextLine(line string) []anthropicStreamEvent {
+	var events []anthropicStreamEvent
+	if !t.thinkingTextOpen {
+		events = append(events, t.beginThinkingTextBlock()...)
+	}
+	if t.thinkingTextFirst {
+		t.thinkingTextFirst = false
+		events = append(events, t.contentBlockDelta(anthropicDelta{
+			Type: "text_delta",
+			Text: thinkingTextHeaderLine,
+		})...)
+	}
+	t.thinkingTextHasLines = true
+	events = append(events, t.contentBlockDelta(anthropicDelta{
+		Type: "text_delta",
+		Text: "\n" + ansiDim + stripReasoningSummaryBold(line) + ansiReset,
+	})...)
+	return events
+}
+
+// flushThinkingTextLine 把 pending 残余落成一行（段边界与块收尾共用）。
+func (t *anthropicStreamTranslator) flushThinkingTextLine() []anthropicStreamEvent {
+	line := strings.TrimSpace(t.thinkingTextPending.String())
+	t.thinkingTextPending.Reset()
+	if line == "" {
+		return nil
+	}
+	return t.emitThinkingTextLine(line)
+}
+
 // translateEvent 将单个 Codex SSE 事件翻译为零或多个 Anthropic SSE 事件
 func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropicStreamEvent {
 	if t.toolInputError != nil {
@@ -848,12 +880,14 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 		return t.handleTextDelta(eventData)
 
 	case "response.reasoning_summary_part.added":
-		// 多段 summary 各占一行：段间补换行，避免上一段残余文本与
-		// 下一段标题挤在同一行渲染（截图中的连排问题）。
-		if t.thinkingAsText && t.thinkingTextOpen {
-			return t.contentBlockDelta(anthropicDelta{Type: "text_delta", Text: "\n"})
+		// 段边界先落行再开新段。summary delta 整段下发且不含 '\n'（实测
+		// 每 part 恰好一个 delta），文本会一直滞留 pending 从未 flush；
+		// 若只在块已打开时补换行，门控与"打开块需先 flush"互为前提，
+		// 多段标题会被拼进同一行。
+		if !t.thinkingAsText {
+			return nil
 		}
-		return nil
+		return t.flushThinkingTextLine()
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return t.handleThinkingDelta(eventData)
@@ -949,14 +983,20 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 
 	switch itemType {
 	case "reasoning":
+		// 渲染模式下连续 reasoning item 合并共享同一个渲染 text 块：
+		// 不关块、不重置 header/duration 状态，等收尾时机统一处理。
+		if t.thinkingAsText && t.thinkingTextOpen {
+			return events
+		}
 		// 关闭当前块。渲染模式下不开 thinking 块，等首个 delta 懒开 text 块。
 		events = append(events, t.closeCurrentBlock()...)
 		if t.thinkingAsText {
+			// 异常序列兜底：前一个 item 的 done 未到达时 pending 可能残留
+			// 未 flush 文本，先落行再重置，避免静默丢弃。
+			events = append(events, t.flushThinkingTextLine()...)
 			t.currentBlockType = "text"
 			t.thinkingTextPending.Reset()
-			t.thinkingTextFirst = true
 			t.thinkingTextOpen = false
-			t.thinkingTextHasLines = false
 			return events
 		}
 		t.currentBlockType = "thinking"
@@ -1001,8 +1041,8 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		// 已开（reasoning 先行），必须先收尾（补 duration 行）再关闭，否则
 		// 回答文本会因懒开条件不触发而追加进 thinking 渲染块之后。
 		if t.thinkingAsText && t.thinkingTextOpen {
-			events = append(t.finishThinkingTextBlock(), t.closeCurrentBlock()...)
-			t.thinkingTextOpen = false
+			events = append(events, t.finishThinkingTextBlock()...)
+			events = append(events, t.closeCurrentBlock()...)
 		}
 	}
 
@@ -1068,21 +1108,7 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 			if line == "" {
 				continue
 			}
-			if !t.thinkingTextOpen {
-				events = append(events, t.beginThinkingTextBlock()...)
-			}
-			if t.thinkingTextFirst {
-				t.thinkingTextFirst = false
-				events = append(events, t.contentBlockDelta(anthropicDelta{
-					Type: "text_delta",
-					Text: thinkingTextHeaderLine,
-				})...)
-			}
-			t.thinkingTextHasLines = true
-			events = append(events, t.contentBlockDelta(anthropicDelta{
-				Type: "text_delta",
-				Text: "\n" + ansiDim + line + ansiReset,
-			})...)
+			events = append(events, t.emitThinkingTextLine(line)...)
 		}
 		t.thinkingTextPending.Reset()
 		t.thinkingTextPending.WriteString(pending)
@@ -1161,19 +1187,17 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 			return append(events, t.closeCurrentBlock()...)
 		}
 	}
-	// 渲染模式收尾：单段 summary 可能没有换行，因而只停留在 pending
-	// 且尚未打开块；reasoning item 完成时也必须懒开块并输出残余文本。
+	// 渲染模式收尾（连续 reasoning item 合并共享一个渲染块）：把该 item 的
+	// 残余 pending 落成行，但不关块也不补 duration 行——后续可能还有下一个
+	// reasoning item 继续追加进同一块；真正的收尾（duration + 关块）延迟到
+	// message item 或响应终止（handleCompleted/handleFailed）时。
+	// 与上方 signature_delta 分支互斥：该分支要求 currentBlockType ==
+	// "thinking"，而渲染模式从不打开 thinking 块（currentBlockType 恒为
+	// "text"），因此本分支仅会在非渲染 thinking 块已关闭后命中。
 	if t.thinkingAsText &&
 		(t.thinkingTextOpen || strings.TrimSpace(t.thinkingTextPending.String()) != "") &&
 		gjson.GetBytes(data, "item.type").String() == "reasoning" {
-		var events []anthropicStreamEvent
-		if !t.thinkingTextOpen {
-			events = append(events, t.beginThinkingTextBlock()...)
-		}
-		events = append(events, t.finishThinkingTextBlock()...)
-		events = append(events, t.closeCurrentBlock()...)
-		t.thinkingTextOpen = false
-		return events
+		return t.flushThinkingTextLine()
 	}
 	return t.closeCurrentBlock()
 }
@@ -1182,24 +1206,15 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 // newline 仍引导（`\n` + duration 行），块尾不带 '\n'；块从未产出任何行时
 // 不补任何内容（避免发出空 text 块的孤儿 stop 事件）。
 func (t *anthropicStreamTranslator) finishThinkingTextBlock() []anthropicStreamEvent {
-	var events []anthropicStreamEvent
-	if !t.thinkingAsText || !t.thinkingTextOpen {
+	if !t.thinkingAsText {
+		return nil
+	}
+	// 残余行可能尚未开块（单 part 无换行的常见形态），flush 内部会懒开，
+	// 不再要求调用方先 beginThinkingTextBlock。
+	events := t.flushThinkingTextLine()
+	if !t.thinkingTextOpen {
 		return events
 	}
-	if lastLine := strings.TrimSpace(t.thinkingTextPending.String()); lastLine != "" {
-		var tail string
-		if t.thinkingTextFirst {
-			tail = thinkingTextHeaderLine
-			t.thinkingTextFirst = false
-		}
-		tail += "\n" + ansiDim + lastLine + ansiReset
-		t.thinkingTextHasLines = true
-		events = append(events, t.contentBlockDelta(anthropicDelta{
-			Type: "text_delta",
-			Text: tail,
-		})...)
-	}
-	t.thinkingTextPending.Reset()
 	if t.thinkingTextHasLines {
 		elapsed := time.Since(t.thinkingTextStartAt)
 		events = append(events, t.contentBlockDelta(anthropicDelta{
@@ -1219,6 +1234,11 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 		events = append(events, t.handleCreated()...)
 	}
 
+	// 渲染模式下 message item 未出现（例如纯 reasoning 截断）时，渲染块
+	// 仍处于打开状态，终止前必须收尾（补 duration 行）再关块。
+	if t.thinkingAsText && t.thinkingTextOpen {
+		events = append(events, t.finishThinkingTextBlock()...)
+	}
 	events = append(events, t.closeCurrentBlock()...)
 
 	// 提取 usage
@@ -1270,6 +1290,9 @@ func (t *anthropicStreamTranslator) handleFailed() []anthropicStreamEvent {
 	var events []anthropicStreamEvent
 	if !t.messageStartSent {
 		events = append(events, t.handleCreated()...)
+	}
+	if t.thinkingAsText && t.thinkingTextOpen {
+		events = append(events, t.finishThinkingTextBlock()...)
 	}
 	events = append(events, t.closeCurrentBlock()...)
 	events = append(events, anthropicStreamEvent{

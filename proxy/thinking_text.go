@@ -33,6 +33,16 @@ func isClaudeCodeUserAgent(userAgent string) bool {
 	return claudeCodeUserAgentRE.MatchString(userAgent)
 }
 
+// reasoningSummaryBoldRE 匹配上游 reasoning summary 的 Markdown 粗体标记。
+// 实测 summary 内容均为 `**标题短语**` 形态，渲染为 dim 文本时粗体语法是噪音。
+var reasoningSummaryBoldRE = regexp.MustCompile(`\*\*(.+?)\*\*`)
+
+// stripReasoningSummaryBold 成对剥离 `**` 粗体标记保留内容；未闭合的 `**`
+// 原样保留，避免误吞后续正常文本。
+func stripReasoningSummaryBold(text string) string {
+	return reasoningSummaryBoldRE.ReplaceAllString(text, "$1")
+}
+
 // 历史剥离正则：引用格式（`> ` 前缀）必须先于裸格式剥离，否则裸正则会
 // 截断引用块内部的 dim header。本仓库未产出过 legacy 标记格式，不移植该正则。
 var (
