@@ -1,0 +1,23 @@
+proxy/handler_anthropic.go
+  7932b62d110431aa 11,14,28-56,719-725
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "58a2740a981dbfbc8c7291d7aba7cd7b2bbdcb97",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 41,
+      "total_deletions": 3,
+      "accepted_lines": 38,
+      "overriden_lines": 0
+    }
+  }
+}
