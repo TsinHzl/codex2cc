@@ -340,7 +340,7 @@ const compactOpenAIModelSuffix = "-openai-compact"
 // stripCompactModelSuffix 去除 compact 模型名上的 -openai-compact 后缀，返回去除后的
 // 模型名与是否发生改写。供显式 /v1/responses/compact 及普通 /v1/responses 中的
 // compaction_trigger 使用：让 newapi 侧渠道仍能以 gpt-5.4-openai-compact 命名，
-// 而 codex2api 内部按 gpt-5.4 校验与转发上游。
+// 而 codex2cc 内部按 gpt-5.4 校验与转发上游。
 func stripCompactModelSuffix(model string) (string, bool) {
 	trimmed := strings.TrimSpace(model)
 	if trimmed == "" {

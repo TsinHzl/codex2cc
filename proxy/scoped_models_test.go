@@ -94,7 +94,7 @@ func TestScopedModelsModelAllowAppliesToAliasName(t *testing.T) {
 	store.AddAccount(&auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example", APIKey: "sk", Models: []string{"target"}, ModelMapping: `{"public-alias":"target"}`})
 	handler := NewHandler(store, nil, nil, nil)
 	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1, Limits: database.APIKeyLimits{ModelAllow: []string{"public-alias"}}})
-	if len(models) != 1 || models[0].ID != "public-alias" || models[0].Owner != "codex2api" {
+	if len(models) != 1 || models[0].ID != "public-alias" || models[0].Owner != "codex2cc" {
 		t.Fatalf("models = %+v, want alias only", models)
 	}
 }

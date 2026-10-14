@@ -10,7 +10,7 @@ import (
 // TestUsageLogViaWebsocketRoundTrip 验证 via_websocket 字段从写入到读回完整保留
 // （覆盖 InsertUsageLog 的批量 INSERT 与 ListRecentUsageLogs 的 SELECT/Scan）。
 func TestUsageLogViaWebsocketRoundTrip(t *testing.T) {
-	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite): %v", err)
 	}
@@ -55,7 +55,7 @@ func TestUsageLogViaWebsocketRoundTrip(t *testing.T) {
 }
 
 func TestUsageLogClientIPRoundTripAndFilter(t *testing.T) {
-	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite): %v", err)
 	}

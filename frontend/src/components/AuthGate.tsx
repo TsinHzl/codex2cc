@@ -42,8 +42,8 @@ interface SetupCheck {
 
 const MIN_SECRET_LEN = 8
 const MAX_SECRET_LEN = 256
-const SETUP_SERVICE_URL_KEY = 'codex2api:first_setup_service_url'
-const SETUP_REVIEW_DONE_KEY = 'codex2api:first_setup_review_done_v1'
+const SETUP_SERVICE_URL_KEY = 'codex2cc:first_setup_service_url'
+const SETUP_REVIEW_DONE_KEY = 'codex2cc:first_setup_review_done_v1'
 
 const COPY = {
   zh: {

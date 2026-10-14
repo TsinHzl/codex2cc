@@ -537,7 +537,7 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 	defer conn.Close()
 	// Serialize builders across instances without delaying service startup.
 	var locked bool
-	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext('codex2api:usage-log-indexes'))`).Scan(&locked); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtext('codex2cc:usage-log-indexes'))`).Scan(&locked); err != nil {
 		return err
 	}
 	if !locked {
@@ -546,7 +546,7 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 	defer func() {
 		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer unlockCancel()
-		if _, err := conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtext('codex2api:usage-log-indexes'))`); err != nil {
+		if _, err := conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtext('codex2cc:usage-log-indexes'))`); err != nil {
 			log.Printf("释放 usage_logs 索引构建锁失败: %v", err)
 		}
 	}()
@@ -1719,7 +1719,7 @@ type APIKeyLimits struct {
 	ModelAllow         []string                  `json:"model_allow,omitempty"`
 	ModelDeny          []string                  `json:"model_deny,omitempty"`
 	PlanAllow          []string                  `json:"plan_allow,omitempty"`
-	// NoAffinityGroupIDs 指定未携带 Codex 引擎指纹或 X-Codex2API-Affinity-Key 的请求使用的账号分组。
+	// NoAffinityGroupIDs 指定未携带 Codex 引擎指纹或 X-Codex2CC-Affinity-Key 的请求使用的账号分组。
 	// 空表示不启用分流，继续沿用 AllowedGroupIDs 的现有行为。
 	NoAffinityGroupIDs []int64 `json:"no_affinity_group_ids,omitempty"`
 	RPM                int     `json:"rpm,omitempty"`
@@ -2286,7 +2286,7 @@ type SystemSettings struct {
 	SessionSlotBufferSeconds           int    // 会话并发槽缓冲时间，默认 10 秒，范围 1..60
 	ModelsListReadMaxBytes             int64  // 上游 /models 与 Codex 模型清单的最大读取字节数，默认 8 MiB
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
-	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
+	ResinPlatformName                  string // Resin 平台标识，例如 codex2cc
 	PromptFilterEnabled                bool
 	PromptFilterMode                   string
 	PromptFilterThreshold              int
@@ -4854,7 +4854,7 @@ type UsageModelStat struct {
 	ErrorCount    int64   `json:"error_count"`
 }
 
-// UsageFeatureStat codex2api 代理能力维度的请求构成。
+// UsageFeatureStat codex2cc 代理能力维度的请求构成。
 type UsageFeatureStat struct {
 	StreamRequests    int64 `json:"stream_requests"`
 	SyncRequests      int64 `json:"sync_requests"`

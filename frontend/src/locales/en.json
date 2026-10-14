@@ -515,7 +515,7 @@
     "exportNoAccounts": "No accounts match the export criteria",
     "migrateImport": "Migration",
     "migrateTitle": "Remote Migration Import",
-    "migrateDesc": "Import healthy accounts from another codex2api instance. The remote instance must have 'Allow Remote Migration' enabled in Settings.",
+    "migrateDesc": "Import healthy accounts from another codex2cc instance. The remote instance must have 'Allow Remote Migration' enabled in Settings.",
     "migrateUrlLabel": "Remote Instance URL",
     "migrateUrlPlaceholder": "e.g. https://other-instance.com",
     "migrateKeyLabel": "Remote Admin Key",
@@ -2694,7 +2694,7 @@
       },
       "attachment": {
         "title": "Attachment Content Extraction",
-        "description": "Send supported attachment references to a separate extractor, then inspect the returned text. Codex2API does not fetch arbitrary user URLs directly; this layer is disabled and Shadowed by default.",
+        "description": "Send supported attachment references to a separate extractor, then inspect the returned text. Codex2CC does not fetch arbitrary user URLs directly; this layer is disabled and Shadowed by default.",
         "enabled": "Enable Attachment Extraction",
         "enabledHint": "Enable only after deploying a controlled extraction service. Attachment reference metadata can still be inspected while this is off.",
         "allowRemoteURLs": "Allow Remote URL Extraction",
@@ -2765,7 +2765,7 @@
       "scheduleEnabled": "Automatically run public intelligence searches at the configured interval.",
       "intervalHours": "Minimum number of hours between automatic intelligence runs.",
       "maxResults": "Maximum public projects saved and supplied to the analysis model per run.",
-      "modelEnabled": "Use a model from the current Codex2API account pool to generate candidate rules.",
+      "modelEnabled": "Use a model from the current Codex2CC account pool to generate candidate rules.",
       "model": "Pool model used for intelligence analysis.",
       "maxModelCalls": "Maximum pool-model requests per run, from zero to three.",
       "queries": "Custom queries, one per line. They are merged with and deduplicated against built-in queries."
@@ -3096,15 +3096,15 @@
     "noRulesInCategory": "No rules in this category",
     "newapi": {
       "title": "NewAPI Audit Integration",
-      "description": "NewAPI signed identities are accepted only through one-to-one Codex2API Key bindings. Bindings verify identity only; GuardPipeline remains the sole authority for enforcement mode and review profile.",
+      "description": "NewAPI signed identities are accepted only through one-to-one Codex2CC Key bindings. Bindings verify identity only; GuardPipeline remains the sole authority for enforcement mode and review profile.",
       "clockSkew": "Clock Skew (seconds)",
       "clockSkewHint": "Signatures outside this time range are rejected.",
       "protocolTitle": "Signature Protocol and NewAPI Configuration",
       "newapiEnv": "NewAPI Environment Variables",
-      "newapiEnvExample": "CODEX2API_POLICY_ENABLED=true\nCODEX2API_POLICY_BINDINGS=[{\"platform_id\":\"primary-newapi\",\"target\":\"http://127.0.0.1:18095\",\"codex_key_fingerprint\":\"<SHA-256 fingerprint of the Key>\",\"secret\":\"<binding secret for this Key>\",\"enabled\":true}]\nCODEX2API_POLICY_BAN_AFTER=2\nCODEX2API_POLICY_WINDOW_SECONDS=86400",
+      "newapiEnvExample": "CODEX2CC_POLICY_ENABLED=true\nCODEX2CC_POLICY_BINDINGS=[{\"platform_id\":\"primary-newapi\",\"target\":\"http://127.0.0.1:18095\",\"codex_key_fingerprint\":\"<SHA-256 fingerprint of the Key>\",\"secret\":\"<binding secret for this Key>\",\"enabled\":true}]\nCODEX2CC_POLICY_BAN_AFTER=2\nCODEX2CC_POLICY_WINDOW_SECONDS=86400",
       "headersTitle": "NewAPI Identity and Policy Headers",
       "headersExample": "X-NewAPI-User-ID: <user ID>\nX-NewAPI-Client-IP: <real client IP>\nX-NewAPI-Request-ID: <unique request ID>\nX-NewAPI-Timestamp: <Unix seconds>\nX-NewAPI-Method: <HTTP method>\nX-NewAPI-Path: <actual forwarded path>\nX-NewAPI-Body-SHA256: <hex body SHA-256>\nX-NewAPI-Signature-Version: 1\nX-NewAPI-Signature: <V1 identity HMAC-SHA256>\nX-NewAPI-Policy-Meta: <Base64URL policy JSON>\nX-NewAPI-Policy-Meta-Signature: <policy HMAC-SHA256>",
-      "signatureHint": "Identity requests use the stable V1 signature. The caller code in policy-meta-v1 must match the current Codex2API Key binding; identity, policy metadata, response decisions, and events are all verified with that binding secret. NewAPI-supplied modes or profiles cannot override GuardPipeline."
+      "signatureHint": "Identity requests use the stable V1 signature. The caller code in policy-meta-v1 must match the current Codex2CC Key binding; identity, policy metadata, response decisions, and events are all verified with that binding secret. NewAPI-supplied modes or profiles cannot override GuardPipeline."
     },
     "intelligence": {
       "title": "Online Rule Intelligence",
@@ -3336,7 +3336,7 @@
         "b2": "Terminal categories: take the terminal path only after the category forms a high-confidence violation.",
         "b3": "User / IP / session risk: records confirmed high-risk events for audit and review; cumulative score alone never bans.",
         "b4": "SSE / WebSocket output scan: inspect streamed model output; can limit to terminal rules only.",
-        "b5": "NewAPI audit integration: verify signed identity and policy metadata only through one-to-one Codex2API Key bindings; unbound Keys cannot accept identity.",
+        "b5": "NewAPI audit integration: verify signed identity and policy metadata only through one-to-one Codex2CC Key bindings; unbound Keys cannot accept identity.",
         "b6": "Scheduled intelligence: periodic public search and optional candidate rule generation.",
         "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency. Output scanning holds a small window for cross-frame detection: when combined with preflight passthrough (codex_preflight_sse_passthrough), tiny metadata frames may still be briefly buffered so first-frame speed is not guaranteed to recover; and once HTTP 200 is committed before the first content event, upstream error status-code recovery changes — grayscale the two together."
       },
@@ -3375,11 +3375,11 @@
       },
       "newapi": {
         "title": "NewAPI audit integration",
-        "p1": "When NewAPI relays traffic to Codex2API, it signs the user ID, IP, request ID, request-body digest, and policy metadata. Codex2API verifies those signatures before associating audit identity and policy.",
-        "p2": "Every caller must use the binding for the Codex2API Key that carries its requests. Retired process-wide secret configuration no longer participates in verification. Header and signature details are available under NewAPI Audit Integration on the overview page.",
+        "p1": "When NewAPI relays traffic to Codex2CC, it signs the user ID, IP, request ID, request-body digest, and policy metadata. Codex2CC verifies those signatures before associating audit identity and policy.",
+        "p2": "Every caller must use the binding for the Codex2CC Key that carries its requests. Retired process-wide secret configuration no longer participates in verification. Header and signature details are available under NewAPI Audit Integration on the overview page.",
         "b1": "Each binding has its own secret and enabled state. Unbound Keys cannot accept NewAPI signed identity.",
         "b2": "Auditing, warnings, account restrictions, and IP restrictions remain separate NewAPI controls and must not be enabled automatically by identity verification.",
-        "b3": "NewAPI must sign request headers, verify signed Codex2API policy events, and persist audit records according to its own configuration."
+        "b3": "NewAPI must sign request headers, verify signed Codex2CC policy events, and persist audit records according to its own configuration."
       },
       "checklist": {
         "title": "Go-live checklist",
@@ -3622,7 +3622,7 @@
     "schedulerModeRemainingQuota": "Remaining Quota",
     "schedulerModeFillFirst": "Fill First",
     "affinityMode": "Session Affinity",
-    "affinityModeDesc": "Affinity is separate from scheduling priority. With a shared API key, send X-Codex2API-Affinity-Key to distinguish end users; it is hashed and used locally only. Bounded rotates only when the account turns unhealthy or the session idles over 10 minutes — active sessions stay pinned to preserve the upstream prompt cache; Off re-picks; Strict stays long-term.",
+    "affinityModeDesc": "Affinity is separate from scheduling priority. With a shared API key, send X-Codex2CC-Affinity-Key to distinguish end users; it is hashed and used locally only. Bounded rotates only when the account turns unhealthy or the session idles over 10 minutes — active sessions stay pinned to preserve the upstream prompt cache; Off re-picks; Strict stays long-term.",
     "sessionAffinitySpread": "Affinity hash spread",
     "sessionAffinitySpreadDesc": "When a new affinity key binds for the first time, pick the account by deterministic hashing within the same priority and health tier instead of always taking the current top score: the same key always maps to the same account, different keys spread evenly, and an unavailable pick falls through in hash order. Off keeps the classic top-score behavior. Multi-replica deployments converge without coordination.",
     "sessionSlotBuffer": "Session slot buffer",
@@ -3640,7 +3640,7 @@
       "saved": "Connectivity test settings saved"
     },
     "allowRemoteMigration": "Allow Remote Migration",
-    "allowRemoteMigrationDesc": "When enabled, other codex2api instances can pull healthy accounts from this instance.",
+    "allowRemoteMigrationDesc": "When enabled, other codex2cc instances can pull healthy accounts from this instance.",
     "allowRemoteMigrationRequiresSecret": "Set an admin secret first. Remote migration cannot be enabled without admin authentication.",
     "resinTitle": "Resin Sticky Proxy Pool",
     "resinDesc": "When configured, every account-bound Codex egress (responses, WS, usage/subscription lookups, token refresh) goes through the Resin reverse proxy for sticky per-account IPs. Both fields must be set to enable; clearing either disables it. Resin overrides the whole chain: while it is on, account proxies, group proxies, the proxy pool and the global proxy do not take part in Codex egress. Claude is unaffected.",
@@ -3651,7 +3651,7 @@
     "resinUrl": "Resin URL",
     "resinUrlDesc": "Resin proxy pool address with token, e.g. http://127.0.0.1:2260/my-token",
     "resinPlatformName": "Platform Name",
-    "resinPlatformNameDesc": "Platform identifier in Resin, used to distinguish different services. e.g. codex2api",
+    "resinPlatformNameDesc": "Platform identifier in Resin, used to distinguish different services. e.g. codex2cc",
     "security": "Security",
     "adminSecret": "Admin Secret",
     "adminSecretPlaceholder": "Leave empty to disable admin auth",
@@ -4675,7 +4675,7 @@
     "noAffinityGroupsLabel": "No-affinity request groups",
     "noAffinityGroupsPlaceholder": "Choose groups for requests without affinity",
     "noAffinityGroupsDisabled": "Split routing off",
-    "noAffinityGroupsHint": "Requests without either a Codex engine fingerprint or X-Codex2API-Affinity-Key use only these groups; fingerprinted requests use the original groups above, or — when that is empty (no group limit) — every group except the ones selected here. Leave empty to preserve current behavior. Note the fingerprint is only a client trait: a downstream caller can opt in by sending the header itself.",
+    "noAffinityGroupsHint": "Requests without either a Codex engine fingerprint or X-Codex2CC-Affinity-Key use only these groups; fingerprinted requests use the original groups above, or — when that is empty (no group limit) — every group except the ones selected here. Leave empty to preserve current behavior. Note the fingerprint is only a client trait: a downstream caller can opt in by sending the header itself.",
     "allowedGroupsNone": "No group limit",
     "allowedGroupsMissing": "Group no longer exists",
     "allowedGroupsSaved": "Allowed groups saved",

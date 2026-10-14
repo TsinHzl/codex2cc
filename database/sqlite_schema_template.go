@@ -32,7 +32,7 @@ func UseSQLiteSchemaTemplate(path string) {
 // PrepareSQLiteSchemaTemplate 在临时目录里完整初始化一次 SQLite 库并注册为模板，
 // 供各测试包的 TestMain 调用；返回的 cleanup 会注销模板并删除临时目录。
 func PrepareSQLiteSchemaTemplate() (cleanup func(), err error) {
-	dir, err := os.MkdirTemp("", "codex2api-sqlite-template-")
+	dir, err := os.MkdirTemp("", "codex2cc-sqlite-template-")
 	if err != nil {
 		return nil, err
 	}

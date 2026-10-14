@@ -17,9 +17,9 @@ func TestCodexRefreshTransactions(t *testing.T) {
 		t.Run(driver, func(t *testing.T) {
 			dsn := filepath.Join(t.TempDir(), "refresh.db")
 			if driver == "postgres" {
-				dsn = os.Getenv("CODEX2API_TEST_POSTGRES_DSN")
+				dsn = os.Getenv("CODEX2CC_TEST_POSTGRES_DSN")
 				if dsn == "" {
-					t.Skip("requires isolated CODEX2API_TEST_POSTGRES_DSN")
+					t.Skip("requires isolated CODEX2CC_TEST_POSTGRES_DSN")
 				}
 			}
 			db, err := New(driver, dsn)

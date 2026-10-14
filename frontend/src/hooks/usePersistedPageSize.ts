@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
-const STORAGE_PREFIX = 'codex2api_page_size_'
+const STORAGE_PREFIX = 'codex2cc_page_size_'
 
 /**
  * usePersistedPageSize 提供按 key 持久化的分页大小状态。
@@ -8,7 +8,7 @@ const STORAGE_PREFIX = 'codex2api_page_size_'
  * - 初值优先使用 localStorage 中保存的值;若不在 allowed 中或非法则回落 fallback。
  * - 调用 setPageSize 时同步写回 localStorage。
  *
- * @param key       页面/表格的标识(写入 localStorage 时会加 codex2api_page_size_ 前缀)
+ * @param key       页面/表格的标识(写入 localStorage 时会加 codex2cc_page_size_ 前缀)
  * @param fallback  默认值
  * @param allowed   合法 pageSize 集合;不在其中的持久化值会被忽略
  */

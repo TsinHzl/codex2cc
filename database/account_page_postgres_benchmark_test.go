@@ -14,12 +14,12 @@ import (
 //  1. the cold, non-secret 40k account projection;
 //  2. the bounded current-page base/stat/usage/health queries (20 accounts).
 //
-// It requires an empty, disposable database in CODEX2API_TEST_POSTGRES_DSN.
+// It requires an empty, disposable database in CODEX2CC_TEST_POSTGRES_DSN.
 // Ordinary `go test` runs do not execute benchmarks or create these fixtures.
 func BenchmarkPostgresFortyThousandAccountPage(b *testing.B) {
-	dsn := os.Getenv("CODEX2API_TEST_POSTGRES_DSN")
+	dsn := os.Getenv("CODEX2CC_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		b.Skip("CODEX2API_TEST_POSTGRES_DSN is not set")
+		b.Skip("CODEX2CC_TEST_POSTGRES_DSN is not set")
 	}
 
 	db, err := New("postgres", dsn)
@@ -41,7 +41,7 @@ func BenchmarkPostgresFortyThousandAccountPage(b *testing.B) {
 		b.Fatalf("benchmark requires an empty disposable database (accounts=%d usage_logs=%d)", accountCount, usageCount)
 	}
 
-	marker := fmt.Sprintf("__codex2api_page_bench_%d_", time.Now().UnixNano())
+	marker := fmt.Sprintf("__codex2cc_page_bench_%d_", time.Now().UnixNano())
 	pattern := marker + "%"
 	b.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Minute)

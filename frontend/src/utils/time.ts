@@ -55,7 +55,7 @@ export function formatRelativeTime(dateStr?: string | null, options: RelativeTim
     : i18n.t('common.daysAgoLong', { count: days })
 }
 
-const TIMEZONE_STORAGE_KEY = 'codex2api_timezone'
+const TIMEZONE_STORAGE_KEY = 'codex2cc_timezone'
 const DEFAULT_TIMEZONE = 'Asia/Shanghai'
 
 /** 获取用户选择的时区，默认 Asia/Shanghai */

@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { ShieldAlert, X } from 'lucide-react'
 import { api } from '../api'
 
-const DISMISS_STORAGE_KEY = 'codex2api_security_banner_dismissed_at'
+const DISMISS_STORAGE_KEY = 'codex2cc_security_banner_dismissed_at'
 const DISMISS_TTL_MS = 24 * 60 * 60 * 1000 // 用户手动关闭后 24h 内不再骚扰
 
 const COPY = {

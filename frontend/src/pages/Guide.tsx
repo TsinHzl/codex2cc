@@ -67,7 +67,7 @@ function encodeBase64(text: string): string {
 
 function buildCcSwitchUrl(baseUrl: string, apiKey: string): string {
   const config = encodeURIComponent(encodeBase64(JSON.stringify({
-    name: 'codex2api',
+    name: 'codex2cc',
     baseURL: baseUrl,
     apiKey,
     anthropicVersion: '2023-06-01',

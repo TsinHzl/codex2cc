@@ -10,7 +10,7 @@ import (
 
 func newProxyTestDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite) returned error: %v", err)
 	}

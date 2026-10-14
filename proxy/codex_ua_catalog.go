@@ -202,7 +202,7 @@ func effectiveCodexClientKind(cfg CodexUserAgentConfig) CodexClientKind {
 
 func codexUAHash(seed string) uint32 {
 	h := fnv.New32a()
-	_, _ = h.Write([]byte("codex2api:ua-catalog:v1:" + seed))
+	_, _ = h.Write([]byte("codex2cc:ua-catalog:v1:" + seed))
 	return h.Sum32()
 }
 

@@ -151,7 +151,7 @@ func fetchOfficialPricingMarkdown(ctx context.Context, client *http.Client, sour
 	}
 	// OpenAI's .md endpoint returns Markdown without content negotiation.
 	// The .md suffix is sufficient for both official providers.
-	req.Header.Set("User-Agent", "codex2api-official-pricing-sync")
+	req.Header.Set("User-Agent", "codex2cc-official-pricing-sync")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

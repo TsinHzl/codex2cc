@@ -992,7 +992,7 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
         <div>
           <div className="docs-eyebrow">
             <BookOpen className="size-3.5" />
-            CODEX2API / {copy("使用文档", "DOCUMENTATION")}
+            CODEX2CC / {copy("使用文档", "DOCUMENTATION")}
           </div>
           <h2>{copy("从接入到用好每个接口", "Connect. Build. Go further.")}</h2>
           <p>

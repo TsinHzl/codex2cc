@@ -22,7 +22,7 @@ func TestAPIKeyAuthRevisionSQLite(t *testing.T) {
 }
 
 func TestAPIKeyAuthRevisionPostgres(t *testing.T) {
-	dsn := os.Getenv("CODEX2API_TEST_POSTGRES_DSN")
+	dsn := os.Getenv("CODEX2CC_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip("requires an isolated PostgreSQL database")
 	}

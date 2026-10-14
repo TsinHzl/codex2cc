@@ -113,7 +113,7 @@ func TestGroupBaseConcurrencyHotUpdateRefreshesFastScheduler(t *testing.T) {
 }
 
 func TestStoreInitLoadsGroupBaseConcurrencyOverrides(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := database.New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("database.New: %v", err)

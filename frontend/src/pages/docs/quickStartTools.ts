@@ -149,7 +149,7 @@ export function resolveTemplate(
     const params = new URLSearchParams();
     params.set("resource", "provider");
     params.set("app", "claude");
-    params.set("name", "Codex2API Claude");
+    params.set("name", "Codex2CC Claude");
     params.set("endpoint", address);
     params.set("apiKey", key);
     params.set("model", "claude-sonnet-4-5");
@@ -161,7 +161,7 @@ export function resolveTemplate(
     const cfg = encodeURIComponent(
       encodeBase64(
         JSON.stringify({
-          id: "codex2api",
+          id: "codex2cc",
           baseUrl: address,
           apiKey: key,
         }),
@@ -173,7 +173,7 @@ export function resolveTemplate(
     const cfg = encodeURIComponent(
       encodeBase64(
         JSON.stringify({
-          platform: "codex2api",
+          platform: "codex2cc",
           baseUrl: address,
           apiKey: key,
         }),

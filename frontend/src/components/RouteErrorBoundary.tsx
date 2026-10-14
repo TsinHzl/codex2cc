@@ -13,7 +13,7 @@ interface State {
   error: Error | null
 }
 
-const CHUNK_RELOAD_FLAG = 'codex2api:chunk-reloaded'
+const CHUNK_RELOAD_FLAG = 'codex2cc:chunk-reloaded'
 const CHUNK_RELOAD_COOLDOWN_MS = 10_000
 
 function reloadWithCacheBust() {

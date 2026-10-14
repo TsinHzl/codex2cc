@@ -23,7 +23,7 @@ func (f failingSharedLeaseCache) AcquireLease(context.Context, string, string, s
 }
 
 func TestPropagateSharedOAuthCredentialsPreservesWorkspaceRoutes(t *testing.T) {
-	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("database.New: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestOAuthRefreshLeaseFailsClosedWhenSharedCacheIsUnavailable(t *testing.T) 
 }
 
 func TestOAuthRefreshLeaseSerializesStoresAndReloadsRotatedCredentials(t *testing.T) {
-	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("database.New: %v", err)
 	}

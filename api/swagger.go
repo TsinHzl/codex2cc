@@ -1,7 +1,7 @@
 // Package api provides OpenAPI/Swagger documentation
 package api
 
-// @title Codex2API
+// @title Codex2CC
 // @version 1.0.0
 // @description OpenAI-compatible API proxy for Codex with enhanced features including multi-account pooling,
 // automatic rotation, usage tracking, and administrative management.
@@ -35,7 +35,7 @@ type SwaggerInfo struct {
 // GetSwaggerInfo returns the swagger information
 func GetSwaggerInfo() SwaggerInfo {
 	return SwaggerInfo{
-		Title:       "Codex2API",
+		Title:       "Codex2CC",
 		Version:     "1.0.0",
 		Description: "OpenAI-compatible API proxy for Codex",
 		Host:        "localhost:8080",

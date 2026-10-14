@@ -345,7 +345,7 @@ func stableAutoResetCreditRequestID(account *auth.Account, credit proxy.WhamRese
 	if trigger == "" {
 		trigger = credit.EffectiveConsumableUntil()
 	}
-	key := "codex2api:auto-reset-credit:" + identity + ":" + trigger
+	key := "codex2cc:auto-reset-credit:" + identity + ":" + trigger
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(key)).String()
 }
 

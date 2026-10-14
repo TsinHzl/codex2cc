@@ -155,7 +155,7 @@ func ApplyCodexModelDiscoveryHeaders(headers http.Header, seed string) {
 	if seed == "" {
 		seed = "default"
 	}
-	headers.Set(codexInstallationIDHeader, deriveStableCodexUUID("codex2api:model-discovery-installation:v1:"+seed))
+	headers.Set(codexInstallationIDHeader, deriveStableCodexUUID("codex2cc:model-discovery-installation:v1:"+seed))
 }
 
 func DefaultCodexUserAgentConfigJSON() string {
@@ -708,7 +708,7 @@ func ProfileForAccount(accountID int64) ClientProfile {
 
 	// 用 FNV hash 将 accountID 映射到 profile 池，确保分布均匀
 	h := fnv.New32a()
-	fmt.Fprintf(h, "codex2api:ua-profile:%d", accountID)
+	fmt.Fprintf(h, "codex2cc:ua-profile:%d", accountID)
 	idx := int(h.Sum32()) % len(clientProfiles)
 	if idx < 0 {
 		idx = -idx

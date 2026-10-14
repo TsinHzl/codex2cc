@@ -98,7 +98,7 @@ func parseAgentIdentityAuthJSON(raw string) (*agentIdentityFields, error) {
 	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
 		return nil, fmt.Errorf("auth.json 不是合法的 JSON: %w", err)
 	}
-	// 先按根级识别；识别不到再穿透 credentials 包装（sub2api / codex2api
+	// 先按根级识别；识别不到再穿透 credentials 包装（sub2api / codex2cc
 	// 导出的账号 JSON 把 Agent Identity 字段包在 credentials 对象里）。
 	node, ok := resolveAgentIdentityNode(root)
 	if !ok {

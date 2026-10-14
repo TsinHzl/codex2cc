@@ -498,7 +498,7 @@ func extractReasoningEffort(body []byte) string {
 
 // responsesPhaseTimingHeader /v1/responses 请求准备阶段分段耗时的响应头。
 // 首个 attempt 开始前写入(SSE 首字节尚未发出),下游网关可据此把
-// "网关侧首字慢 vs codex2api first_token_ms 快"的差值归因到具体阶段(issue #405)。
+// "网关侧首字慢 vs codex2cc first_token_ms 快"的差值归因到具体阶段(issue #405)。
 
 func extractServiceTier(body []byte) string {
 	if tier := gjson.GetBytes(body, "service_tier").String(); tier != "" {

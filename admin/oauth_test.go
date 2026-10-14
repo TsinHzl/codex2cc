@@ -38,7 +38,7 @@ func TestExchangeOAuthCodeSeedsAccessTokenFromExchangeResponse(t *testing.T) {
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2cc"})
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator
@@ -121,7 +121,7 @@ func newOAuthExchangeTestServerWithIDToken(t *testing.T, idToken string) *httpte
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2cc"})
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator
@@ -546,7 +546,7 @@ func TestUpdateOAuthAccountCodeDoesNotExposeTokenErrorBody(t *testing.T) {
 
 	oldResinCfg := proxy.GetResinConfig()
 	oldDecorator := auth.ResinRequestDecorator
-	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2api"})
+	proxy.SetResinConfig(&proxy.ResinConfig{BaseURL: server.URL, PlatformName: "codex2cc"})
 	t.Cleanup(func() {
 		proxy.SetResinConfig(oldResinCfg)
 		auth.ResinRequestDecorator = oldDecorator

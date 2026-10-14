@@ -1,5 +1,5 @@
 export const OPERATION_RESULTS_VISIBILITY_STORAGE_KEY =
-  "codex2api:accounts:show-operation-results";
+  "codex2cc:accounts:show-operation-results";
 
 type PreferenceStorage = Pick<Storage, "getItem" | "setItem">;
 

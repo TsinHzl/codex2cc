@@ -77,7 +77,7 @@ func (db *DB) ensureAPIKeyAuthCacheSchema(ctx context.Context) error {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `
-		CREATE OR REPLACE FUNCTION codex2api_api_key_auth_revision() RETURNS TRIGGER AS $$
+		CREATE OR REPLACE FUNCTION codex2cc_api_key_auth_revision() RETURNS TRIGGER AS $$
 		BEGIN
 			IF TG_OP = 'TRUNCATE' THEN
 				UPDATE api_key_auth_cache_state SET generation=generation+1,key_count=0 WHERE id=1;
@@ -94,9 +94,9 @@ func (db *DB) ensureAPIKeyAuthCacheSchema(ctx context.Context) error {
 		END; $$ LANGUAGE plpgsql;
 		DROP TRIGGER IF EXISTS api_key_auth_cache_change ON api_keys;
 		CREATE TRIGGER api_key_auth_cache_change AFTER INSERT OR DELETE OR UPDATE OF name,key,enabled,quota_limit,expires_at,allowed_group_ids,limits
-			ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2api_api_key_auth_revision();
+			ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2cc_api_key_auth_revision();
 		DROP TRIGGER IF EXISTS api_key_auth_cache_truncate ON api_keys;
-		CREATE TRIGGER api_key_auth_cache_truncate AFTER TRUNCATE ON api_keys FOR EACH STATEMENT EXECUTE FUNCTION codex2api_api_key_auth_revision();`)
+		CREATE TRIGGER api_key_auth_cache_truncate AFTER TRUNCATE ON api_keys FOR EACH STATEMENT EXECUTE FUNCTION codex2cc_api_key_auth_revision();`)
 		if err != nil {
 			return fmt.Errorf("install API key authentication revision trigger: %w", err)
 		}

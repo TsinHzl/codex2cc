@@ -82,7 +82,7 @@ func attachUpstreamTrace(c *gin.Context, store *auth.Store) {
 	}
 	a := &upstreamTraceAudit{requestID: NewUpstreamSessionUUID(), store: store}
 	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), upstreamTraceContextKey{}, a))
-	c.Header("X-Codex2API-Request-ID", a.requestID)
+	c.Header("X-Codex2CC-Request-ID", a.requestID)
 }
 
 func resetUpstreamRequestTrace(c *gin.Context) {

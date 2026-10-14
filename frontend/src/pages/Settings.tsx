@@ -4698,7 +4698,7 @@ export default function Settings() {
                     </SettingField>
                     <SettingField label={t('settings.resinPlatformName')} description={t('settings.resinPlatformNameDesc')}>
                       <Input
-                        placeholder="codex2api"
+                        placeholder="codex2cc"
                         value={settingsForm.resin_platform_name}
                         onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
                       />

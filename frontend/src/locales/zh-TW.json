@@ -1373,7 +1373,7 @@
       },
       "attachment": {
         "title": "附件內容解析",
-        "description": "透過獨立服務擷取受支援附件的文字後再檢查。Codex2API 不直接下載任意使用者 URL，預設關閉並以影子層記錄。",
+        "description": "透過獨立服務擷取受支援附件的文字後再檢查。Codex2CC 不直接下載任意使用者 URL，預設關閉並以影子層記錄。",
         "enabled": "啟用附件解析",
         "enabledHint": "只有部署受控的附件解析服務後才開啟；關閉時仍可檢查附件引用中繼資料。",
         "allowRemoteURLs": "允許解析遠端 URL",

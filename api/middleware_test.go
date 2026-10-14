@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestCORSMiddlewareAllowsCodex2APIAffinityHeaderPreflight(t *testing.T) {
+func TestCORSMiddlewareAllowsCodex2CCAffinityHeaderPreflight(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	handlerCalled := false
@@ -35,7 +35,7 @@ func TestCORSMiddlewareAllowsCodex2APIAffinityHeaderPreflight(t *testing.T) {
 	}
 
 	allowedHeaders := strings.ToLower(recorder.Header().Get("Access-Control-Allow-Headers"))
-	if !strings.Contains(allowedHeaders, strings.ToLower("X-Codex2API-Affinity-Key")) {
-		t.Fatalf("Access-Control-Allow-Headers = %q, missing X-Codex2API-Affinity-Key", recorder.Header().Get("Access-Control-Allow-Headers"))
+	if !strings.Contains(allowedHeaders, strings.ToLower("X-Codex2CC-Affinity-Key")) {
+		t.Fatalf("Access-Control-Allow-Headers = %q, missing X-Codex2CC-Affinity-Key", recorder.Header().Get("Access-Control-Allow-Headers"))
 	}
 }

@@ -29,7 +29,7 @@ import (
 
 const (
 	systemUpdateRepo             = "TsinHzl/codex2cc"
-	systemUpdateUserAgent        = "Codex2API-Updater"
+	systemUpdateUserAgent        = "Codex2CC-Updater"
 	systemUpdateMaxDownloadBytes = 200 * 1024 * 1024
 	systemUpdateRestartDelay     = 900 * time.Millisecond
 	systemUpdateReleaseCacheTTL  = 2 * time.Minute
@@ -395,7 +395,7 @@ func (u *systemUpdater) applyBinaryUpdate(ctx context.Context, inspection *syste
 	}
 	exeDir := filepath.Dir(exePath)
 
-	tempDir, err := os.MkdirTemp(exeDir, ".codex2api-update-*")
+	tempDir, err := os.MkdirTemp(exeDir, ".codex2cc-update-*")
 	if err != nil {
 		return "", "", fmt.Errorf("创建更新临时目录失败: %w", err)
 	}
@@ -563,7 +563,7 @@ func findSystemUpdateAsset(release *systemGitHubRelease, latestVersion, goos, go
 	if release == nil {
 		return nil
 	}
-	prefix := fmt.Sprintf("codex2api_%s_%s_%s", strings.TrimPrefix(latestVersion, "v"), goos, goarch)
+	prefix := fmt.Sprintf("codex2cc_%s_%s_%s", strings.TrimPrefix(latestVersion, "v"), goos, goarch)
 	for i := range release.Assets {
 		asset := &release.Assets[i]
 		name := strings.ToLower(asset.Name)
@@ -680,7 +680,7 @@ func extractSystemUpdateBinary(archivePath, destPath string) error {
 		if strings.Contains(hdr.Name, "..") || filepath.IsAbs(hdr.Name) {
 			return fmt.Errorf("更新包包含不安全路径: %s", hdr.Name)
 		}
-		if filepath.Base(hdr.Name) != "codex2api" {
+		if filepath.Base(hdr.Name) != "codex2cc" {
 			continue
 		}
 		if hdr.Size > systemUpdateMaxDownloadBytes {
@@ -702,7 +702,7 @@ func extractSystemUpdateBinary(archivePath, destPath string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("更新包内未找到 codex2api 程序")
+	return fmt.Errorf("更新包内未找到 codex2cc 程序")
 }
 
 func replaceExecutable(currentPath, newPath, backupPath string) error {
@@ -721,9 +721,9 @@ func replaceExecutable(currentPath, newPath, backupPath string) error {
 
 func systemBinaryName(goos string) string {
 	if goos == "windows" {
-		return "codex2api.exe"
+		return "codex2cc.exe"
 	}
-	return "codex2api"
+	return "codex2cc"
 }
 
 func normalizeSystemVersion(v string) string {

@@ -4313,7 +4313,7 @@ type jsonAgentIdentityNode struct {
 }
 
 // agentIdentityNodeFromFlatCredentials 从平铺在 credentials 里的 Agent Identity 字段
-// 合成 agent_identity 节点：sub2api / codex2api 的账号导出把这些字段直接摊在
+// 合成 agent_identity 节点：sub2api / codex2cc 的账号导出把这些字段直接摊在
 // credentials 对象上（auth_mode=agentIdentity + agent_runtime_id…），不套
 // agent_identity 子对象。既有子对象则不必调用本函数。
 func agentIdentityNodeFromFlatCredentials(authMode, runtimeID, privateKey, taskID, accountID, userID, email, planType string, fedramp bool) *jsonAgentIdentityNode {
@@ -4662,7 +4662,7 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
 
 		// Agent Identity 条目：无 RT/ST/AT，单独识别。子对象缺失时回退到
-		// 平铺在条目根上的 Agent Identity 字段（sub2api / codex2api 导出形态）。
+		// 平铺在条目根上的 Agent Identity 字段（sub2api / codex2cc 导出形态）。
 		agentNode := entry.AgentIdentity
 		if agentNode == nil {
 			agentNode = agentIdentityNodeFromFlatCredentials(entry.AuthMode, entry.AgentRuntimeID, entry.AgentPrivateKey, entry.AgentTaskID, accID, entry.ChatGPTUserID, email, planType, entry.AgentFedRAMP)
@@ -11156,7 +11156,7 @@ type migrateReq struct {
 	AdminKey string `json:"admin_key"`
 }
 
-// MigrateAccounts 从远程 codex2api 实例迁移健康账号（SSE 流式进度）
+// MigrateAccounts 从远程 codex2cc 实例迁移健康账号（SSE 流式进度）
 func (h *Handler) MigrateAccounts(c *gin.Context) {
 	if !h.hasConfiguredAdminSecret(c.Request.Context()) {
 		writeError(c, http.StatusForbidden, "请先设置管理密钥，再使用远程迁移")

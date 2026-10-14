@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the API enhancements implemented for the Codex2API project.
+This document describes the API enhancements implemented for the Codex2CC project.
 
 ## Enhancements
 
@@ -116,7 +116,7 @@ api/
 ### Using Validation
 
 ```go
-import "github.com/codex2api/api"
+import "github.com/codex2cc/api"
 
 validator := api.NewValidator(body)
 result := validator.ValidateRequest(api.ChatCompletionValidationRules())

@@ -10,9 +10,9 @@ import (
 
 // Run against an empty disposable database, as for the other PostgreSQL tests.
 func TestPostgresTraceAndCapabilities(t *testing.T) {
-	dsn := os.Getenv("CODEX2API_TEST_POSTGRES_DSN")
+	dsn := os.Getenv("CODEX2CC_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		t.Skip("CODEX2API_TEST_POSTGRES_DSN is not set")
+		t.Skip("CODEX2CC_TEST_POSTGRES_DSN is not set")
 	}
 	db, err := New("postgres", dsn)
 	if err != nil {

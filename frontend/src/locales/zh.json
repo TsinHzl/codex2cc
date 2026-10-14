@@ -513,7 +513,7 @@
     "exportNoAccounts": "没有符合条件的账号可导出",
     "migrateImport": "迁移导入",
     "migrateTitle": "远程迁移导入",
-    "migrateDesc": "从另一个 codex2api 实例导入健康账号。远程实例需在系统设置中开启「允许远程迁移」。",
+    "migrateDesc": "从另一个 codex2cc 实例导入健康账号。远程实例需在系统设置中开启「允许远程迁移」。",
     "migrateUrlLabel": "远程实例地址",
     "migrateUrlPlaceholder": "例如 https://other-instance.com",
     "migrateKeyLabel": "远程管理密钥",
@@ -2694,7 +2694,7 @@
       },
       "attachment": {
         "title": "附件内容解析",
-        "description": "通过独立服务提取受支持附件中的文本后再检查。Codex2API 不直接下载任意用户 URL，默认关闭并以影子层记录。",
+        "description": "通过独立服务提取受支持附件中的文本后再检查。Codex2CC 不直接下载任意用户 URL，默认关闭并以影子层记录。",
         "enabled": "启用附件解析",
         "enabledHint": "只有部署受控的附件解析服务后才开启；关闭时仍可检查附件引用元数据。",
         "allowRemoteURLs": "允许解析远程 URL",
@@ -2765,7 +2765,7 @@
       "scheduleEnabled": "服务启动后按设定间隔自动执行公开情报搜索。",
       "intervalHours": "两次自动情报任务之间至少间隔多少小时。",
       "maxResults": "每次最多保存和发送给分析模型的公开项目数量。",
-      "modelEnabled": "使用当前 Codex2API 号池中的模型，把公开项目归纳为候选拦截规则。",
+      "modelEnabled": "使用当前 Codex2CC 号池中的模型，把公开项目归纳为候选拦截规则。",
       "model": "执行情报归纳的号池模型名称。",
       "maxModelCalls": "单次情报任务允许消耗的最大号池模型请求数，范围 0—3。",
       "queries": "用户自定义搜索词，每行一个；会与系统内置搜索词合并并去重。"
@@ -3096,15 +3096,15 @@
     "noRulesInCategory": "该分类下暂无规则",
     "newapi": {
       "title": "NewAPI 审计接入",
-      "description": "NewAPI 签名身份只通过 Codex2API Key 一对一绑定接入。绑定只负责身份校验；拦截模式和审核档位统一由 GuardPipeline 管理。",
+      "description": "NewAPI 签名身份只通过 Codex2CC Key 一对一绑定接入。绑定只负责身份校验；拦截模式和审核档位统一由 GuardPipeline 管理。",
       "clockSkew": "时钟容差（秒）",
       "clockSkewHint": "超过该时间范围的签名会被视为无效。",
       "protocolTitle": "查看签名协议与 NewAPI 配置",
       "newapiEnv": "NewAPI 环境变量",
-      "newapiEnvExample": "CODEX2API_POLICY_ENABLED=true\nCODEX2API_POLICY_BINDINGS=[{\"platform_id\":\"primary-newapi\",\"target\":\"http://127.0.0.1:18095\",\"codex_key_fingerprint\":\"<Key 的 SHA-256 指纹>\",\"secret\":\"<该 Key 的绑定密钥>\",\"enabled\":true}]\nCODEX2API_POLICY_BAN_AFTER=2\nCODEX2API_POLICY_WINDOW_SECONDS=86400",
+      "newapiEnvExample": "CODEX2CC_POLICY_ENABLED=true\nCODEX2CC_POLICY_BINDINGS=[{\"platform_id\":\"primary-newapi\",\"target\":\"http://127.0.0.1:18095\",\"codex_key_fingerprint\":\"<Key 的 SHA-256 指纹>\",\"secret\":\"<该 Key 的绑定密钥>\",\"enabled\":true}]\nCODEX2CC_POLICY_BAN_AFTER=2\nCODEX2CC_POLICY_WINDOW_SECONDS=86400",
       "headersTitle": "NewAPI 请求头与审核档案",
       "headersExample": "X-NewAPI-User-ID: <用户ID>\nX-NewAPI-Client-IP: <真实用户IP>\nX-NewAPI-Request-ID: <唯一请求ID>\nX-NewAPI-Timestamp: <Unix秒>\nX-NewAPI-Method: <HTTP方法>\nX-NewAPI-Path: <实际转发路径>\nX-NewAPI-Body-SHA256: <请求体SHA-256十六进制>\nX-NewAPI-Signature-Version: 1\nX-NewAPI-Signature: <V1身份HMAC-SHA256>\nX-NewAPI-Policy-Meta: <Base64URL审核档案JSON>\nX-NewAPI-Policy-Meta-Signature: <档案HMAC-SHA256>",
-      "signatureHint": "身份请求继续使用稳定的 V1 签名。policy-meta-v1 中的调用方代码必须与当前 Codex2API Key 绑定一致；身份、审核档案、返回决策和事件都使用该绑定密钥验签。NewAPI 传入的模式或档位不会覆盖 GuardPipeline。"
+      "signatureHint": "身份请求继续使用稳定的 V1 签名。policy-meta-v1 中的调用方代码必须与当前 Codex2CC Key 绑定一致；身份、审核档案、返回决策和事件都使用该绑定密钥验签。NewAPI 传入的模式或档位不会覆盖 GuardPipeline。"
     },
     "intelligence": {
       "title": "联网规则情报更新",
@@ -3336,7 +3336,7 @@
         "b2": "终局拦截分类：指定 category 形成高可信违规判定后进入终局路径。",
         "b3": "用户/IP/会话累计风险：记录已确认的高风险事件并辅助复核，不会仅凭累计分独立封禁。",
         "b4": "SSE/WebSocket 输出扫描：检查模型流式输出；可限制为仅终局规则中断。",
-        "b5": "NewAPI 审计接入：只按 Codex2API Key 一对一绑定校验签名身份与审核档案；未绑定 Key 不接受签名身份。",
+        "b5": "NewAPI 审计接入：只按 Codex2CC Key 一对一绑定校验签名身份与审核档案；未绑定 Key 不接受签名身份。",
         "b6": "规则情报定时任务：按间隔搜索公开情报并可选生成候选规则。",
         "callout": "多副本部署时累计风险建议使用 Redis 缓存；解码轮数建议 1–2，过高会增加延迟。输出扫描为跨帧检测会保留有限窗口：与预检透传（codex_preflight_sse_passthrough）同时开启时，小体积 metadata 帧仍可能被短暂缓存，首帧速度不一定能恢复；且首个内容事件前一旦提交 HTTP 200，后续上游错误的状态码恢复语义会改变，两者同开需单独验证。"
       },
@@ -3375,11 +3375,11 @@
       },
       "newapi": {
         "title": "NewAPI 审计接入",
-        "p1": "当流量经 NewAPI 转发到 Codex2API 时，NewAPI 对用户 ID、IP、请求 ID、请求体摘要和审核档案签名，Codex2API 验签后再关联审计身份与策略。",
-        "p2": "每个调用方必须使用实际请求对应的 Codex2API Key 绑定；旧版进程级密钥配置不再参与验签。详细字段与签名串见概览中的「NewAPI 审计接入」。",
+        "p1": "当流量经 NewAPI 转发到 Codex2CC 时，NewAPI 对用户 ID、IP、请求 ID、请求体摘要和审核档案签名，Codex2CC 验签后再关联审计身份与策略。",
+        "p2": "每个调用方必须使用实际请求对应的 Codex2CC Key 绑定；旧版进程级密钥配置不再参与验签。详细字段与签名串见概览中的「NewAPI 审计接入」。",
         "b1": "每个绑定使用自己的密钥与启用状态；未绑定 Key 不接受 NewAPI 签名身份。",
         "b2": "审计、警告、账号限制和 IP 限制由 NewAPI 分别配置，不应因启用身份校验而自动开启处罚。",
-        "b3": "NewAPI 侧需签名请求头、校验 Codex2API 返回的签名策略事件，并按自身配置保存审计记录。"
+        "b3": "NewAPI 侧需签名请求头、校验 Codex2CC 返回的签名策略事件，并按自身配置保存审计记录。"
       },
       "checklist": {
         "title": "上线检查清单",
@@ -3620,7 +3620,7 @@
     "schedulerModeRemainingQuota": "剩余配额",
     "schedulerModeFillFirst": "顺序耗尽",
     "affinityMode": "会话粘性",
-    "affinityModeDesc": "亲和与调度优先级相互独立。共享 API Key 时，下游可传 X-Codex2API-Affinity-Key 稳定区分最终用户（仅本地哈希使用）。Bounded 在账号不健康或会话空闲超 10 分钟时换号，活跃会话不轮换以保住上游 prompt cache；Off 每次重选；Strict 长期粘连。",
+    "affinityModeDesc": "亲和与调度优先级相互独立。共享 API Key 时，下游可传 X-Codex2CC-Affinity-Key 稳定区分最终用户（仅本地哈希使用）。Bounded 在账号不健康或会话空闲超 10 分钟时换号，活跃会话不轮换以保住上游 prompt cache；Off 每次重选；Strict 长期粘连。",
     "sessionAffinitySpread": "亲和散列绑定",
     "sessionAffinitySpreadDesc": "新亲和键首次绑定时在同优先级、同健康档位的账号里按哈希确定性散开，不再全部涌向当前最高分账号：相同键恒绑同一账号，不同键均匀分摊，首选不可用时顺延。关闭时保持原有最高分优先。多副本部署无需额外协调即可收敛到相同映射。",
     "sessionSlotBuffer": "会话并发槽缓冲",
@@ -3638,7 +3638,7 @@
       "saved": "连通性测试设置已保存"
     },
     "allowRemoteMigration": "允许远程迁移",
-    "allowRemoteMigrationDesc": "开启后，其他 codex2api 实例可通过导出接口拉取本实例的健康账号。",
+    "allowRemoteMigrationDesc": "开启后，其他 codex2cc 实例可通过导出接口拉取本实例的健康账号。",
     "allowRemoteMigrationRequiresSecret": "请先设置管理密钥，未设置密码时不能启用远程迁移。",
     "resinTitle": "Resin 粘性代理池",
     "resinDesc": "配置后 Codex 渠道所有携带账号身份的出站（对话、WS、用量/订阅查询、令牌刷新）全部改经 Resin 反向代理，实现按账号粘性 IP。两个字段都填写后生效，清空任一即禁用。Resin 是整层覆盖：启用期间账号代理、分组代理、代理池与全局代理对 Codex 渠道均不参与出站；Claude 不受影响。",
@@ -3649,7 +3649,7 @@
     "resinUrl": "Resin 地址",
     "resinUrlDesc": "Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token",
     "resinPlatformName": "平台标识",
-    "resinPlatformNameDesc": "Resin 中的平台名称，用于区分不同业务。例如 codex2api",
+    "resinPlatformNameDesc": "Resin 中的平台名称，用于区分不同业务。例如 codex2cc",
     "security": "安全",
     "adminSecret": "管理密钥",
     "adminSecretPlaceholder": "留空则不启用管理接口鉴权",
@@ -4675,7 +4675,7 @@
     "noAffinityGroupsLabel": "无指纹请求分流组",
     "noAffinityGroupsPlaceholder": "选择无指纹请求使用的分组",
     "noAffinityGroupsDisabled": "不启用分流",
-    "noAffinityGroupsHint": "不带 Codex 引擎指纹且不带 X-Codex2API-Affinity-Key 的请求只从这些分组选号；带任一指纹的请求走上面的原分组，上面留空（不限分组）时则自动排除这里的分流组。留空保持当前行为。注意指纹只是客户端特征，下游自行加上相应请求头即可绕过。",
+    "noAffinityGroupsHint": "不带 Codex 引擎指纹且不带 X-Codex2CC-Affinity-Key 的请求只从这些分组选号；带任一指纹的请求走上面的原分组，上面留空（不限分组）时则自动排除这里的分流组。留空保持当前行为。注意指纹只是客户端特征，下游自行加上相应请求头即可绕过。",
     "allowedGroupsNone": "不限制分组",
     "allowedGroupsMissing": "分组已不存在",
     "allowedGroupsSaved": "允许分组已保存",

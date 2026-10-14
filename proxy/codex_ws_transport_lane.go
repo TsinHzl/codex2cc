@@ -53,7 +53,7 @@ func ResolveCodexWebsocketTransportSessionKeyWithBody(upstreamSessionID string, 
 	if !childThread && lane == "" {
 		return upstreamSessionID
 	}
-	seed := "codex2api:ws-transport-lane:v1\x00" + upstreamSessionID + "\x00" + clientSessionID + "\x00" + clientThreadID
+	seed := "codex2cc:ws-transport-lane:v1\x00" + upstreamSessionID + "\x00" + clientSessionID + "\x00" + clientThreadID
 	if lane != "" {
 		seed += "\x00" + lane
 	}

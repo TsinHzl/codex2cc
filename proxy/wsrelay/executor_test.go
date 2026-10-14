@@ -576,7 +576,7 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 	const (
 		clientUUID    = "01a00e75-8856-7542-89bf-35812620690f"
 		installUUID   = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
-		workspacePath = "/Users/kyx/code_project/codex2api"
+		workspacePath = "/Users/kyx/code_project/codex2cc"
 		remoteURL     = "https://github.com/TsinHzl/codex2cc.git"
 		commitHash    = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
 	)

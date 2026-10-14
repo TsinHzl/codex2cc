@@ -20,9 +20,9 @@ func TestMemoryRuntimeCooldownMerge(t *testing.T) {
 }
 
 func TestRedisRuntimeCooldownMerge(t *testing.T) {
-	addr := os.Getenv("CODEX2API_TEST_REDIS_ADDR")
+	addr := os.Getenv("CODEX2CC_TEST_REDIS_ADDR")
 	if addr == "" {
-		t.Skip("set CODEX2API_TEST_REDIS_ADDR to an isolated Redis for Lua integration tests")
+		t.Skip("set CODEX2CC_TEST_REDIS_ADDR to an isolated Redis for Lua integration tests")
 	}
 	options := &redis.Options{Addr: addr}
 	if strings.HasPrefix(addr, "/") {

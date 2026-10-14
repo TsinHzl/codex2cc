@@ -1,8 +1,8 @@
-# OpenAPI Specification for Codex2API
+# OpenAPI Specification for Codex2CC
 
 openapi: 3.0.3
 info:
-  title: Codex2API
+  title: Codex2CC
   description: |
     OpenAI-compatible API proxy for Codex with enhanced features including:
     - Multi-account pooling with automatic rotation
@@ -16,8 +16,8 @@ info:
   version: 1.0.0
   contact:
     name: API Support
-    url: https://github.com/codex2api
-    email: support@codex2api.local
+    url: https://github.com/codex2cc
+    email: support@codex2cc.local
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -25,7 +25,7 @@ info:
 servers:
   - url: http://localhost:8080/v1
     description: Local development server
-  - url: https://api.codex2api.local/v1
+  - url: https://api.codex2cc.local/v1
     description: Production server
 
 security:
@@ -696,7 +696,7 @@ paths:
     servers:
       - url: http://localhost:8080
         description: Local development server
-      - url: https://api.codex2api.local
+      - url: https://api.codex2cc.local
         description: Production server
     get:
       summary: Health check

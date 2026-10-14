@@ -31,7 +31,7 @@ const DashboardUsageCharts = lazy(() => import('../components/DashboardUsageChar
 
 const DASHBOARD_REFRESH_INTERVAL_MS = 15_000
 const DASHBOARD_POOL_REFRESH_INTERVAL_MS = 60_000
-const DASHBOARD_POOL_RUNWAY_VISIBILITY_KEY = 'codex2api:dashboard:pool-runway-visible'
+const DASHBOARD_POOL_RUNWAY_VISIBILITY_KEY = 'codex2cc:dashboard:pool-runway-visible'
 
 function getInitialPoolRunwayVisibility(): boolean {
   try {

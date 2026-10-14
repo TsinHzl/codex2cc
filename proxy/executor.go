@@ -385,7 +385,7 @@ func codexResponsesLiteRequested(requestBody []byte, headers http.Header) bool {
 }
 
 // prepareCodexResponsesLiteTransport keeps the request-scoped Responses Lite
-// signal intact when codex2api changes the upstream transport. HTTP carries the
+// signal intact when codex2cc changes the upstream transport. HTTP carries the
 // signal in a header; WebSocket carries it on each response.create frame so a
 // pooled connection can safely serve both Lite and non-Lite requests.
 func prepareCodexResponsesLiteTransport(requestBody []byte, headers http.Header, useWebsocket, enabled bool) ([]byte, http.Header) {
@@ -874,7 +874,7 @@ func ensureCodexClientInstallationMetadata(requestBody []byte, account *auth.Acc
 	if seed == "" {
 		seed = "default"
 	}
-	installationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:client-installation:"+seed)).String()
+	installationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2cc:client-installation:"+seed)).String()
 	updatedBody, err := sjson.SetBytes(requestBody, "client_metadata.x-codex-installation-id", installationID)
 	if err != nil {
 		return requestBody, false
@@ -1348,7 +1348,7 @@ func codexIdentityPassthroughActive(account *auth.Account, headers http.Header) 
 	)
 }
 
-const downstreamAffinityHeader = "X-Codex2API-Affinity-Key"
+const downstreamAffinityHeader = "X-Codex2CC-Affinity-Key"
 
 // requestSessionIdentity keeps the local account-routing identity separate
 // from the seed used to derive an upstream Session_id/prompt_cache_key. The
@@ -1364,7 +1364,7 @@ type requestSessionIdentity struct {
 
 // ResolveSessionID 从下游请求提取或生成 session ID
 // 优先级：
-//  1. Header: X-Codex2API-Affinity-Key（仅本地使用，先哈希再参与绑定）
+//  1. Header: X-Codex2CC-Affinity-Key（仅本地使用，先哈希再参与绑定）
 //  2. Header: Session_id
 //  3. Header: Conversation_id
 //  4. Header: Idempotency-Key
@@ -1399,7 +1399,7 @@ func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSess
 		if apiKey != "" {
 			// 必须与 deterministicPromptCacheKey 用同一条派生：两处共享种子字符串，
 			// 产出不同就会让 HTTP 与 WS 路径对同一个 API Key 算出两个上游身份。
-			upstreamSeed = DeriveStableSessionUUIDv7("codex2api:prompt-cache:" + apiKey)
+			upstreamSeed = DeriveStableSessionUUIDv7("codex2cc:prompt-cache:" + apiKey)
 		}
 	}
 	if upstreamSeed == "" {
@@ -1435,7 +1435,7 @@ func resolveDownstreamAffinityID(headers http.Header) string {
 	if raw == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte("codex2api:downstream-affinity:" + raw))
+	sum := sha256.Sum256([]byte("codex2cc:downstream-affinity:" + raw))
 	return "affinity-" + hex.EncodeToString(sum[:16])
 }
 
@@ -1487,11 +1487,11 @@ func IsStatelessWebsocketSessionID(sessionID string) bool {
 func deterministicPromptCacheKey(apiKey string, account *auth.Account) string {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey != "" {
-		return DeriveStableSessionUUIDv7("codex2api:prompt-cache:" + apiKey)
+		return DeriveStableSessionUUIDv7("codex2cc:prompt-cache:" + apiKey)
 	}
 	if account != nil {
 		if id := account.ID(); id > 0 {
-			return DeriveStableSessionUUIDv7(fmt.Sprintf("codex2api:prompt-cache:auth:%d", id))
+			return DeriveStableSessionUUIDv7(fmt.Sprintf("codex2cc:prompt-cache:auth:%d", id))
 		}
 	}
 	return ""

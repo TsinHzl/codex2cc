@@ -115,7 +115,7 @@ func codexIdentityUnixMilli(account *auth.Account, seed string) int64 {
 	if base <= 0 {
 		base = codexIdentityFallbackEpochMilli
 	}
-	sum := sha256.Sum256([]byte("codex2api:codex-identity-ts:v1:" + seed))
+	sum := sha256.Sum256([]byte("codex2cc:codex-identity-ts:v1:" + seed))
 	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
 	return base + offset
 }
@@ -153,7 +153,7 @@ func NewUpstreamSessionUUID() string {
 // seededIdentityUnixMilli 是 codexIdentityUnixMilli 的无账号版本：拿不到账号加入
 // 时间时以固定基准代替，其余散布逻辑一致。
 func seededIdentityUnixMilli(seed string) int64 {
-	sum := sha256.Sum256([]byte("codex2api:session-identity-ts:v1:" + seed))
+	sum := sha256.Sum256([]byte("codex2cc:session-identity-ts:v1:" + seed))
 	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
 	return codexIdentityFallbackEpochMilli + offset
 }
@@ -188,7 +188,7 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 		return ids
 	}
 
-	sessionSeed := fmt.Sprintf("codex2api:codex-session-id:v1:%d", accountID)
+	sessionSeed := fmt.Sprintf("codex2cc:codex-session-id:v1:%d", accountID)
 	ids.sessionID = deriveStableCodexUUIDv7(sessionSeed, codexIdentityUnixMilli(account, sessionSeed))
 	ids.threadID = ids.sessionID
 	if mode == auth.CodexFingerprintModeSession {
@@ -199,11 +199,11 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 			// 子代理 / 多窗口：真实 thread 与 session 不同。仍按会话派生会把
 			// 多条线程收成一条，X-Client-Request-Id（实测恒等于 thread-id）
 			// 跟着塌缩后，上游按线程查找 previous_response_id 就会 400（#541）。
-			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v2:%d:%s", accountID, clientThreadID)
+			threadSeed = fmt.Sprintf("codex2cc:codex-thread-id:v2:%d:%s", accountID, clientThreadID)
 		case clientSessionID != "":
-			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientSessionID)
+			threadSeed = fmt.Sprintf("codex2cc:codex-thread-id:v1:%d:%s", accountID, clientSessionID)
 		case clientThreadID != "":
-			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientThreadID)
+			threadSeed = fmt.Sprintf("codex2cc:codex-thread-id:v1:%d:%s", accountID, clientThreadID)
 		}
 		if threadSeed != "" {
 			ids.threadID = deriveStableCodexUUIDv7(threadSeed, codexIdentityUnixMilli(account, threadSeed))
@@ -225,7 +225,7 @@ func resolveConvergedInstallationID(account *auth.Account, accountID int64) stri
 			}
 		}
 	}
-	return deriveStableCodexUUID(fmt.Sprintf("codex2api:codex-install-id:v1:%d", accountID))
+	return deriveStableCodexUUID(fmt.Sprintf("codex2cc:codex-install-id:v1:%d", accountID))
 }
 
 // extractClientCodexSessionID 取下游客户端的原始会话标识。
@@ -495,7 +495,7 @@ func convergeCodexLineageMetadata(raw string, accountID int64) (string, bool) {
 // 原始 UUID 出现在不同字段上会得到不同结果——上游据此无法把"某人的父线程"和
 // "某人的上下文窗口"认作同一个对象。
 func convergeCodexLineageValue(accountID int64, key, original string) string {
-	seed := fmt.Sprintf("codex2api:codex-lineage:v1:%s:%d:%s", key, accountID, original)
+	seed := fmt.Sprintf("codex2cc:codex-lineage:v1:%s:%d:%s", key, accountID, original)
 	return deriveStableCodexUUIDv7(seed, seededIdentityUnixMilli(seed))
 }
 
@@ -573,14 +573,14 @@ func scrubCodexWorkspaces(raw string, accountID int64) (string, bool) {
 // 不同路径互不相同，且不携带用户名或项目名。返回值不含 sjson 的路径元字符
 // （. * ?），可直接作为 sjson 路径使用。
 func placeholderWorkspacePath(accountID int64, original string) string {
-	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-path:v2:%d:%s", accountID, original))
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2cc:workspace-path:v2:%d:%s", accountID, original))
 	return workspacePlaceholderPrefix + fmt.Sprintf("%x", sum[:workspacePlaceholderDigestBytes])
 }
 
 // placeholderCommitHash 派生一个与真实 commit hash 等长（40 位十六进制）的占位值，
 // 保持字段形状不变。种子取占位路径而非原哈希，见调用点说明。
 func placeholderCommitHash(accountID int64, placeholderPath string) string {
-	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-commit:v1:%d:%s", accountID, placeholderPath))
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2cc:workspace-commit:v1:%d:%s", accountID, placeholderPath))
 	return fmt.Sprintf("%x", sum[:20])
 }
 

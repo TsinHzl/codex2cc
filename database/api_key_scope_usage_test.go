@@ -10,7 +10,7 @@ import (
 )
 
 func TestGetAPIKeyAccountWindowUsageSplitsByAccount(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -92,7 +92,7 @@ func TestGetAPIKeyAccountWindowUsageSplitsByAccount(t *testing.T) {
 }
 
 func TestAPIKeyAccountStatsKeepsDeletedAccountLastGroup(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -179,7 +179,7 @@ func TestAPIKeyAccountStatsKeepsDeletedAccountLastGroup(t *testing.T) {
 }
 
 func TestDeleteAccountGroupPrunesScopeLimits(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -239,7 +239,7 @@ func TestDeleteAccountGroupPrunesScopeLimits(t *testing.T) {
 }
 
 func TestScopeCountersAccumulateAcrossGroupAndAccount(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -324,7 +324,7 @@ func TestScopeCountersAccumulateAcrossGroupAndAccount(t *testing.T) {
 }
 
 func TestScopeCountersSkipKeysWithoutCumulativeQuota(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -361,7 +361,7 @@ func TestScopeCountersSkipKeysWithoutCumulativeQuota(t *testing.T) {
 }
 
 func TestDeleteAPIKeyRemovesScopeCounters(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)

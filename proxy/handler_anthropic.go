@@ -765,7 +765,7 @@ func (h *Handler) Messages(c *gin.Context) {
 						upstreamCyberPolicyLogged = true
 						failedOutcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
 						if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated {
-							policyDetails = gin.H{"codex2api_policy": newAPIPolicyDecisionDetails(metadata)}
+							policyDetails = gin.H{"codex2cc_policy": newAPIPolicyDecisionDetails(metadata)}
 						}
 					}
 					if err := writeAnthropicStreamErrorEvent(streamWriter, mapHTTPStatusToAnthropicError(failedOutcome.logStatusCode), failedOutcome.failureMessage, policyDetails); err != nil {

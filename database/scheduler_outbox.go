@@ -278,7 +278,7 @@ func (db *DB) installSQLiteSchedulerOutboxTriggers(ctx context.Context) error {
 
 func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error {
 	const query = `
-		CREATE OR REPLACE FUNCTION codex2api_scheduler_outbox_row() RETURNS trigger AS $$
+		CREATE OR REPLACE FUNCTION codex2cc_scheduler_outbox_row() RETURNS trigger AS $$
 		DECLARE
 			payload JSONB;
 			entity_id BIGINT;
@@ -297,7 +297,7 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 		DROP TRIGGER IF EXISTS scheduler_outbox_accounts_insert ON accounts;
 		DROP TRIGGER IF EXISTS scheduler_outbox_accounts_update ON accounts;
 		DROP TRIGGER IF EXISTS scheduler_outbox_accounts_delete ON accounts;
-		CREATE TRIGGER scheduler_outbox_accounts_insert AFTER INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
+		CREATE TRIGGER scheduler_outbox_accounts_insert AFTER INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','id');
 		CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE OF credentials,proxy_url,status,error_message,cooldown_reason,cooldown_until,enabled,locked,score_bias_override,base_concurrency_override,skip_warm_tier,tags,credit_enabled,credit_skip_usage_window,deleted_at ON accounts FOR EACH ROW WHEN (
 			OLD.proxy_url IS DISTINCT FROM NEW.proxy_url OR OLD.status IS DISTINCT FROM NEW.status OR OLD.error_message IS DISTINCT FROM NEW.error_message OR
 			OLD.cooldown_reason IS DISTINCT FROM NEW.cooldown_reason OR OLD.cooldown_until IS DISTINCT FROM NEW.cooldown_until OR
@@ -326,46 +326,46 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 			COALESCE(OLD.credentials->>'agent_runtime_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_runtime_id','') OR
 			COALESCE(OLD.credentials->>'agent_private_key','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_private_key','') OR
 			COALESCE(OLD.credentials->>'task_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'task_id','')
-		) EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
-		CREATE TRIGGER scheduler_outbox_accounts_delete AFTER DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
+		) EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','id');
+		CREATE TRIGGER scheduler_outbox_accounts_delete AFTER DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_insert ON api_keys;
 		DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_update ON api_keys;
 		DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_delete ON api_keys;
-		CREATE TRIGGER scheduler_outbox_api_keys_insert AFTER INSERT ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('api_key','id');
-		CREATE TRIGGER scheduler_outbox_api_keys_update AFTER UPDATE OF allowed_group_ids,limits,expires_at ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('api_key','id');
-		CREATE TRIGGER scheduler_outbox_api_keys_delete AFTER DELETE ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('api_key','id');
+		CREATE TRIGGER scheduler_outbox_api_keys_insert AFTER INSERT ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('api_key','id');
+		CREATE TRIGGER scheduler_outbox_api_keys_update AFTER UPDATE OF allowed_group_ids,limits,expires_at ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('api_key','id');
+		CREATE TRIGGER scheduler_outbox_api_keys_delete AFTER DELETE ON api_keys FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('api_key','id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_groups_insert ON account_groups;
 		DROP TRIGGER IF EXISTS scheduler_outbox_groups_update ON account_groups;
 		DROP TRIGGER IF EXISTS scheduler_outbox_groups_delete ON account_groups;
-		CREATE TRIGGER scheduler_outbox_groups_insert AFTER INSERT ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('group','id');
-		CREATE TRIGGER scheduler_outbox_groups_update AFTER UPDATE ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('group','id');
-		CREATE TRIGGER scheduler_outbox_groups_delete AFTER DELETE ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('group','id');
+		CREATE TRIGGER scheduler_outbox_groups_insert AFTER INSERT ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('group','id');
+		CREATE TRIGGER scheduler_outbox_groups_update AFTER UPDATE ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('group','id');
+		CREATE TRIGGER scheduler_outbox_groups_delete AFTER DELETE ON account_groups FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('group','id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_members_insert ON account_group_members;
 		DROP TRIGGER IF EXISTS scheduler_outbox_members_delete ON account_group_members;
-		CREATE TRIGGER scheduler_outbox_members_insert AFTER INSERT ON account_group_members FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','account_id');
-		CREATE TRIGGER scheduler_outbox_members_delete AFTER DELETE ON account_group_members FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','account_id');
+		CREATE TRIGGER scheduler_outbox_members_insert AFTER INSERT ON account_group_members FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','account_id');
+		CREATE TRIGGER scheduler_outbox_members_delete AFTER DELETE ON account_group_members FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','account_id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_insert ON account_model_cooldowns;
 		DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_update ON account_model_cooldowns;
 		DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_delete ON account_model_cooldowns;
-		CREATE TRIGGER scheduler_outbox_cooldowns_insert AFTER INSERT ON account_model_cooldowns FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','account_id');
+		CREATE TRIGGER scheduler_outbox_cooldowns_insert AFTER INSERT ON account_model_cooldowns FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','account_id');
 		CREATE TRIGGER scheduler_outbox_cooldowns_update AFTER UPDATE ON account_model_cooldowns FOR EACH ROW WHEN (
 			OLD.reset_at IS DISTINCT FROM NEW.reset_at OR OLD.reason IS DISTINCT FROM NEW.reason OR OLD.model IS DISTINCT FROM NEW.model
-		) EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','account_id');
-		CREATE TRIGGER scheduler_outbox_cooldowns_delete AFTER DELETE ON account_model_cooldowns FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','account_id');
+		) EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','account_id');
+		CREATE TRIGGER scheduler_outbox_cooldowns_delete AFTER DELETE ON account_model_cooldowns FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('account','account_id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_proxies_insert ON proxies;
 		DROP TRIGGER IF EXISTS scheduler_outbox_proxies_update ON proxies;
 		DROP TRIGGER IF EXISTS scheduler_outbox_proxies_delete ON proxies;
-		CREATE TRIGGER scheduler_outbox_proxies_insert AFTER INSERT ON proxies FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('proxy','id');
-		CREATE TRIGGER scheduler_outbox_proxies_update AFTER UPDATE ON proxies FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('proxy','id');
-		CREATE TRIGGER scheduler_outbox_proxies_delete AFTER DELETE ON proxies FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('proxy','id');
+		CREATE TRIGGER scheduler_outbox_proxies_insert AFTER INSERT ON proxies FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('proxy','id');
+		CREATE TRIGGER scheduler_outbox_proxies_update AFTER UPDATE ON proxies FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('proxy','id');
+		CREATE TRIGGER scheduler_outbox_proxies_delete AFTER DELETE ON proxies FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('proxy','id');
 
 		DROP TRIGGER IF EXISTS scheduler_outbox_settings_update ON system_settings;
-		CREATE TRIGGER scheduler_outbox_settings_update AFTER UPDATE ON system_settings FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('settings','id');
+		CREATE TRIGGER scheduler_outbox_settings_update AFTER UPDATE ON system_settings FOR EACH ROW EXECUTE FUNCTION codex2cc_scheduler_outbox_row('settings','id');
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	return err

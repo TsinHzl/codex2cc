@@ -65,15 +65,15 @@ func addScopedModel(records map[string]*scopedModelRecord, id string, backing mo
 
 func scopedModelOwner(record *scopedModelRecord) string {
 	if record == nil || record.alias {
-		return "codex2api"
+		return "codex2cc"
 	}
 	switch record.backing {
 	case modelBackingCodex:
 		return "openai"
 	case modelBackingRelay:
-		return "codex2api"
+		return "codex2cc"
 	default:
-		return "codex2api"
+		return "codex2cc"
 	}
 }
 
@@ -305,8 +305,8 @@ func filterCodexManifest(body []byte, upstreamETag string, allowed func(string) 
 	if err != nil {
 		return nil, "", err
 	}
-	sum := sha256.Sum256(append(append([]byte("codex2api-manifest-v1\x00"+upstreamETag+"\x00"), filteredBody...), '\n'))
-	return filteredBody, `"codex2api-` + hex.EncodeToString(sum[:]) + `"`, nil
+	sum := sha256.Sum256(append(append([]byte("codex2cc-manifest-v1\x00"+upstreamETag+"\x00"), filteredBody...), '\n'))
+	return filteredBody, `"codex2cc-` + hex.EncodeToString(sum[:]) + `"`, nil
 }
 
 func etagHeaderMatches(header, current string) bool {

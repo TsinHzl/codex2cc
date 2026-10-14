@@ -12,7 +12,7 @@ import (
 
 const (
 	portableCompactionEnvelopePrefix      = "sub2api-emulated-compaction-v1:"
-	localPortableCompactionEnvelopePrefix = "codex2api-emulated-compaction-v1:"
+	localPortableCompactionEnvelopePrefix = "codex2cc-emulated-compaction-v1:"
 	portableCompactionSummaryOpen         = "<summary>"
 	portableCompactionSummaryClose        = "</summary>"
 	responsesCompactionSummaryPrefix      = "[Conversation summary from earlier turns]\n"

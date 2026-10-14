@@ -104,7 +104,7 @@ func TestFastSchedulerKeeps5hExhaustedSparkAccount(t *testing.T) {
 
 func TestSparkSnapshotHydratesFromCredentials(t *testing.T) {
 	ctx := context.Background()
-	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("database.New: %v", err)
 	}

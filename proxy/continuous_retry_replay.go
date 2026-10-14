@@ -84,7 +84,7 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 		return n, err
 	}
 	if r.file == nil {
-		file, err := os.CreateTemp("", "codex2api-continuous-retry-*")
+		file, err := os.CreateTemp("", "codex2cc-continuous-retry-*")
 		if err != nil {
 			return 0, errContinuousRetryReplayStorage
 		}

@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseLinuxProcessRSS(t *testing.T) {
-	status := "Name:\tcodex2api\nVmSize:\t1308916 kB\nVmRSS:\t53368 kB\nThreads:\t12\n"
+	status := "Name:\tcodex2cc\nVmSize:\t1308916 kB\nVmRSS:\t53368 kB\nThreads:\t12\n"
 	got, ok := parseLinuxProcessRSS(strings.NewReader(status))
 	if !ok {
 		t.Fatal("parseLinuxProcessRSS did not find VmRSS")
@@ -20,8 +20,8 @@ func TestParseLinuxProcessRSS(t *testing.T) {
 
 func TestParseLinuxProcessRSSRejectsMissingOrZeroValue(t *testing.T) {
 	for _, status := range []string{
-		"Name:\tcodex2api\nVmSize:\t1308916 kB\n",
-		"Name:\tcodex2api\nVmRSS:\t0 kB\n",
+		"Name:\tcodex2cc\nVmSize:\t1308916 kB\n",
+		"Name:\tcodex2cc\nVmRSS:\t0 kB\n",
 	} {
 		if got, ok := parseLinuxProcessRSS(strings.NewReader(status)); ok || got != 0 {
 			t.Fatalf("parseLinuxProcessRSS(%q) = (%d, %t), want (0, false)", status, got, ok)

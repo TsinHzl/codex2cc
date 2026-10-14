@@ -91,7 +91,7 @@ func fetchModelPricingJSON(ctx context.Context, syncURL, proxyURL string) (map[s
 		return nil, fmt.Errorf("build pricing request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex2api")
+	req.Header.Set("User-Agent", "codex2cc")
 
 	// 目标是 GitHub 域（默认定价 JSON 在 raw.githubusercontent.com）时套用专用代理；
 	// URL 可被部署方改成任意地址，故这里绝不附加 github_token。

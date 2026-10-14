@@ -1358,7 +1358,7 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
 // 列设置菜单按这个顺序列出可选列，与表头顺序一致。
 const USAGE_TABLE_COLUMN_ORDER: readonly UsageTableColumn[] = USAGE_COLUMN_DEFINITIONS.map((column) => column.key)
 
-const USAGE_VISIBLE_COLUMNS_KEY = 'codex2api:usage:visible-columns'
+const USAGE_VISIBLE_COLUMNS_KEY = 'codex2cc:usage:visible-columns'
 const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   status: true,
   error: true,

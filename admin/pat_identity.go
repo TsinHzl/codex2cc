@@ -82,7 +82,7 @@ func QueryPersonalAccessTokenMetadata(ctx context.Context, accessToken string, p
 
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex2api")
+	req.Header.Set("User-Agent", "codex2cc")
 
 	resp, err := client.Do(req)
 	if err != nil {

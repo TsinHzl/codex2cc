@@ -17,7 +17,7 @@ import (
 
 func newTestModelRegistryDB(t *testing.T) *database.DB {
 	t.Helper()
-	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite) error: %v", err)
 	}

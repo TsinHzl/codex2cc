@@ -193,8 +193,8 @@ const requestCacheSize = 256
 const maxTools = 128
 
 const (
-	codexImageGenerationBridgeMarker = "<codex2api-codex-image-generation>"
-	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</codex2api-codex-image-generation>"
+	codexImageGenerationBridgeMarker = "<codex2cc-codex-image-generation>"
+	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</codex2cc-codex-image-generation>"
 	jsonObjectFormatInputHint        = "Return a valid JSON object."
 )
 
@@ -663,7 +663,7 @@ func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
 // 是 applyResponsesImageGenerationBridgeInstructions 的逆操作。剥除随注入工具
 // 一同追加的桥接文案时使用；标记块不在场则原样返回。
 func removeCodexImageGenerationBridgeText(instructions string) string {
-	const bridgeEndTag = "</codex2api-codex-image-generation>"
+	const bridgeEndTag = "</codex2cc-codex-image-generation>"
 	for {
 		start := strings.Index(instructions, codexImageGenerationBridgeMarker)
 		if start < 0 {

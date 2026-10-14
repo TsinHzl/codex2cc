@@ -79,7 +79,7 @@ func TestCompareSystemVersions(t *testing.T) {
 
 func TestValidateSystemUpdateURL(t *testing.T) {
 	allowed := []string{
-		"https://github.com/TsinHzl/codex2cc/releases/download/v1/codex2api.tar.gz",
+		"https://github.com/TsinHzl/codex2cc/releases/download/v1/codex2cc.tar.gz",
 		"https://release-assets.githubusercontent.com/github-production-release-asset/file",
 		"https://objects.githubusercontent.com/github-production-release-asset/file",
 	}
@@ -90,8 +90,8 @@ func TestValidateSystemUpdateURL(t *testing.T) {
 	}
 
 	blocked := []string{
-		"http://github.com/TsinHzl/codex2cc/releases/download/v1/codex2api.tar.gz",
-		"https://example.com/codex2api.tar.gz",
+		"http://github.com/TsinHzl/codex2cc/releases/download/v1/codex2cc.tar.gz",
+		"https://example.com/codex2cc.tar.gz",
 	}
 	for _, rawURL := range blocked {
 		if err := validateSystemUpdateURL(rawURL); err == nil {
@@ -105,8 +105,8 @@ func TestSystemUpdaterCheckFindsMatchingAsset(t *testing.T) {
 		TagName: "v2.4.4",
 		HTMLURL: "https://github.com/TsinHzl/codex2cc/releases/tag/v2.4.4",
 		Assets: []systemGitHubAsset{
-			{Name: "codex2api_2.4.4_linux_arm64.tar.gz", BrowserDownloadURL: "https://github.com/arm64"},
-			{Name: "codex2api_2.4.4_linux_amd64.tar.gz", BrowserDownloadURL: "https://github.com/amd64"},
+			{Name: "codex2cc_2.4.4_linux_arm64.tar.gz", BrowserDownloadURL: "https://github.com/arm64"},
+			{Name: "codex2cc_2.4.4_linux_amd64.tar.gz", BrowserDownloadURL: "https://github.com/amd64"},
 			{Name: "SHA256SUMS.txt", BrowserDownloadURL: "https://github.com/sums"},
 		},
 	}}
@@ -127,7 +127,7 @@ func TestSystemUpdaterCheckFindsMatchingAsset(t *testing.T) {
 	if !info.Supported {
 		t.Fatalf("Supported = false: %s", info.UnsupportedReason)
 	}
-	if info.AssetName != "codex2api_2.4.4_linux_amd64.tar.gz" {
+	if info.AssetName != "codex2cc_2.4.4_linux_amd64.tar.gz" {
 		t.Fatalf("AssetName = %q", info.AssetName)
 	}
 }
@@ -135,7 +135,7 @@ func TestSystemUpdaterCheckFindsMatchingAsset(t *testing.T) {
 func TestSystemUpdaterContainerWarning(t *testing.T) {
 	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
 		TagName: "v2.4.4",
-		Assets:  []systemGitHubAsset{{Name: "codex2api_2.4.4_linux_amd64.tar.gz"}},
+		Assets:  []systemGitHubAsset{{Name: "codex2cc_2.4.4_linux_amd64.tar.gz"}},
 	}}
 	updater := &systemUpdater{
 		currentVersion:     "v2.4.3",
@@ -169,7 +169,7 @@ func TestSystemUpdaterContainerWarning(t *testing.T) {
 func TestSystemUpdaterRejectsDevBuild(t *testing.T) {
 	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
 		TagName: "v2.4.4",
-		Assets:  []systemGitHubAsset{{Name: "codex2api_2.4.4_linux_amd64.tar.gz"}},
+		Assets:  []systemGitHubAsset{{Name: "codex2cc_2.4.4_linux_amd64.tar.gz"}},
 	}}
 	updater := &systemUpdater{
 		currentVersion: "dev",
@@ -190,7 +190,7 @@ func TestSystemUpdaterRejectsDevBuild(t *testing.T) {
 func TestSystemUpdaterRejectsNonSemverBuild(t *testing.T) {
 	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
 		TagName: "v2.4.4",
-		Assets:  []systemGitHubAsset{{Name: "codex2api_2.4.4_linux_amd64.tar.gz"}},
+		Assets:  []systemGitHubAsset{{Name: "codex2cc_2.4.4_linux_amd64.tar.gz"}},
 	}}
 	updater := &systemUpdater{
 		currentVersion: "main",
@@ -211,7 +211,7 @@ func TestSystemUpdaterRejectsNonSemverBuild(t *testing.T) {
 func TestSystemUpdaterCachesLatestRelease(t *testing.T) {
 	client := &fakeSystemReleaseClient{release: &systemGitHubRelease{
 		TagName: "v2.4.4",
-		Assets:  []systemGitHubAsset{{Name: "codex2api_2.4.4_linux_amd64.tar.gz"}},
+		Assets:  []systemGitHubAsset{{Name: "codex2cc_2.4.4_linux_amd64.tar.gz"}},
 	}}
 	updater := &systemUpdater{
 		currentVersion: "v2.4.3",
@@ -290,21 +290,21 @@ func TestHandlerSystemUpdaterConcurrentSingleInstance(t *testing.T) {
 
 func TestSystemUpdaterPerformUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 	tempDir := t.TempDir()
-	currentPath := filepath.Join(tempDir, "codex2api")
+	currentPath := filepath.Join(tempDir, "codex2cc")
 	if err := os.WriteFile(currentPath, []byte("old-binary"), 0755); err != nil {
 		t.Fatalf("write current binary: %v", err)
 	}
 
-	archive := buildSystemUpdateTarball(t, "codex2api", []byte("new-binary"))
+	archive := buildSystemUpdateTarball(t, "codex2cc", []byte("new-binary"))
 	archiveHash := sha256.Sum256(archive)
-	archiveURL := "https://github.com/TsinHzl/codex2cc/releases/download/v2.4.4/codex2api_2.4.4_linux_amd64.tar.gz"
+	archiveURL := "https://github.com/TsinHzl/codex2cc/releases/download/v2.4.4/codex2cc_2.4.4_linux_amd64.tar.gz"
 	restarted := make(chan string, 1)
 	client := &fakeSystemReleaseClient{
 		release: &systemGitHubRelease{
 			TagName: "v2.4.4",
 			HTMLURL: "https://github.com/TsinHzl/codex2cc/releases/tag/v2.4.4",
 			Assets: []systemGitHubAsset{{
-				Name:               "codex2api_2.4.4_linux_amd64.tar.gz",
+				Name:               "codex2cc_2.4.4_linux_amd64.tar.gz",
 				BrowserDownloadURL: archiveURL,
 				Digest:             "sha256:" + hex.EncodeToString(archiveHash[:]),
 			}},
@@ -355,18 +355,18 @@ func TestSystemUpdaterPerformUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 
 func TestSystemUpdaterPerformUpdateRejectsChecksumMismatch(t *testing.T) {
 	tempDir := t.TempDir()
-	currentPath := filepath.Join(tempDir, "codex2api")
+	currentPath := filepath.Join(tempDir, "codex2cc")
 	if err := os.WriteFile(currentPath, []byte("old-binary"), 0755); err != nil {
 		t.Fatalf("write current binary: %v", err)
 	}
 
-	archive := buildSystemUpdateTarball(t, "codex2api", []byte("new-binary"))
-	archiveURL := "https://github.com/TsinHzl/codex2cc/releases/download/v2.4.4/codex2api_2.4.4_linux_amd64.tar.gz"
+	archive := buildSystemUpdateTarball(t, "codex2cc", []byte("new-binary"))
+	archiveURL := "https://github.com/TsinHzl/codex2cc/releases/download/v2.4.4/codex2cc_2.4.4_linux_amd64.tar.gz"
 	client := &fakeSystemReleaseClient{
 		release: &systemGitHubRelease{
 			TagName: "v2.4.4",
 			Assets: []systemGitHubAsset{{
-				Name:               "codex2api_2.4.4_linux_amd64.tar.gz",
+				Name:               "codex2cc_2.4.4_linux_amd64.tar.gz",
 				BrowserDownloadURL: archiveURL,
 				Digest:             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
 			}},

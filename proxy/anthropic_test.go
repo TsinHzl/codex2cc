@@ -91,13 +91,13 @@ func TestAnthropicStreamErrorCarriesPolicyDetails(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	writer := newStreamFlushWriter(c.Writer, nil)
-	details := gin.H{"codex2api_policy": gin.H{"decision_id": "dec_stream", "strike_eligible": true}}
+	details := gin.H{"codex2cc_policy": gin.H{"decision_id": "dec_stream", "strike_eligible": true}}
 
 	if err := writeAnthropicStreamErrorEvent(writer, "invalid_request_error", "blocked", details); err != nil {
 		t.Fatalf("writeAnthropicStreamErrorEvent: %v", err)
 	}
 	data := strings.TrimSuffix(strings.TrimPrefix(recorder.Body.String(), "event: error\ndata: "), "\n\n")
-	if got := gjson.Get(data, "error.details.codex2api_policy.decision_id").String(); got != "dec_stream" {
+	if got := gjson.Get(data, "error.details.codex2cc_policy.decision_id").String(); got != "dec_stream" {
 		t.Fatalf("policy details missing from Anthropic stream error: %s", data)
 	}
 }
@@ -444,8 +444,8 @@ func TestSanitizeToolInputJSON(t *testing.T) {
 		{
 			name:     "enter worktree drops empty name when path is set",
 			toolName: "EnterWorktree",
-			in:       `{"name":"","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
-			want:     `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			in:       `{"name":"","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
+			want:     `{"path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
 		},
 		{
 			name:     "enter worktree drops empty path when name is set",
@@ -456,8 +456,8 @@ func TestSanitizeToolInputJSON(t *testing.T) {
 		{
 			name:     "enter worktree preserves both non-empty mutually exclusive fields",
 			toolName: "EnterWorktree",
-			in:       `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
-			want:     `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			in:       `{"name":"feature-x","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
+			want:     `{"name":"feature-x","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
 		},
 		{
 			name:     "enter worktree preserves both empty fields",
@@ -634,14 +634,14 @@ func TestBuildAnthropicResponseFromCompletedPreservesToolInputByToolName(t *test
 		{
 			name:      "enter worktree drops empty name when path is set",
 			toolName:  "EnterWorktree",
-			arguments: `{"name":"","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
-			wantInput: `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			arguments: `{"name":"","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
+			wantInput: `{"path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
 		},
 		{
 			name:      "enter worktree preserves both non-empty mutually exclusive fields",
 			toolName:  "EnterWorktree",
-			arguments: `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
-			wantInput: `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			arguments: `{"name":"feature-x","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
+			wantInput: `{"name":"feature-x","path":"F:\\Github\\codex2cc\\.claude\\worktrees\\existing"}`,
 		},
 	}
 

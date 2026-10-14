@@ -31,7 +31,7 @@ func insertUsageLogs(t *testing.T, db *DB, count int) {
 // TestFlushUsageLogsDrainsBeyondOneBatch 覆盖 flush 的分批语义：flushLogs 每次只取
 // usage_log_batch_size 条，FlushUsageLogs 必须循环刷完整个缓冲。
 func TestFlushUsageLogsDrainsBeyondOneBatch(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -69,7 +69,7 @@ func TestFlushUsageLogsDrainsBeyondOneBatch(t *testing.T) {
 }
 
 func TestSQLiteUsageLogFlushWaitsForUnifiedWriteLock(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -110,7 +110,7 @@ func TestSQLiteUsageLogFlushWaitsForUnifiedWriteLock(t *testing.T) {
 // 此时再走「只刷一个批次 + notifyLogFlush」的路径没人消费信号，超出一个批次的日志
 // 会被静默丢弃，所以收尾必须刷完整个缓冲。
 func TestCloseFlushesEntireUsageLogBuffer(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -144,7 +144,7 @@ func TestCloseFlushesEntireUsageLogBuffer(t *testing.T) {
 // 等直接来自下游请求体，超过列宽会让整条批量 INSERT 回滚，失败批次又被放回缓冲区头部，
 // 一条脏数据就能永久堵死日志写入。
 func TestUsageLogTextClampedToColumnWidth(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -347,7 +347,7 @@ func TestSalvageKeepsTransientFailuresForRetry(t *testing.T) {
 // TestUsageLogBufferHonorsHardLimit 覆盖缓冲硬上限：数据库长时间写不进去时缓冲不能无限涨，
 // 超限丢最旧的并计数，运维能从运行状态里看见丢了多少。
 func TestUsageLogBufferHonorsHardLimit(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -374,7 +374,7 @@ func TestUsageLogBufferHonorsHardLimit(t *testing.T) {
 
 // TestRequeueHonorsHardLimit 失败批次放回缓冲区同样要守住上限。
 func TestRequeueHonorsHardLimit(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	dbPath := filepath.Join(t.TempDir(), "codex2cc.db")
 	db, err := New("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("New(sqlite) 返回错误: %v", err)
@@ -398,11 +398,11 @@ func TestRequeueHonorsHardLimit(t *testing.T) {
 
 // TestSalvageDropsPoisonRowAgainstPostgres 在真实 PostgreSQL 上验证脏数据隔离：
 // SQLite 不校验列宽也不返回 SQLSTATE，isUsageLogDataError 这条路只有真库能走通。
-// 需要一个可写的空库，用 CODEX2API_TEST_POSTGRES_DSN 指定，未设置时跳过。
+// 需要一个可写的空库，用 CODEX2CC_TEST_POSTGRES_DSN 指定，未设置时跳过。
 func TestSalvageDropsPoisonRowAgainstPostgres(t *testing.T) {
-	dsn := os.Getenv("CODEX2API_TEST_POSTGRES_DSN")
+	dsn := os.Getenv("CODEX2CC_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		t.Skip("未设置 CODEX2API_TEST_POSTGRES_DSN，跳过 PostgreSQL 集成用例")
+		t.Skip("未设置 CODEX2CC_TEST_POSTGRES_DSN，跳过 PostgreSQL 集成用例")
 	}
 
 	db, err := New("postgres", dsn)

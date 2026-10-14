@@ -14,9 +14,9 @@ import (
 
 func newBatchTestRedis(t testing.TB) *redisTokenCache {
 	t.Helper()
-	addr := os.Getenv("CODEX2API_TEST_REDIS_ADDR")
+	addr := os.Getenv("CODEX2CC_TEST_REDIS_ADDR")
 	if addr == "" {
-		t.Skip("set CODEX2API_TEST_REDIS_ADDR to an isolated Redis")
+		t.Skip("set CODEX2CC_TEST_REDIS_ADDR to an isolated Redis")
 	}
 	options := &redis.Options{Addr: addr}
 	if strings.HasPrefix(addr, "/") {

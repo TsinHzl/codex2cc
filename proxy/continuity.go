@@ -130,7 +130,7 @@ func ResolveContinuity(ctx context.Context, account *auth.Account, req Request, 
 	}
 	if apiKey != "" {
 		return Continuity{
-			Key:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:"+apiKey)).String(),
+			Key:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2cc:prompt-cache:"+apiKey)).String(),
 			Source: "client_principal",
 		}
 	}
@@ -149,7 +149,7 @@ func ResolveContinuity(ctx context.Context, account *auth.Account, req Request, 
 
 		if authID != "" {
 			return Continuity{
-				Key:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:auth:"+authID)).String(),
+				Key:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2cc:prompt-cache:auth:"+authID)).String(),
 				Source: "auth_id",
 			}
 		}

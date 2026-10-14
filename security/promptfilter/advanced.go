@@ -125,7 +125,7 @@ type GuardLayerModeConfig struct {
 }
 
 // NewAPIConfig controls signed identity verification for the request-local
-// Codex2API Key binding. Enabled is runtime-only: persisted/global configuration
+// Codex2CC Key binding. Enabled is runtime-only: persisted/global configuration
 // must never enable NewAPI identity verification without a concrete binding.
 type NewAPIConfig struct {
 	Enabled             bool `json:"-"`

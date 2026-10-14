@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { SystemUpdateInfo } from '../types'
 
-const REMOTE_RELEASE_CACHE_KEY = 'codex2api_latest_release'
+const REMOTE_RELEASE_CACHE_KEY = 'codex2cc_latest_release'
 const LEGACY_UPDATE_CACHE_KEY = 'codex2api_latest_version'
 const CACHE_TTL = 10 * 60 * 1000
 const POLL_INTERVAL = 30 * 60 * 1000

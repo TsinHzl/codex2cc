@@ -356,7 +356,7 @@ func TestLoadAcceptsValidDatabaseSchema(t *testing.T) {
 		t.Fatalf("Load() 返回错误: %v", err)
 	}
 	if got := cfg.Database.Schema; got != "codex2cc" {
-		t.Fatalf("Database.Schema = %q, want codex2api", got)
+		t.Fatalf("Database.Schema = %q, want codex2cc", got)
 	}
 	dsn := cfg.Database.DSN()
 	if !strings.Contains(dsn, "options='-c search_path=codex2cc,public'") {

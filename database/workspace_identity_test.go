@@ -24,7 +24,7 @@ func workspaceIdentityJWT(t *testing.T, email, workspaceID string) string {
 
 func TestSQLiteWorkspaceIdentityV3(t *testing.T) {
 	ctx := context.Background()
-	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2cc.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite): %v", err)
 	}

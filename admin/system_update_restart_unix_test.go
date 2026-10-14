@@ -11,8 +11,8 @@ import (
 )
 
 func TestDefaultRestartProcessExecsProvidedPathAndKeepsEnvironment(t *testing.T) {
-	if os.Getenv("CODEX2API_RESTART_EXEC_HELPER") == "1" {
-		targetPath := os.Getenv("CODEX2API_RESTART_EXEC_TARGET")
+	if os.Getenv("CODEX2CC_RESTART_EXEC_HELPER") == "1" {
+		targetPath := os.Getenv("CODEX2CC_RESTART_EXEC_TARGET")
 		if err := defaultRestartProcess(targetPath); err != nil {
 			t.Fatalf("defaultRestartProcess(%q) error: %v", targetPath, err)
 		}
@@ -20,17 +20,17 @@ func TestDefaultRestartProcessExecsProvidedPathAndKeepsEnvironment(t *testing.T)
 	}
 
 	tempDir := t.TempDir()
-	targetPath := filepath.Join(tempDir, "codex2api-new")
-	targetScript := "#!/bin/sh\nprintf 'target=new env=%s\\n' \"$CODEX2API_RESTART_EXEC_VALUE\"\n"
+	targetPath := filepath.Join(tempDir, "codex2cc-new")
+	targetScript := "#!/bin/sh\nprintf 'target=new env=%s\\n' \"$CODEX2CC_RESTART_EXEC_VALUE\"\n"
 	if err := os.WriteFile(targetPath, []byte(targetScript), 0755); err != nil {
 		t.Fatalf("write target script: %v", err)
 	}
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestDefaultRestartProcessExecsProvidedPathAndKeepsEnvironment")
 	cmd.Env = append(os.Environ(),
-		"CODEX2API_RESTART_EXEC_HELPER=1",
-		"CODEX2API_RESTART_EXEC_TARGET="+targetPath,
-		"CODEX2API_RESTART_EXEC_VALUE=kept",
+		"CODEX2CC_RESTART_EXEC_HELPER=1",
+		"CODEX2CC_RESTART_EXEC_TARGET="+targetPath,
+		"CODEX2CC_RESTART_EXEC_VALUE=kept",
 	)
 
 	output, err := cmd.CombinedOutput()
