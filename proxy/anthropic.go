@@ -834,9 +834,21 @@ func (t *anthropicStreamTranslator) beginThinkingTextBlock() []anthropicStreamEv
 // 引导本行（块尾不带 '\n'）、逐行独立 dim 包裹。
 func (t *anthropicStreamTranslator) emitThinkingTextLine(line string) []anthropicStreamEvent {
 	var events []anthropicStreamEvent
+	// tool_use 块打开期间不得开新渲染 text 块（beginThinkingTextBlock 会
+	// closeCurrentBlock 提前关闭未完结的 tool_use 块，后续 input_json_delta
+	// 落错块，客户端报 "Content block is not a text block"）：把行暂存回
+	// pending，等 tool 块关闭后的下一个 flush 时机再落行。
+	if t.contentBlockOpen && t.currentBlockType == "tool_use" {
+		if t.thinkingTextPending.Len() > 0 {
+			t.thinkingTextPending.WriteString("\n")
+		}
+		t.thinkingTextPending.WriteString(line)
+		return nil
+	}
 	// 仅凭 thinkingTextOpen 判断不够：tool_use 块打开后 thinkingTextOpen
-	// 仍可能残留 true（见 handleOutputItemAdded function_call 分支不清该
-	// 标志），此时 text_delta 会落到 tool_use 块 index 上，客户端报
+	// 可能残留 true（历史版本 function_call 分支不清该标志时会残留，现由
+	// 该分支 finishThinkingTextBlock 清除，此判定保留作异常序列兜底），
+	// 此时 text_delta 会落到 tool_use 块 index 上，客户端报
 	// "Content block is not a text block"。必须同时确认当前物理块确实是
 	// 打开中的 text 块，否则先正确收尾旧块再懒开新块。
 	if !t.thinkingTextOpen || t.currentBlockType != "text" || !t.contentBlockOpen {
@@ -858,14 +870,20 @@ func (t *anthropicStreamTranslator) emitThinkingTextLine(line string) []anthropi
 	return events
 }
 
-// flushThinkingTextLine 把 pending 残余落成一行（段边界与块收尾共用）。
+// flushThinkingTextLine 把 pending 残余落成行（段边界与块收尾共用）。
+// pending 可能含守卫暂存的多行（以 '\n' 分隔），按行拆开逐行 emit，
+// 保证每行独立 dim 包裹。
 func (t *anthropicStreamTranslator) flushThinkingTextLine() []anthropicStreamEvent {
-	line := strings.TrimSpace(t.thinkingTextPending.String())
+	pending := strings.TrimSpace(t.thinkingTextPending.String())
 	t.thinkingTextPending.Reset()
-	if line == "" {
+	if pending == "" {
 		return nil
 	}
-	return t.emitThinkingTextLine(line)
+	var events []anthropicStreamEvent
+	for _, line := range strings.Split(pending, "\n") {
+		events = append(events, t.emitThinkingTextLine(line)...)
+	}
+	return events
 }
 
 // translateEvent 将单个 Codex SSE 事件翻译为零或多个 Anthropic SSE 事件
@@ -1012,6 +1030,12 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		})...)
 
 	case "function_call", "custom_tool_call":
+		// 打开 tool_use 块前必须收尾渲染状态：flush 残余 pending（此时
+		// tool_use 块尚未打开，行会正常落进渲染 text 块），并清除
+		// thinkingTextOpen，否则渲染行门控会误判渲染块仍在而落错块。
+		if t.thinkingAsText {
+			events = append(events, t.finishThinkingTextBlock()...)
+		}
 		events = append(events, t.closeCurrentBlock()...)
 		callID := fromCodexCallID(gjson.GetBytes(data, "item.call_id").String())
 		if callID == "" {
@@ -1046,7 +1070,10 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		// text block 延迟到第一个 delta 时打开；渲染模式下若 thinking 渲染块
 		// 已开（reasoning 先行），必须先收尾（补 duration 行）再关闭，否则
 		// 回答文本会因懒开条件不触发而追加进 thinking 渲染块之后。
-		if t.thinkingAsText && t.thinkingTextOpen {
+		// pending 非空但块未开（tool 块打开期间暂存的行）同样要 flush，
+		// 否则暂存内容随块关闭被静默丢弃。
+		if t.thinkingAsText &&
+			(t.thinkingTextOpen || strings.TrimSpace(t.thinkingTextPending.String()) != "") {
 			events = append(events, t.finishThinkingTextBlock()...)
 			events = append(events, t.closeCurrentBlock()...)
 		}
@@ -1241,8 +1268,10 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 	}
 
 	// 渲染模式下 message item 未出现（例如纯 reasoning 截断）时，渲染块
-	// 仍处于打开状态，终止前必须收尾（补 duration 行）再关块。
-	if t.thinkingAsText && t.thinkingTextOpen {
+	// 仍处于打开状态，终止前必须收尾（补 duration 行）再关块。pending
+	// 非空但块未开（tool 块打开期间暂存的行）同样要 flush 兜底。
+	if t.thinkingAsText &&
+		(t.thinkingTextOpen || strings.TrimSpace(t.thinkingTextPending.String()) != "") {
 		events = append(events, t.finishThinkingTextBlock()...)
 	}
 	events = append(events, t.closeCurrentBlock()...)
@@ -1297,7 +1326,9 @@ func (t *anthropicStreamTranslator) handleFailed() []anthropicStreamEvent {
 	if !t.messageStartSent {
 		events = append(events, t.handleCreated()...)
 	}
-	if t.thinkingAsText && t.thinkingTextOpen {
+	// 与 handleCompleted 同理：pending 非空但块未开时也要 flush 兜底。
+	if t.thinkingAsText &&
+		(t.thinkingTextOpen || strings.TrimSpace(t.thinkingTextPending.String()) != "") {
 		events = append(events, t.finishThinkingTextBlock()...)
 	}
 	events = append(events, t.closeCurrentBlock()...)
