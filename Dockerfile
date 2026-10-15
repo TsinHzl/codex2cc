@@ -22,7 +22,11 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 # modernc.org/sqlite 为纯 Go 驱动，无需 CGO；禁用后交叉构建不依赖 gcc
 ARG TARGETARCH
 # TARGETARCH 由 buildx 自动注入；直接 docker build 时可能为空，兜底 amd64。
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -ldflags="-s -w" -o /codex2cc .
+# APP_VERSION 同时注入前端（VITE_APP_VERSION）与后端（internal/version），
+# 保证 /system/update 的 current_version 与检查更新降级信息不落到 dev。
+ARG APP_VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-s -w -X github.com/codex2cc/internal/version.Version=${APP_VERSION}" -o /codex2cc .
 
 # ---- 运行阶段 ----
 FROM alpine:3.20
