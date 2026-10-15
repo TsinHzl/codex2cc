@@ -1236,8 +1236,11 @@ func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropi
 }
 
 // finishThinkingTextBlock 在渲染块的收尾补齐残余行 + duration 行。
-// newline 仍引导（`\n` + duration 行），块尾不带 '\n'；块从未产出任何行时
-// 不补任何内容（避免发出空 text 块的孤儿 stop 事件）。
+// newline 仍引导（`\n` + duration 行）；与 cc-proxy 不同的是 duration 行后
+// 追加一个尾随 '\n'：Claude Code 的 recap 会把本渲染 text 块与下一个 text
+// 块（回答/recap 内容）拼接渲染，缺尾随换行时「💭 Thought for Xs」与后续
+// 文案会落在同一行。块从未产出任何行时不补任何内容（避免发出空 text 块
+// 的孤儿 stop 事件）。
 func (t *anthropicStreamTranslator) finishThinkingTextBlock() []anthropicStreamEvent {
 	if !t.thinkingAsText {
 		return nil
@@ -1252,7 +1255,7 @@ func (t *anthropicStreamTranslator) finishThinkingTextBlock() []anthropicStreamE
 		elapsed := time.Since(t.thinkingTextStartAt)
 		events = append(events, t.contentBlockDelta(anthropicDelta{
 			Type: "text_delta",
-			Text: "\n" + formatThinkingDurationLine(elapsed),
+			Text: "\n" + formatThinkingDurationLine(elapsed) + "\n",
 		})...)
 	}
 	t.thinkingTextOpen = false

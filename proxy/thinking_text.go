@@ -52,12 +52,19 @@ var (
 	thinkingTextBlockRE = regexp.MustCompile(
 		regexp.QuoteMeta(thinkingTextHeaderLine) +
 			`(?:\n\x1b\[2m[^\n]*?\x1b\[0m)*`)
+	// 本仓库渲染的 duration 行形态。剥离时连同尾随的 '\n' 一并吃掉——流式侧
+	// 在 duration 行后补了一个尾随 '\n'（防止 recap 与 duration 行同行渲染），
+	// 历史回放时若不剥离该换行会残留空行。
+	thinkingTextDurationLineRE = regexp.MustCompile(
+		`\n?` + regexp.QuoteMeta(ansiDim+"💭 Thought for ") + `(?:\d+m)?\d+s` + regexp.QuoteMeta(ansiReset) + `\n?`)
 )
 
-// stripThinkingTextMarkers 按顺序剥离引用格式与裸格式的 thinking 文案块。
+// stripThinkingTextMarkers 按顺序剥离引用格式、裸格式的 thinking 文案块与
+// duration 行。
 func stripThinkingTextMarkers(text string) string {
 	text = quotedThinkingTextBlockRE.ReplaceAllString(text, "")
-	return thinkingTextBlockRE.ReplaceAllString(text, "")
+	text = thinkingTextBlockRE.ReplaceAllString(text, "")
+	return thinkingTextDurationLineRE.ReplaceAllString(text, "")
 }
 
 // formatThinkingDurationLine 生成 stop 时的时长行，如 `💭 Thought for 12s`，
