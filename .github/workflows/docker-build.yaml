@@ -43,6 +43,15 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
+      - name: Extract version
+        # tag 推送取版本号（去掉 v 前缀）；master 推送取短 sha
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+          else
+            echo "APP_VERSION=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -52,3 +61,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
+          build-args: APP_VERSION=${{ env.APP_VERSION }}

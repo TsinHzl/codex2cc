@@ -4,6 +4,10 @@ WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+# 构建上下文无 .git，git describe 不可用；版本号由 CI 通过 APP_VERSION 注入，
+# 未注入时回退 dev。前端 vite.config.js 读取 VITE_APP_VERSION。
+ARG APP_VERSION=dev
+ENV VITE_APP_VERSION=$APP_VERSION
 RUN npm run build
 
 # ---- Go 构建阶段 ----
