@@ -9303,7 +9303,8 @@ func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
 		resp.BackgroundGlassBlur = bg.GlassBlur
 		return resp
 	}
-	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
+	// 站点名固定使用代码默认值，忽略 DB 中持久化的旧站点名
+	resp.SiteName = database.DefaultSiteName
 	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
 	bg = decodeBackgroundConfig(settings.BackgroundConfig)
 	resp.BackgroundImage = bg.Image
