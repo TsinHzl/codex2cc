@@ -494,15 +494,6 @@ export default function Layout({ children }: PropsWithChildren) {
                         : 'border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground',
                     )}
                   >
-                    {active ? (
-                      <span
-                        aria-hidden
-                        className={cn(
-                          'absolute top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-primary',
-                          sidebarCollapsed ? 'left-1' : 'left-1.5',
-                        )}
-                      />
-                    ) : null}
                     {item.icon}
                     <span
                       className={`overflow-hidden whitespace-nowrap transition-[max-width,opacity] ${textEase} ${textRevealDelay} ${
