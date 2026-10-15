@@ -1233,3 +1233,74 @@ func TestAnthropicThinkingTextConsecutiveItemsMergeBlock(t *testing.T) {
 		t.Fatalf("content block 数应为 2（渲染块+回答块）：start=%d stop=%d", startCount, stopCount)
 	}
 }
+
+// TestAnthropicThinkingTextAfterToolUseReopensTextBlock 复现 v0.1.7 线上
+// bug：reasoning 与 function_call 交替出现时，function_call 分支不重置
+// thinkingTextOpen，下一个 reasoning 的 text_delta 会落到已关闭的 tool_use
+// 块 index 上，客户端报 "Content block is not a text block"；且 delta 串改
+// tool input JSON 导致 "Invalid tool parameters"。
+func TestAnthropicThinkingTextAfterToolUseReopensTextBlock(t *testing.T) {
+	tr := newAnthropicStreamTranslatorWithThinkingText("gpt-5.6-sol", time.Now())
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		// 第一段 reasoning：完整 part → 懒开渲染 text 块并落行
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**First**"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.reasoning_summary_part.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+		// 工具调用块打开
+		`{"type":"response.output_item.added","item":{"type":"function_call","name":"Bash","call_id":"call_1"}}`,
+		`{"type":"response.function_call_arguments.delta","delta":"{\"command\":\"ls\"}"}`,
+		`{"type":"response.output_item.done","item":{"type":"function_call","name":"Bash","call_id":"call_1"}}`,
+		// 第二段 reasoning：此前 thinkingTextOpen 残留 true
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_part.added","summary_index":0}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"**Second**"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.reasoning_summary_part.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+	// 记录每个 index 的块类型，校验 text_delta 只落在 text 块上
+	blockTypes := map[int]string{}
+	var openIndexes, stopIndexes []int
+	for _, evt := range all {
+		idx := 0
+		if evt.Index != nil {
+			idx = *evt.Index
+		}
+		switch evt.Type {
+		case "content_block_start":
+			blockTypes[idx] = evt.ContentBlock.Type
+			openIndexes = append(openIndexes, idx)
+		case "content_block_stop":
+			stopIndexes = append(stopIndexes, idx)
+			delete(blockTypes, idx)
+		case "content_block_delta":
+			if evt.Delta != nil && evt.Delta.Type == "text_delta" {
+				typ, ok := blockTypes[idx]
+				if !ok {
+					t.Fatalf("index %d 的 text_delta 落在已关闭的块上", idx)
+				}
+				if typ != "text" {
+					t.Fatalf("index %d 的 text_delta 落在 %s 块上，应为 text 块", idx, typ)
+				}
+			}
+		}
+	}
+	var joined strings.Builder
+	for _, evt := range all {
+		if evt.Type == "content_block_delta" && evt.Delta != nil && evt.Delta.Type == "text_delta" {
+			joined.WriteString(evt.Delta.Text)
+		}
+	}
+	if !strings.Contains(joined.String(), ansiDim+"First"+ansiReset) ||
+		!strings.Contains(joined.String(), ansiDim+"Second"+ansiReset) {
+		t.Fatalf("两段 reasoning 文案均应渲染；got %q", joined.String())
+	}
+}

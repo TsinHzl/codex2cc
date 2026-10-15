@@ -834,9 +834,15 @@ func (t *anthropicStreamTranslator) beginThinkingTextBlock() []anthropicStreamEv
 // 引导本行（块尾不带 '\n'）、逐行独立 dim 包裹。
 func (t *anthropicStreamTranslator) emitThinkingTextLine(line string) []anthropicStreamEvent {
 	var events []anthropicStreamEvent
-	if !t.thinkingTextOpen {
+	// 仅凭 thinkingTextOpen 判断不够：tool_use 块打开后 thinkingTextOpen
+	// 仍可能残留 true（见 handleOutputItemAdded function_call 分支不清该
+	// 标志），此时 text_delta 会落到 tool_use 块 index 上，客户端报
+	// "Content block is not a text block"。必须同时确认当前物理块确实是
+	// 打开中的 text 块，否则先正确收尾旧块再懒开新块。
+	if !t.thinkingTextOpen || t.currentBlockType != "text" || !t.contentBlockOpen {
 		events = append(events, t.beginThinkingTextBlock()...)
 	}
+	t.thinkingTextOpen = true
 	if t.thinkingTextFirst {
 		t.thinkingTextFirst = false
 		events = append(events, t.contentBlockDelta(anthropicDelta{
