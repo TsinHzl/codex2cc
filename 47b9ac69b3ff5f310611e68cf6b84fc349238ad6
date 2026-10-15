@@ -1,0 +1,23 @@
+frontend/src/components/Layout.tsx
+  7932b62d110431aa 4,353-354,358-359,456-465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "47b9ac69b3ff5f310611e68cf6b84fc349238ad6",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 43,
+      "total_deletions": 56,
+      "accepted_lines": 20,
+      "overriden_lines": 0
+    }
+  }
+}
