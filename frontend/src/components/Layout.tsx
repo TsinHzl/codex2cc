@@ -1,7 +1,7 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, BookOpen, KeyRound, ExternalLink, ChevronLeft, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, BookOpen, KeyRound, ExternalLink, PanelLeftClose, PanelLeftOpen, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
@@ -350,13 +350,13 @@ export default function Layout({ children }: PropsWithChildren) {
         <aside data-slot="admin-sidebar" className="sticky top-0 self-start h-dvh overflow-hidden border-r border-border bg-[hsl(var(--sidebar-background))] max-lg:hidden">
           <div className={`flex flex-col h-full ${sidebarCollapsed ? 'px-2' : 'px-4'} pt-5 pb-4 transition-[padding] ${containerEase}`}>
             {/* Brand */}
-            <div className={`pb-4 border-b border-border ${sidebarCollapsed ? 'flex justify-center' : ''}`}>
-              <div className={`flex items-center gap-3 ${sidebarCollapsed ? 'justify-center' : ''}`}>
+            <div className={`pb-4 border-b border-border ${sidebarCollapsed ? 'flex flex-col items-center' : ''}`}>
+              <div className={`flex ${sidebarCollapsed ? 'flex-col items-center gap-2' : 'w-full items-center justify-between gap-3'}`}>
                 <img src={logoSrc} alt={siteName} className="size-10 rounded-lg object-cover shadow-sm shrink-0" />
                 <div
                   aria-hidden={sidebarCollapsed}
-                  className={`min-w-0 overflow-hidden transition-[max-width] ${containerEase} ${
-                    sidebarCollapsed ? 'pointer-events-none max-w-0' : 'max-w-[160px]'
+                  className={`min-w-0 overflow-hidden transition-[max-width,max-height] ${containerEase} ${textRevealDelay} ${
+                    sidebarCollapsed ? 'pointer-events-none max-h-0 max-w-0 opacity-0' : 'max-w-[160px] opacity-100'
                   }`}
                 >
                   <div
@@ -452,32 +452,19 @@ export default function Layout({ children }: PropsWithChildren) {
                     </div>
                   </div>
                 </div>
+
+                {/* Collapse toggle: 展开态位于 brand 行右侧,收起态位于 logo 下方 */}
+                <button
+                  type="button"
+                  onClick={toggleSidebarCollapsed}
+                  title={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
+                  aria-label={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
+                  className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                >
+                  {sidebarCollapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
+                </button>
               </div>
             </div>
-
-            {/* Collapse toggle: 嵌入 brand 与 nav 之间,展开态显示文字,收起态只显示箭头 */}
-            <button
-              type="button"
-              onClick={toggleSidebarCollapsed}
-              title={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
-              aria-label={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
-              className={`mt-3 flex items-center min-h-9 rounded-lg text-[12px] font-semibold text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-[background-color,color,padding] ${containerEase} ${
-                sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-2 px-3 py-2'
-              }`}
-            >
-              <ChevronLeft
-                className={`size-4 transition-transform ${containerEase} ${
-                  sidebarCollapsed ? 'rotate-180' : 'rotate-0'
-                }`}
-              />
-              <span
-                className={`overflow-hidden whitespace-nowrap transition-[max-width,opacity] ${textEase} ${textRevealDelay} ${
-                  sidebarCollapsed ? 'max-w-0 opacity-0' : 'max-w-[160px] opacity-100'
-                }`}
-              >
-                {t('common.collapseSidebar')}
-              </span>
-            </button>
 
             {/* Nav */}
             <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pt-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Main navigation">
