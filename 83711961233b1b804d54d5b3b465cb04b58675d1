@@ -1,0 +1,25 @@
+proxy/anthropic.go
+  7932b62d110431aa 1239-1243,1258
+proxy/thinking_text.go
+  7932b62d110431aa 55-59,62-63,66-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "83711961233b1b804d54d5b3b465cb04b58675d1",
+  "prompts": {
+    "7932b62d110431aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4cad782b-090c-4717-a87f-70cf5ff92e18",
+        "model": "deepseek-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 15,
+      "total_deletions": 5,
+      "accepted_lines": 15,
+      "overriden_lines": 0
+    }
+  }
+}
