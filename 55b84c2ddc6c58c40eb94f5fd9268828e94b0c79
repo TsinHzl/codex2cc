@@ -1,0 +1,23 @@
+README.md
+  23dcd0a07dddcb19 94-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.20",
+  "base_commit_sha": "55b84c2ddc6c58c40eb94f5fd9268828e94b0c79",
+  "prompts": {
+    "23dcd0a07dddcb19": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82bb05fe-0f18-4475-81f4-3cc93a9aac2c",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "TsinHzl <tsinhzl@icloud.com>",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 0,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
