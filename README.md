@@ -91,3 +91,7 @@ npm run test      # node --test
 ```
 
 前端改动后需重新构建 dist 并重新编译 Go 二进制（go:embed 编译期固化）。
+
+## 致谢
+
+本项目基于 [james-6-23/codex2api](https://github.com/james-6-23/codex2api) 抽离而来，感谢原作者 [james-6-23](https://github.com/james-6-23) 的开源贡献。
